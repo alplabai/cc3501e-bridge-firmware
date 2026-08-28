@@ -14,17 +14,25 @@ only this compiled+signed artifact is withheld. See alp-sdk issue #590.
 
 ## Building the OTA self-test
 
-The default (customer) build never references this file. Only `--ota-selftest` does.
+The default (customer) build never references this file.  Both `--ota-selftest`
+(`-OtaSelftest`) and `-OtaWindowSelftest` embed it; neither builds without it.
 Before an OTA self-test build, stage the artifact from `alp-sdk-internal` into this
 directory:
 
 ```
 cp <alp-sdk-internal>/firmware/cc3501e/hal/ti/cc3501e_ota_candidate.c \
-   firmware/cc3501e/hal/ti/cc3501e_ota_candidate.c
+   hal/ti/cc3501e_ota_candidate.c
 ```
 
 `build_ti.sh --ota-selftest` (and `build_ti.ps1 -OtaSelftest`) fail with a clear
-message if the file is absent. The staged copy is git-ignored.
+message if the file is absent.
+
+The staged copy IS git-ignored: the root `.gitignore` names
+`hal/ti/cc3501e_ota_candidate.c` explicitly.  This sentence used to sit here
+while NOTHING ignored the file, so following this README and then running
+`git add -A` would have committed a signed, license-gated TI vendor image into
+this public repository.  If you move or rename the file, move the ignore rule
+with it.
 
 ## Regenerating it
 
