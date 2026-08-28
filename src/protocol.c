@@ -28,13 +28,18 @@
  *     GET_DIAG_INFO / DIAG_GET_STATS handlers in protocol_diag.c read
  *     them via protocol_internal.h's extern declarations.
  *
- * v0.1 ("bring-up") scope: the META group only (PING, GET_VERSION,
- * GET_MAC, RESET).  Every other opcode -- Wi-Fi, BLE, GPIO proxy,
- * power, diagnostics -- is rejected with ALP_CC3501E_RESP_ERR_INVALID
- * per the protocol header's contract ("v1 firmware rejects opcodes it
- * does not implement with ALP_CC3501E_RESP_ERR_INVALID").  Those land
- * in v0.2+ and route to TI's SimpleLink Wi-Fi / BLE APIs through the
- * HAL backend; see docs/cc3501e-bridge.md "v0.x roadmap".
+ * Scope: protocol_dispatch() below routes 49 opcodes -- META, Wi-Fi,
+ * BLE, sockets, GPIO proxy, camera enables, power policy, diagnostics
+ * (including GET_PENDING_EVENTS) and OTA -- onto the per-family handlers,
+ * which reach TI's CC35xx Wi-Fi / NimBLE / lwIP / psa_fwu APIs through
+ * the HAL backend.  Routed is not proven: BRINGUP_STATUS.md records what
+ * is silicon-validated, and sockets do NOT connect (alp-sdk#1746).
+ *
+ * The rejection contract is unchanged and still load-bearing: an opcode
+ * this firmware does not implement is answered with
+ * ALP_CC3501E_RESP_ERR_INVALID, per the protocol header ("firmware
+ * rejects opcodes it does not implement with
+ * ALP_CC3501E_RESP_ERR_INVALID").
  */
 
 #include <string.h>
@@ -214,8 +219,8 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 typedef alp_cc3501e_resp_t (*cmd_handler_t)(const uint8_t *, size_t, uint8_t *, size_t, size_t *);
 
 /* Sparse switch on opcode -- keeps the table small without losing the
- * single-handler-table property.  v0.2+ feature groups slot in here as
- * their HAL bodies land.  Each case routes to the owning family's
+ * single-handler-table property.  A new feature group slots in here as
+ * its HAL body lands.  Each case routes to the owning family's
  * protocol_<family>.c handler (declared in protocol_internal.h). */
 alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
                                      uint8_t        flags,
@@ -225,7 +230,7 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
                                      size_t         reply_cap,
                                      size_t        *reply_data_len)
 {
-	(void)flags; /* v0.1 has no request flag that alters dispatch. */
+	(void)flags; /* no request flag alters dispatch today */
 	*reply_data_len = 0u;
 
 	cmd_handler_t h = NULL;
@@ -384,9 +389,8 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 		h = handle_diag_log_level;
 		break;
 	default:
-		/* Unknown, or a known v1 opcode whose firmware body has not
-         * landed yet (all of Wi-Fi / BLE / GPIO / power / diag in
-         * v0.1).  The header's contract is RESP_ERR_INVALID. */
+		/* Unknown, or a known opcode whose firmware body has not landed
+		 * yet.  The header's contract is RESP_ERR_INVALID. */
 		return ALP_CC3501E_RESP_ERR_INVALID;
 	}
 	return h(req, req_len, reply_data, reply_cap, reply_data_len);
@@ -447,9 +451,11 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 		g_last_error = (uint8_t)status;
 	}
 
-	/* Frame the reply: [cmd | flags=0 | payload_len(LE) | status | data].
-     * flags = 0 -> solicited reply (async events set FLAG_ASYNC_EVENT in
-     * v0.2+).  payload = status(1) + data. */
+	/* Frame the reply: [cmd | flags=0 | payload_len(LE) | status | data | pad].
+	 * flags = 0 -> solicited reply.  NOTHING in this firmware ever sets
+	 * ALP_CC3501E_FLAG_ASYNC_EVENT: async events are never emitted as frames of
+	 * their own, they are queued in the event ring and handed back inside an
+	 * ordinary GET_PENDING_EVENTS reply.  payload = status(1) + data + pad. */
 	/* Pad the reply payload up to a multiple of CC3501E_REPLY_PAD so the HOST's
 	 * DMA can move it as ONE burst-aligned chunk.
 	 *
@@ -461,10 +467,15 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 	 * what kept DMA slower than PIO on this bridge.  Reply payload is
 	 * 1 + data_len, so without padding roughly half of all frames are odd.
 	 *
-	 * The pad bytes are never interpreted: every reply carries its own length
-	 * (SOCK_RECV has data_len inside alp_cc3501e_sock_recv_resp_t), so the host
-	 * reads payload_len purely to know how many bytes to clock.  Costs at most
-	 * CC3501E_REPLY_PAD-1 bytes of wire out of ~1.7 KB. */
+	 * The declared payload_len INCLUDES the pad, so payload_len is NOT
+	 * status + data.  That is safe only for a reply payload that is
+	 * SELF-DELIMITING.  SOCK_RECV is: data_len sits inside
+	 * alp_cc3501e_sock_recv_resp_t.  GET_PENDING_EVENTS was NOT -- its reply data
+	 * is a bare packed entry list -- so an empty ring's 7 zero pad bytes were
+	 * walked as three "opcode 0x00, len 0" entries, ~5.8 phantom events per
+	 * second (alp-sdk#1740; the host walk now stops at a zero opcode).  Any NEW
+	 * variable-length reply payload must carry its own count or terminator.
+	 * Costs at most CC3501E_REPLY_PAD-1 bytes of wire out of ~1.7 KB. */
 	uint16_t reply_payload = (uint16_t)(1u + data_len);
 	{
 		const uint16_t rem = (uint16_t)(reply_payload % CC3501E_REPLY_PAD);

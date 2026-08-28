@@ -1,9 +1,9 @@
 # CC3501E prebuilt firmware — release notes
 
-Each entry corresponds to a tagged release of the in-tree
-[`firmware/cc3501e/`](..) source.  The signed binary, its detached
-signature, and a SHA-256 manifest are dropped into this directory and
-named `cc3501e-vX.Y.Z.bin` (matching `firmware/cc3501e/firmware-version.txt`).
+Each entry corresponds to a tagged release of this repository's source.
+The signed binary, its detached signature, and a SHA-256 manifest are
+dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
+`firmware-version.txt` at the repo root).
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
@@ -79,7 +79,7 @@ contract, no ABI change.
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 10.10.01.08 + SysConfig 1.28.0 + Wi-Fi toolbox 4.2.4) via
-`firmware/cc3501e/ti/build_ti.ps1 -Ble`.
+`ti/build_ti.ps1 -Ble`.
 
 - `cc3501e-v0.4.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.4.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
@@ -149,7 +149,7 @@ is all it claims; it is not a release scheme.
 
 Built on the bench with the `ti` backend (TI `ticlang` 5.1.1 +
 SimpleLink Wi-Fi SDK 10.10.01.08 + SysConfig 1.28 + Wi-Fi toolbox
-4.2.4) via `firmware/cc3501e/ti/build_ti.sh --wifi --ble`.
+4.2.4) via `ti/build_ti.sh --wifi --ble`.
 
 - `cc3501e-v0.3.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.3.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
@@ -206,7 +206,7 @@ and OTA are unaffected; this is soft-AP advertising only.
 
 First signed prebuilt, built on the bench with the `ti` backend (TI
 `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK 10.10.01.08 + SysConfig 1.28 +
-Wi-Fi toolbox 4.2.4) via `firmware/cc3501e/ti/build_ti.sh --wifi --ble`.
+Wi-Fi toolbox 4.2.4) via `ti/build_ti.sh --wifi --ble`.
 
 - `cc3501e-v0.2.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.2.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
@@ -224,7 +224,8 @@ earlier drafts was wrong — the VALIDATION vendor key is a P-256 EC key).
 The AEN SoM presets' `helper_firmware.cc3501e_otp` now point
 `firmware_path` at this blob; the CC3501E is never customer-flashed, so
 there is no `flash_method` -- `update_channel: alp_ota_spi_otp` is the
-whole story (see `metadata/e1m_modules/README.md`).
+whole story (see alp-sdk
+[`metadata/e1m_modules/README.md`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/README.md)).
 
 **Full OTA cycle validated on hardware (2026-07-10):** stream → FINISH →
 STAGED → the CC35's own `psa_fwu_request_reboot()` swap (the bridge drops,
@@ -233,4 +234,4 @@ cold POR** (no rollback). Proven on the E1M-AEN801 EVK with a FORWARD
 candidate — the OTA payload's signed version must EXCEED the running
 primary (monotonic anti-rollback: a downgrade is refused at `psa_fwu`
 install). A first OTA after a failed one recovers cleanly (no bridge
-wedge, no CC35 reset). See `firmware/cc3501e/BRINGUP_STATUS.md` §5.
+wedge, no CC35 reset). See `BRINGUP_STATUS.md` §5.

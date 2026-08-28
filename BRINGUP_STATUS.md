@@ -10,7 +10,7 @@ the E1M-AEN801 bench. Updated 2026-08-28.
 
 This is the consolidated on-silicon record for the **link / Wi-Fi / BLE**
 pillars. The authoritative topology is the hardware-framed SPI bridge described
-in [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md): Alif `SPI1_SS0_C`
+in [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md): Alif `SPI1_SS0_C`
 frames every protocol phase and READY gates reply phases. Async events ride an
 attention edge on that same READY wire (#130, alp-sdk#1721) -- shipped and
 silicon-validated, build-time opt-in, and with Wi-Fi connect/disconnect as its
@@ -292,7 +292,7 @@ full-set-regen script is **not** currently staged in the bench signing dir; the
 `gen-out-*/` trees are prior outputs, not a reproducible command. Confirm by
 re-reading the fuse: `boot_sector_programmed` `0 → 1`.
 
-### Cold swap-boot cycle — bench result 2026-07-09 (#493 criterion 1: STAGED proven, SWAP fails)
+### Cold swap-boot cycle — bench result 2026-07-09 (#493 criterion 1: STAGED proven; the swap failure was PROCEDURAL, and criterion 1 closed 2026-07-10 — see the end of this section)
 
 Ran the real-image OTA cycle on `e1m-aen-evk-01` (E8 slot0 = the
 `-DCC3501E_OTA_REAL=ON` app, SE-UART `app-write-mram`). Result:
@@ -354,7 +354,7 @@ GPE **v0.90.0.0**, above the primary) streamed → `state=2 written=37016/37016 
 → **self-accepted and PERSISTED across a true cold POR** (no rollback). The key
 was a candidate version ABOVE the primary: a downgrade (the old v0.0.4.0
 candidate) is refused at `psa_fwu` install (`state=3` ERROR), a forward one is
-accepted. Regenerate the forward candidate with `firmware/cc3501e/ti/build_ti.sh`
+accepted. Regenerate the forward candidate with `ti/build_ti.sh`
 (plain) → `build+sign vendor_image --version <above primary>` → bin2c (recipe in
 `cc3501e_ota_candidate.c`). **Known follow-up (non-blocking):** the FIRST OTA
 attempt after a failed/aborted OTA can return `-1` and wedge the bridge until a
