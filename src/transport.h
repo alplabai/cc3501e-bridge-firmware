@@ -55,7 +55,17 @@ void bridge_transport_sdio_hw_init(void);
  * brought the radio up (the Wlan_Start DMA-coexistence fix).  No-op on the stub
  * backend (the weak default below), and a no-op in OTA update mode while a handle
  * exists -- see bridge_transport_spi_polled() below. */
-void bridge_transport_spi_hw_reinit(void);
+/* Re-open + re-arm the bridge slave.  Returns TRUE only when the slave is
+ * actually armed for the host's next clock.
+ *
+ * It used to return void and every caller assumed success, so a re-init whose
+ * re-arm had failed was still followed by cc3501e_bridge_ready().  The host
+ * then saw READY, asserted CSN and clocked a full frame into a slave that never
+ * latches -- silent byte misalignment, recoverable only through the host's
+ * desync walk.  arm_transfer() deliberately leaves the line LOW on a failed arm
+ * so the host sees a real stall instead; raising it anyway threw that away.
+ * Issue #5. */
+bool bridge_transport_spi_hw_reinit(void);
 
 /* True while the SPI slave has NO handle -- every SPI_open retry failed.  The
  * tick's desync / arm-failure self-heals both key off counters that only move

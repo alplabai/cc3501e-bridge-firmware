@@ -370,12 +370,20 @@ static bool        pend_valid;
  * MOSI dummies are discarded).  Non-blocking in SPI_MODE_CALLBACK: the DMA
  * (RX=ch12, TX=ch13) drains/fills the FIFO and the driver invokes on_transfer
  * when `count` frames have shifted. */
-static void arm_transfer(void *rx, const void *tx, size_t count)
+/* Returns true only when the slave is ACTUALLY armed for the next clock.
+ *
+ * The return value used to be absent and every caller assumed success, which
+ * let two separate lies through (#5):
+ *   - worker.c and main.c raised READY after a re-init whose arm had failed,
+ *     so the host clocked a full frame into a slave that never latches;
+ *   - the reply-stall watchdog was stamped even when the arm bailed out, so a
+ *     quiesced OTA flush left a guaranteed false stall pending. */
+static bool arm_transfer(void *rx, const void *tx, size_t count)
 {
 	static SPI_Transaction t; /* retained for the transfer's duration */
 	if (g_quiesce) {
 		/* Deliberately leave READY LOW: not armed means the host must not clock. */
-		return;
+		return false;
 	}
 	if (bridge_transport_spi_polled()) {
 		/* Polled/update mode: RECORD the phase; poll_service() executes it.
@@ -390,7 +398,9 @@ static void arm_transfer(void *rx, const void *tx, size_t count)
 		pend_tx    = tx;
 		pend_count = count;
 		pend_valid = true;
-		return;
+		/* Recorded, not armed -- the service loop arms it.  Reported as armed
+		 * because the phase WILL be driven; the polled path has no watchdog. */
+		return true;
 	}
 	t.count = count;
 	t.txBuf = (void *)tx;
@@ -414,21 +424,22 @@ static void arm_transfer(void *rx, const void *tx, size_t count)
 		 * fail counter so cc3501e_hw_tick() drives a full SPI re-open
 		 * recovery (bridge_transport_spi_hw_reinit) -- see g_arm_fail_count. */
 		g_arm_fail_count++;
-		return;
+		return false;
 	}
 	/* Slave is now armed -> raise READY so the host may clock THIS transfer.  Paired
 	 * with the CSN-deassert re-arm + on_transfer's busy() drop, this gives the host an
 	 * exact "armed" edge to gate on, so it never asserts CSN + clocks into a not-yet-
 	 * re-armed slave (which loses the header's first bits -> misread -> 0x00 desync). */
 	cc3501e_bridge_ready();
+	return true;
 }
 
 /* Re-arm the request-header phase driving the 0xA5 marker on MISO.  Used both
  * for the normal next-frame re-arm and the P0-2 desync/probe no-op re-arm. */
-static void arm_request_header(void)
+static bool arm_request_header(void)
 {
 	phase = PH_REQ_HEADER;
-	arm_transfer(frame_buf, sync_idle, ALP_CC3501E_HEADER_BYTES);
+	return arm_transfer(frame_buf, sync_idle, ALP_CC3501E_HEADER_BYTES);
 }
 
 /* Replay the captured request frame through the silicon-free seams
@@ -564,9 +575,10 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 			 * reads the payload in the NEXT.  (No single-transfer reply -- the SS0
 			 * deassert after the header would cut a single armed reply mid-frame.) */
 			phase = PH_REPLY_HEADER;
-			arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES);
-			reply_armed_ms = cc3501e_hw_uptime_ms();
-			reply_armed    = true;
+			if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES)) {
+				reply_armed_ms = cc3501e_hw_uptime_ms();
+				reply_armed    = true;
+			}
 		} else {
 			phase = PH_REQ_PAYLOAD;
 			/* dummy_tx_zero (all-0x00) on MISO during payload (0xA5 marks the
@@ -580,9 +592,10 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 		dispatch_frame((size_t)ALP_CC3501E_HEADER_BYTES + cur_payload_len);
 		/* Reply HEADER as its own SS0-framed transfer (see PH_REQ_HEADER). */
 		phase = PH_REPLY_HEADER;
-		arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES);
-		reply_armed_ms = cc3501e_hw_uptime_ms();
-		reply_armed    = true;
+		if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES)) {
+			reply_armed_ms = cc3501e_hw_uptime_ms();
+			reply_armed    = true;
+		}
 		break;
 
 	case PH_REPLY_HEADER:
@@ -590,10 +603,11 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 		 * SS0-framed transfer, after the host clocked the reply header in the previous
 		 * transceive (so it knows the length to clock here). */
 		phase = PH_REPLY_PAYLOAD;
-		arm_transfer(
-		    NULL, &reply_buf[ALP_CC3501E_HEADER_BYTES], reply_len - ALP_CC3501E_HEADER_BYTES);
-		reply_armed_ms = cc3501e_hw_uptime_ms();
-		reply_armed    = true;
+		if (arm_transfer(
+		        NULL, &reply_buf[ALP_CC3501E_HEADER_BYTES], reply_len - ALP_CC3501E_HEADER_BYTES)) {
+			reply_armed_ms = cc3501e_hw_uptime_ms();
+			reply_armed    = true;
+		}
 		break;
 
 	case PH_REPLY_PAYLOAD:
@@ -743,8 +757,11 @@ bool bridge_transport_spi_poll_service(void)
  * spi_open_and_arm().  Read cross-TU via bridge_transport_spi_is_dead(). */
 volatile uint32_t g_spi_open_failed;
 
-static void spi_open_and_arm(void)
+static bool spi_open_and_arm(void)
 {
+	/* A fresh open has no outstanding reply, so the stall latch must not
+	 * survive into it.  Issue #5. */
+	reply_armed = false;
 	for (size_t i = 0u; i < sizeof(sync_idle); i++) {
 		sync_idle[i] = ALP_CC3501E_SYNC_IDLE;
 	}
@@ -805,7 +822,7 @@ static void spi_open_and_arm(void)
 		 * transient by nature; the only thing that made it terminal was never
 		 * trying again. */
 		g_spi_open_failed = 1u;
-		return;
+		return false;
 	}
 	g_spi_open_failed = 0u;
 
@@ -817,7 +834,7 @@ static void spi_open_and_arm(void)
 	 * again and stall the host's per-request READY gate (-3 BUSY).  Bench-proven. */
 
 	g_resync_count = 0u;
-	arm_request_header();
+	return arm_request_header();
 }
 
 /* Release the slave and its DMA WITHOUT SPI_transferCancel.  The cancel has now
@@ -841,6 +858,12 @@ void bridge_transport_spi_hw_release(void)
 		spi = NULL;
 	}
 	phase = PH_REQ_HEADER;
+	/* Clear the reply-stall latch: the transfer it referred to is gone.
+	 * Without this, ONE abandoned reply became a 100 Hz SPI_close/SPI_open
+	 * storm -- cc3501e_hw_tick() re-evaluated the same stale stamp every
+	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
+	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
+	reply_armed = false;
 }
 
 /* Re-open + re-arm the bridge slave after a radio op (boot Wlan_Start or a
@@ -861,7 +884,7 @@ uint8_t bridge_transport_spi_phase(void)
 	return (uint8_t)phase;
 }
 
-void bridge_transport_spi_hw_reinit(void)
+bool bridge_transport_spi_hw_reinit(void)
 {
 	/* OTA update mode with a LIVE handle: nothing was ever torn down, so there is
 	 * nothing to re-establish -- and re-rolling spi_open_and_arm()'s SPI_open retry
@@ -880,7 +903,7 @@ void bridge_transport_spi_hw_reinit(void)
 	 * that self-heal to kill.  The tick's OTHER two self-heals (resync burst, arm
 	 * failure) only ever fire with a live handle, so they still no-op here. */
 	if (bridge_transport_spi_polled() && spi != NULL) {
-		return;
+		return true; /* nothing torn down -> still armed */
 	}
 	if (spi != NULL) {
 		/* NO SPI_transferCancel here.  I added one on audit advice ("closing a
@@ -896,7 +919,7 @@ void bridge_transport_spi_hw_reinit(void)
 		SPI_close(spi);
 		spi = NULL;
 	}
-	spi_open_and_arm();
+	return spi_open_and_arm();
 }
 
 /* Quiesce the bridge slave + RELEASE its DMA (ch12/13) for the DURATION of a radio op
@@ -923,6 +946,12 @@ void bridge_transport_spi_hw_suspend(void)
 		spi = NULL;
 	}
 	phase = PH_REQ_HEADER;
+	/* Clear the reply-stall latch: the transfer it referred to is gone.
+	 * Without this, ONE abandoned reply became a 100 Hz SPI_close/SPI_open
+	 * storm -- cc3501e_hw_tick() re-evaluated the same stale stamp every
+	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
+	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
+	reply_armed = false;
 }
 
 void bridge_transport_spi_hw_init(void)
