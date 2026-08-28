@@ -6,12 +6,20 @@
  *
  * ===================== WHY THIS EXISTS (task #17) =====================
  * The firmware learns of asynchronous events (Wi-Fi connect/disconnect, BLE
- * connection, a GPIO edge) on its radio/host-driver threads, but there is NO
- * slave->master attention line on this HW rev (the CC35 GPIO17 -> Alif P2_6
- * wire is a BODGE not routed on the stock EVK), so it cannot PUSH them to the
- * host.  Instead the host POLLS: it periodically issues
+ * connection, a GPIO edge) on its radio/host-driver threads, but the CC3501E is
+ * the SPI slave and can never initiate a transfer, so it cannot PUSH an event
+ * frame to the host.  The host POLLS instead: it issues
  * CMD_GET_PENDING_EVENTS, and handle_get_pending_events() DRAINS this ring
  * into the reply.
+ *
+ * There IS a slave->master ATTENTION path, and it is multiplexed onto the READY
+ * wire (CC35 GPIO17 -> Alif P2_6, the rev-1 bodge line that the stock EVK does
+ * not route): event_ring_push() below calls cc3501e_bridge_attn_pulse(), and a
+ * host that armed the edge drains at once instead of waiting for its timer
+ * (#130, alp-sdk#1721).  It does not replace the poll -- the firmware half is a
+ * BUILD-TIME OPT-IN (CC3501E_ATTN_PULSE, default OFF; without it the pulse links
+ * to a no-op stub and the host falls back to its timer).  A dedicated HOST_IRQ
+ * pad is still a future board rev.  See DESIGN.md for both limits.
  *
  * The ring decouples the event PRODUCERS (thread context: the Wi-Fi event
  * callback / connect body, BLE, GPIO) from the CONSUMER (the SPI-ISR dispatch
@@ -41,7 +49,9 @@
 #define CC3501E_EVENT_RING_SLOTS  16u
 #define CC3501E_EVENT_PAYLOAD_MAX 16u
 
-/* Initialise the ring to empty (called once from main() / worker_init). */
+/* Initialise the ring to empty.  Called once from main(), right after
+ * worker_init() and before the transport is started -- worker_init() itself does
+ * NOT touch the ring. */
 void event_ring_init(void);
 
 /*
@@ -66,6 +76,13 @@ int event_ring_push(uint8_t evt_opcode, const uint8_t *payload, uint8_t len);
  * Packs WHOLE entries only: an entry that would not fit in @p cap is LEFT in
  * the ring for the next drain (never split).  Returns the number of bytes
  * written to @p out (0 when the ring is empty or the first entry does not fit).
+ *
+ * The entry list is NOT self-delimiting, and protocol_build_reply() pads the
+ * reply payload with zero bytes that the declared payload_len counts -- which is
+ * exactly how an empty drain once decoded as three "opcode 0x00, len 0" events
+ * (alp-sdk#1740).  The host walk stops at a zero opcode; keep opcode 0 out of
+ * the wire format here, and read protocol.h's padding note before changing this
+ * layout.
  */
 size_t event_ring_drain(uint8_t *out, size_t cap);
 

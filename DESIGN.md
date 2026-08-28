@@ -2,14 +2,21 @@
 
 Scope, the wire framing, and the bench bring-up plan.  The authoritative
 wire contract is
-[`include/alp/protocol/cc3501e.h`](../../include/alp/protocol/cc3501e.h);
+[`include/alp/protocol/cc3501e.h`](https://github.com/alplabai/alp-sdk/blob/main/include/alp/protocol/cc3501e.h);
 this file records the firmware-side decisions and the host/firmware
 framing they share.
 
-## v0.1 scope ("bring-up")
+## Command scope
 
-The META command group only, enough to prove the link is alive and
-version-compatible:
+`protocol_dispatch()` (`src/protocol.c`) routes **49 opcodes** -- every
+command family in the wire header: META, Wi-Fi station/AP/scan/status,
+BLE (enable, advertise, scan, connect, GATT), sockets, the GPIO proxy,
+camera enables, power policy, diagnostics + `GET_PENDING_EVENTS`, and OTA
+including `OTA_UPDATE_MODE`.  All of them route to TI's CC35xx Wi-Fi /
+NimBLE / lwIP / `psa_fwu` APIs through the `hal/ti/` backend.
+
+The META group is still the floor the link is debugged against -- nothing
+else is worth reading until these four answer:
 
 | Opcode | Behaviour |
 |--------|-----------|
@@ -18,21 +25,30 @@ version-compatible:
 | `GET_MAC` (0x03) | reply data = 6-byte factory MAC (HAL); stub → `RESP_ERR_NOT_READY` |
 | `RESET` (0x02) | ack `RESP_OK`, then HAL reboots after the ack is drained |
 
-Every other opcode (Wi-Fi, BLE, GPIO proxy, camera, power, diagnostics)
-returns `ALP_CC3501E_RESP_ERR_INVALID`, per the protocol header's
-contract that v1 firmware rejects opcodes it does not implement.  Those
-groups land in v0.2+ and route to TI's SimpleLink Wi-Fi / BLE APIs
-through the `hal/ti/` backend.
+Routed is not the same as proven: `BRINGUP_STATUS.md` records what is
+silicon-validated per pillar, and **sockets do not connect**
+(alp-sdk#1746).
+
+What survives unchanged from the bring-up contract is the rejection rule:
+an opcode this firmware does not implement returns
+`ALP_CC3501E_RESP_ERR_INVALID`, per the protocol header's contract that
+firmware rejects opcodes it does not implement.
 
 ## Wire framing -- hardware-SS0 phases + READY (current HW rev)
 
 Both sides build the same frame: a 4-byte LE header
 `[cmd | flags | payload_len(LE16)]` + payload.  The reply echoes the
-request `cmd`, uses `flags = 0` (solicited; async events in v0.2+ set
-`ALP_CC3501E_FLAG_ASYNC_EVENT`), and its payload is `[status][data...]`
+request `cmd`, uses `flags = 0`, and its payload is `[status][data...]`
 — the response status (`ALP_CC3501E_RESP_*`) is the first payload byte,
 per the header.  Framing + dispatch is centralised in
 `protocol_build_reply()` so SPI and SDIO are byte-identical.
+
+`ALP_CC3501E_FLAG_ASYNC_EVENT` is defined by the wire header but **no
+code in this firmware ever sets it**: every frame the CC3501E emits is a
+solicited reply with `flags = 0`.  Async events do not travel as their
+own frames at all — they are queued in the event ring and handed back
+inside an ordinary `GET_PENDING_EVENTS` reply (the attention edge below
+only tells the host *when* to ask).
 
 The **current E1M-AEN rev wires SCLK/MOSI/MISO plus a real hardware
 chip-select**: the Alif side muxes `P14_7` as `SPI1_SS0_C`, and the
@@ -47,12 +63,25 @@ next length from a header it already exchanged:
 | 1 | request header | MOSI | 4 |
 | 2 | request payload | MOSI | `payload_len` (from #1) |
 | 3 | reply header | MISO | 4 |
-| 4 | reply payload | MISO | reply `payload_len` (from #3) = status + data |
+| 4 | reply payload | MISO | reply `payload_len` (from #3) = status + data + zero pad |
+
+**Phase 4 is NOT `1 + data_len`.**  `protocol_build_reply()` rounds the
+reply payload up to a multiple of `CC3501E_REPLY_PAD` (8) with zero bytes,
+so the declared `payload_len` is `status + data + pad` and the host clocks
+the padded length.  The padding buys the host's DW SSI a burst-aligned DMA
+transfer; the cost is that **a variable-length reply payload must be
+self-delimiting**, because `payload_len` no longer delimits the data.  It
+was not, once: an empty `GET_PENDING_EVENTS` drain came back as 7 zero pad
+bytes and the host walked them as three `opcode 0x00, len 0` events, ~5.8
+phantom events per second forever (alp-sdk#1740, see `BRINGUP_STATUS.md`).
+Any NEW variable-length reply payload must carry its own count or its own
+terminator, or it walks into the same trap.
 
 The host waits for READY before the reply header and reply payload
-phases.  Firmware side: `hal/ti/transport_hw_ti_spi.c` (a `SPI_SLAVE` +
-`SPI_MODE_CALLBACK` state machine that replays the captured frame through
-the silicon-free byte seams and advances on transfer completion).  Host
+phases.  Firmware side: `hal/ti/transport_hw_ti_spi.c` (a `SPI_PERIPHERAL`
++ `SPI_MODE_CALLBACK` state machine that replays the captured frame through
+the silicon-free byte seams and advances on transfer completion;
+`SPI_PERIPHERAL` is the CC35xx TI Drivers term for SPI slave).  Host
 side: `chips/cc3501e/cc3501e_core.c` `cc3501e_request()` (matching four-phase
 sequence + `resp_to_status()` on `payload[0]`).  Host + firmware are
 reconciled to each other and to the header, and this hardware-SS0 bridge
@@ -161,15 +190,20 @@ came up is dropped.
   `CC3501E_HW_ERR_NOTIMPL`.  The host test + CI compile smoke build this.
 - `ti` (`hal/ti/`): the real bench backend, built with `ticlang` against
   TI's SimpleLink CC35xx SDK (FreeRTOS + LwIP + TI Drivers).  Implemented:
-  - `cc3501e_hw_ti.c`: `GPIO_init`/`SPI_init`, lazy SimpleLink start,
-    `cc3501e_hw_get_mac` via `sl_NetCfgGet(SL_NETCFG_MAC_ADDRESS_GET)`,
-    deferred reset via CMSIS `NVIC_SystemReset()` after the ack is sent.
+  - `cc3501e_hw_ti.c`: `Board_init()` (Power + GPIO + DMA) then
+    `SPI_init()`, and the deferred reset via CMSIS `NVIC_SystemReset()`
+    after the ack is sent.
+  - `cc3501e_hw_ti_wifi.c`: the lazy `Wlan_Start` bring-up
+    (`cc3501e_hw_wifi_lazy_start`) and `cc3501e_hw_get_mac` via
+    `Wlan_Get(WLAN_GET_MACADDRESS)` on a `WlanMacAddress_t`.  There is no
+    `sl_*` SimpleLink call anywhere in this tree -- the CC35xx host API is
+    `Wlan_*`.
   - `transport_hw_ti_spi.c`: the four-phase hardware-SS0 SPI-slave
-    transport above (`SPI_open(..., SPI_SLAVE, SPI_MODE_CALLBACK)`) with
-    READY gating between phases.
+    transport above (`SPI_open(..., SPI_PERIPHERAL, SPI_MODE_CALLBACK)`)
+    with READY gating between phases.
   - `transport_hw_ti_sdio.c`: frame glue complete; SDIO-device register
     bring-up is the one SWRU626 §21 bench item (no public SDK SDIO-device
-    driver) — off the v0.1 critical path.
+    driver) — off the critical path, since SPI is the default.
 
 ## SimpleLink command structs: a zero-init is NOT a set of defaults
 
@@ -205,7 +239,8 @@ not choose.
 The Alif is SPI master, so the CC3501E can never initiate a transfer, yet the
 protocol defines async events (`EVT_WIFI_*`, `EVT_BLE_*`,
 `EVT_GPIO_INTERRUPT`) with 5-10 ms latency budgets
-(docs/cc3501e-bridge.md).  Polling cannot meet those budgets without
+([`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)).
+Polling cannot meet those budgets without
 hammering the bus.
 
 ### What shipped (#130, alp-sdk#1721 -- 2026-08-27)
@@ -273,9 +308,11 @@ The firmware is identical across all AEN SKUs (the CC3501E + its
 inter-chip wiring are AEN-family-wide); these are board/SDK anchors, not
 firmware redesigns:
 
-1. **SysConfig anchor.** The `ti` build needs a board file defining
-   `CONFIG_SPI_0` (the inter-chip SPI on CC3501E GPIO_27/28/29 plus the
-   CC35-side CSN resource paired with Alif hardware SS0).
+1. **SysConfig anchor — DONE, kept here so it stays findable.** Both
+   board files are committed: `ti/cc3501e_aen.syscfg` and
+   `ti/cc3501e_aen_wifi.syscfg` (plus `ti/cc3501e_mem.syscfg`) define
+   `CONFIG_SPI_0` — the inter-chip SPI on CC3501E GPIO_27/28/29 plus the
+   CC35-side CSN resource paired with Alif hardware SS0.
 2. **Async-event producers.** The attention transport shipped (#130,
    alp-sdk#1721) on the shared READY wire; what is missing is producers.
    Only `EVT_WIFI_CONNECTED` / `EVT_WIFI_DISCONNECTED` reach
@@ -287,8 +324,8 @@ firmware redesigns:
 4. **Flashing.** The CC3501E is Alp-OTA-updated (`update_channel:
    alp_ota_spi_otp`, `flash_policy: recovery_only`); a customer flash
    is permitted only to recover a bricked device, with Alp Lab-supplied
-   binaries.  Bench units are warm-programmed via SWD/J-Link (see
-   `docs/cc3501e-production.md`).
+   binaries.  Bench units are warm-programmed via SWD/J-Link (see alp-sdk
+   [`docs/cc3501e-production.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-production.md)).
    The retired public `cc3501e_usb_bootloader` backend and
    `flash.py` release/bench helper now live in `alp-sdk-internal`
    as Alp-internal OTA-build tooling.

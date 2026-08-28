@@ -25,9 +25,10 @@ prebuilt/cc3501e-v0.4.0.bin):
   * lwIP                                     -- BSD-3-Clause
   * Mbed TLS                                 -- Apache-2.0
 
-alp-sdk does NOT redistribute TI's SDK itself; only a thin wrapper is
-committed (`vendor/simplelink-cc33xx/`), and the SDK is obtained from TI
-by whoever builds the `ti` backend.
+This repository does NOT redistribute TI's SDK itself; only a thin
+wrapper is committed (`vendor/simplelink-cc33xx/` -- a CMakeLists.txt and
+a README), and the SDK is obtained from TI by whoever builds the `ti`
+backend.
 
 OPEN ITEM -- redistribution terms of the shipped binaries
 ---------------------------------------------------------

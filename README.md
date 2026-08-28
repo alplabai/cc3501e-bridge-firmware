@@ -11,7 +11,8 @@
 > **`prebuilt/` ships signed binaries customers flash** as the
 > `helper_firmware.cc3501e_otp` payload named by the AEN SoM presets
 > (alp-sdk#1733). They are Alp Lab build output of the source here, linked
-> against TI's SimpleLink SDK — which alp-sdk does **not** redistribute; see
+> against TI's SimpleLink SDK — which this repository does **not**
+> redistribute; see
 > `vendor/simplelink-cc33xx/README.md` for how to obtain it.
 > The resulting images therefore also carry TI `wifi-uppermac`, lwIP and
 > mbedTLS code; see `NOTICE`.
@@ -29,33 +30,58 @@ host-side driver lives at [`chips/cc3501e/`](https://github.com/alplabai/alp-sdk
 the wire protocol at
 [`include/alp/protocol/cc3501e.h`](https://github.com/alplabai/alp-sdk/blob/main/include/alp/protocol/cc3501e.h).
 
-It is **embedded in alp-sdk** -- not split into a separate repo -- for
-the same reasons the [`gd32-bridge`](../gd32-bridge/) is: the wire
-protocol stays single-source (the firmware `#include`s the canonical
-header directly, no mirror to drift), and an opcode change moves the
-host driver, this firmware, and the wire-vector tests in **one commit**.
-See [ADR 0015](https://github.com/alplabai/alp-sdk/blob/main/docs/adr/0015-cc3501e-firmware-embedded.md).
+This firmware is its **own repository**, split out of
+`alp-sdk:firmware/cc3501e` (alp-sdk#1370); the
+[`gd32-bridge`](https://github.com/alplabai/alp-sdk/tree/main/firmware/gd32-bridge/)
+is still embedded in alp-sdk.  The wire protocol stays single-source
+across the split: the firmware `#include`s the canonical header out of an
+alp-sdk checkout (`-DALP_SDK_ROOT=<path>`), never a mirrored copy, so
+there is nothing here to drift.  What the split cost is **atomicity** --
+an opcode change is now two commits in two repos instead of one -- so CI
+builds against alp-sdk's *default branch* rather than a pinned SHA, and
+the `protocol version parity` job fails the moment `protocol-version.txt`
+and `ALP_CC3501E_PROTOCOL_VERSION` disagree.
+[ADR 0015](https://github.com/alplabai/alp-sdk/blob/main/docs/adr/0015-cc3501e-firmware-embedded.md)
+records the pre-split rationale.
 
 ## Tree layout
 
 ```
-firmware/cc3501e/
-├── CMakeLists.txt          ← backend (stub|ti) + transport (spi|sdio) selection
+cc3501e-bridge-firmware/
+├── CMakeLists.txt          ← backend (stub|ti) + transport (spi|sdio) selection; ALP_SDK_ROOT
 ├── README.md               ← this file
-├── DESIGN.md               ← v0.1 scope, wire-reply contract, reconciliation items
+├── DESIGN.md               ← command scope, wire-reply contract, reconciliation items
+├── BRINGUP_STATUS.md       ← the on-silicon bench record (link / Wi-Fi / BLE / OTA)
+├── CONTRIBUTING.md         ← house style + review rules
+├── NOTICE                  ← third-party code inside the SHIPPED BINARIES
 ├── firmware-version.txt    ← firmware RELEASE semver (own axis)
 ├── protocol-version.txt    ← wire-protocol version expected (= ALP_CC3501E_PROTOCOL_VERSION)
-├── prebuilt/               ← signed binaries shipped with each alp-sdk release
-├── toolchain/              ← arm-none-eabi (stub/CI smoke) + ticlang (bench/production)
+├── prebuilt/               ← signed release binaries + CHANGELOG.md
+├── toolchain/              ← arm-none-eabi.cmake (stub/CI smoke) + ticlang.cmake (bench)
+├── vendor/simplelink-cc33xx/ ← CMake shim onto a TI SDK you install yourself (no SDK sources)
+├── ti/                     ← bench build + flash-set scripts, and the SysConfig board files
 ├── src/
-│   ├── main.c              ← entry: hw init → selected transport init → WFI loop
-│   ├── protocol.{c,h}      ← shared command-handler table + transport-agnostic framing
+│   ├── main.c              ← entry: hw init → selected transport init → WFI / FreeRTOS loop
+│   ├── protocol.{c,h}      ← the opcode → handler switch + transport-agnostic framing
+│   ├── protocol_internal.h ← handler declarations shared by the family TUs
+│   ├── protocol_meta.c     ← PING / GET_VERSION / GET_MAC / RESET / STREAM_WRITE
+│   ├── protocol_wifi.c     ← Wi-Fi station / AP / scan / status
+│   ├── protocol_ble.c      ← BLE enable / advertise / scan / connect / GATT
+│   ├── protocol_sockets.c  ← socket open / connect / send / recv / close
+│   ├── protocol_gpio.c     ← GPIO proxy
+│   ├── protocol_camera.c   ← camera-enable rails
+│   ├── protocol_power.c    ← power policy (latched by the ISR, applied on the task)
+│   ├── protocol_ota.c      ← OTA over the bridge + OTA update mode
+│   ├── protocol_diag.c     ← diagnostics + the GET_PENDING_EVENTS drain
+│   ├── event_ring.{c,h}    ← the async EVT_* ring the host drains
+│   ├── worker.{c,h}        ← off-ISR seam for blocking radio / flash bodies
 │   ├── transport.h         ← SPI + SDIO seam declarations
 │   ├── transport_spi.c     ← SPI-slave staging (DEFAULT link)        — silicon-free
 │   └── transport_sdio.c    ← SDIO-slave staging (OPTIONAL link)      — silicon-free
 ├── hal/
-│   ├── cc3501e_hw.h        ← HAL contract (init, tick, get_mac, reset)
-│   ├── cc3501e_hw_stub.c   ← hardware-free backend (host tests + CI compile smoke)
+│   ├── cc3501e_hw.h        ← HAL contract (init/tick/MAC/reset + Wi-Fi, BLE, sockets,
+│   │                         GPIO, camera, OTA, power, diagnostics)
+│   ├── cc3501e_hw_stub.c   ← hardware-free backend (CI compile smoke)
 │   └── ti/                 ← real TI SimpleLink / driverlib backend (bench build)
 └── tests/
     ├── gen_protocol_vectors.py  ← canonical wire vectors (regenerate + --check)
@@ -163,6 +189,13 @@ Build from source only when you are changing the firmware -- see below.
 The CMake build runs **outside** the Zephyr build (the Alif side's
 `west build` does not descend here).  Two backends:
 
+Run both from this repo's root.  `-DALP_SDK_ROOT` is **mandatory**: the
+firmware compiles the canonical `<alp/protocol/cc3501e.h>` out of an
+alp-sdk checkout, and CMake stops with a `FATAL_ERROR` when it cannot find
+that header.  `CMAKE_TOOLCHAIN_FILE` must be **absolute** -- CMake resolves
+a relative toolchain path against the *build* directory, not the working
+directory.
+
 ```bash
 # Host-side / CI compile smoke -- silicon-free, no TI SDK needed.
 # ALP_SDK_ROOT is MANDATORY: this firmware compiles alp-sdk's canonical
@@ -185,25 +218,39 @@ cmake -B build/ti -S . \
 cmake --build build/ti
 ```
 
-The `ti` backend vendors TI's **BSD-3-licensed** SimpleLink CC33xx SDK
-as a submodule under `vendor/simplelink-cc33xx/` (obtained from TI;
-alp-sdk does not redistribute it) and builds with `ticlang` (TI's Arm
-LLVM compiler -- pin the exact version on the bench for reproducible
-images).  CI builds only the `stub` backend (the silicon-free layer is
-toolchain-agnostic portable C; that catches compile + framing errors
-without the ~GB vendor SDK); the wire behaviour is additionally pinned
-by the native test `tests/zephyr/cc3501e_bridge_transport/` under the
-twister gate.
+The `ti` backend links against TI's SimpleLink CC33xx SDK, which you
+obtain from TI and install yourself.  It is **not vendored and not a
+submodule**: `vendor/simplelink-cc33xx/` holds only a `CMakeLists.txt`
+shim plus a `README.md` describing how to obtain the SDK -- no SDK
+sources are redistributed here, and this repository makes no statement
+about TI's licence terms.  The build uses `ticlang` (TI's Arm LLVM
+compiler -- pin the exact version on the bench for reproducible images).
+CI builds only the `stub` backend (that catches compile + framing errors
+without the ~GB vendor SDK), in both transport configurations, and pins
+`protocol-version.txt` against alp-sdk's `ALP_CC3501E_PROTOCOL_VERSION`.
+The frame-level wire vectors live in `tests/protocol_vectors.txt` and are
+pinned by the `wire vectors` job
+(`ALP_SDK_ROOT=<path-to-alp-sdk> python3 tests/gen_protocol_vectors.py
+--check`).  The full gate list is `stub build`, `protocol version parity`,
+`wire vectors`, `clang-format (diff only)`, `no build artifacts or crash
+dumps` and `prebuilt integrity`.
 
-## v0.x roadmap
+## Command scope
 
-v0.1 ("bring-up") implements the META command group only -- PING,
-GET_VERSION, GET_MAC, RESET -- enough to prove the link is alive and
-version-compatible.  Everything else (Wi-Fi, BLE, GPIO proxy,
-camera-enable, power, diagnostics) is rejected with
-`ALP_CC3501E_RESP_ERR_INVALID` and lands in v0.2+.  The full roadmap is
-in [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)
-"v0.x roadmap".
+`protocol_dispatch()` routes **49 opcodes**, covering every command family
+in the wire header: META (PING, GET_VERSION, GET_MAC, RESET,
+STREAM_WRITE), Wi-Fi station/AP/scan/status, BLE (enable, advertise,
+scan, connect, GATT), sockets, the GPIO proxy, camera enables, power
+policy, diagnostics + `GET_PENDING_EVENTS`, and OTA including
+`OTA_UPDATE_MODE`.  Routed is not the same as proven: the Status table
+below and `BRINGUP_STATUS.md` record what is silicon-validated, and
+**sockets do not connect** (alp-sdk#1746).
+
+What survives from the bring-up contract is the rejection rule: an opcode
+this firmware does not implement is answered with
+`ALP_CC3501E_RESP_ERR_INVALID`, per the protocol header.  The roadmap
+itself lives in
+[`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md).
 
 ## Source-of-truth contract
 
@@ -213,7 +260,7 @@ in [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs
 | Bridge architecture + GPIO behaviour contract | [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md) |
 | Inter-chip wiring (SPI1 / SDIO / control lines) | [`metadata/e1m_modules/aen/inter-chip.tsv`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/aen/inter-chip.tsv) |
 | E1M ↔ CC3501E pad routing | [`metadata/e1m_modules/aen/from-cc3501e.tsv`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/aen/from-cc3501e.tsv) |
-| v0.1 scope + wire-reply contract + reconciliation items | `DESIGN.md` |
+| Command scope + wire-reply contract (incl. the reply padding) + reconciliation items | `DESIGN.md` |
 
 ## Versioning
 
@@ -231,7 +278,8 @@ The CC3501E ships **pre-flashed by Alp**, and normal firmware updates are
 Alp-released and applied over the bridge SPI link, programming the chip's
 own OTP; the SoM preset models this with
 `helper_firmware[].update_channel: alp_ota_spi_otp` +
-`flash_policy: recovery_only` (see `metadata/e1m_modules/README.md`), and no
+`flash_policy: recovery_only` (see alp-sdk
+[`metadata/e1m_modules/README.md`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/README.md)), and no
 `flash_method`.  A customer flash is permitted **only** to recover a bricked
 device, using Alp Lab-supplied binaries — it is not a routine flash target.
 The signed
@@ -251,10 +299,10 @@ protocol **4**, so a host built from this tree refuses it.
 | Milestone | Status |
 |-----------|--------|
 | Wire-protocol header + host driver | ✅ landed (`include/alp/protocol/`, `chips/cc3501e/`) |
-| Firmware tree (embedded) | ✅ this tree |
-| v0.1 META group (PING / GET_VERSION / GET_MAC / RESET) | ✅ silicon-free + stub backend; native test green |
-| TI backend: SPI-slave + lifecycle (`hal/ti/`) | ✅ implemented against TI Drivers (`SPI_open` SPI_SLAVE callback) + SimpleLink (`sl_Start`/`sl_NetCfgGet`) + CMSIS reset. Hardware SS0 chip-select + per-phase READY framing (this rev wires SCLK/MOSI/MISO + `SPI1_SS0_C`); host `cc3501e_request()` reconciled to match. Compiles on the bench against the SimpleLink CC35xx SDK + a SysConfig board file (`CONFIG_SPI_0`). Bench-validated on E1M-AEN801 (FIB v0.0.207): survives radio ops and concurrent Wi-Fi/BLE scan; see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md). |
-| TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the v0.1 critical path — SPI is the default. |
+| Firmware tree (own repo) | ✅ this tree |
+| META group (PING / GET_VERSION / GET_MAC / RESET) | ✅ silicon-free + stub backend; the frames are pinned by `tests/protocol_vectors.txt` (regenerate or `--check` with `tests/gen_protocol_vectors.py`; gated by the `wire vectors` CI job) |
+| TI backend: SPI-slave + lifecycle (`hal/ti/`) | ✅ implemented against TI Drivers (`SPI_open` in `SPI_PERIPHERAL` + `SPI_MODE_CALLBACK`) + the CC35xx Wi-Fi host API (`Wlan_Start`, and `Wlan_Get(WLAN_GET_MACADDRESS)` for the factory MAC) + CMSIS reset. Hardware SS0 chip-select + per-phase READY framing (this rev wires SCLK/MOSI/MISO + `SPI1_SS0_C`); host `cc3501e_request()` reconciled to match. Compiles on the bench against the SimpleLink CC35xx SDK + a SysConfig board file (`CONFIG_SPI_0`). Bench-validated on E1M-AEN801 (FIB v0.0.207): survives radio ops and concurrent Wi-Fi/BLE scan; see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md). |
+| TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the critical path — SPI is the default. |
 | Async events: attention edge on READY | ✅ shipped and silicon-validated (#130, alp-sdk#1721): the CC35 pulses an attention edge on the rev-1 READY wire (`GPIO17` -> Alif `P2_6`) and the host drains on the edge — 135/135 firmware pushes delivered with the timer poll at 60 s. **Build-time opt-in** (`build_ti.ps1 -AttnPulse`, default OFF: the wire is a rev-1 bodge absent on the stock EVK), and only `EVT_WIFI_CONNECTED`/`_DISCONNECTED` have a producer today. A *dedicated* HOST_IRQ pad remains a future board rev (see DESIGN.md). |
 | `flash.py` real flashing | 🔮 moved to `alp-sdk-internal` (Alp-internal OTA-build tooling); blocked on TI's `cc3501e-flasher` CLI (not public yet); manual SWD/J-Link is the interim bench path |
 | `prebuilt/` populated | ✅ `cc3501e-v0.4.1.bin` signed (full bridge: META + Wi-Fi + BLE + OTA, proto v5 incl. `OTA_UPDATE_MODE`); fixes the soft-AP that accepted no clients (alp-sdk#1562). **Sockets are present but do NOT connect** (alp-sdk#1746) — see `prebuilt/CHANGELOG.md`. |

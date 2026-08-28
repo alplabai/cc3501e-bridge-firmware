@@ -15,11 +15,16 @@
  *     level (via mux resistors) with the micro-SD slot, so SDIO is
  *     available to the CC3501E only on boards that do NOT populate an
  *     SD card.  When an SD card is used, SDIO is blocked and the link
- *     falls back to SPI.  See docs/cc3501e-bridge.md "Inter-chip
- *     wiring" + "Selectable host-control transport".
+ *     falls back to SPI.  See alp-sdk's docs/cc3501e-bridge.md
+ *     (https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)
+ *     "Inter-chip wiring" + "Selectable host-control transport".
  *
- * Exactly one control transport is active per build/boot
- * (CC3501E_CONTROL_TRANSPORT, default spi).  Whichever is active, it
+ * Exactly one control transport is OPENED per build/boot
+ * (CC3501E_CONTROL_TRANSPORT, default spi): main() calls
+ * transport_sdio_init() in an SDIO build and transport_spi_init()
+ * otherwise, never both.  Both transports -- and, in the ti backend,
+ * both of their HW halves -- are still COMPILED into every image;
+ * compiled is not opened.  Whichever is active, it
  * feeds the SAME protocol_dispatch() -- one framing format, one
  * command set, one set of reply codes; only the byte-level transport
  * differs (the gd32-bridge SPI + I2C model).
@@ -177,7 +182,7 @@ void cc3501e_bridge_attn_pulse(void);
  * tx_next_byte while tx_pending() is true.  Request and reply ride
  * SEPARATE transactions; the firmware signals "reply ready" to the
  * host out-of-band (a READY GPIO -- the v0.x bring-up handshake noted
- * in chips/cc3501e/cc3501e.c). */
+ * in alp-sdk chips/cc3501e/cc3501e_core.c). */
 void    spi_slave_cs_low(void);       /* CS falling edge: reset RX staging    */
 void    spi_slave_rx_byte(uint8_t b); /* one received request byte            */
 void    spi_slave_cs_high(void);      /* CS rising edge: decode + dispatch     */

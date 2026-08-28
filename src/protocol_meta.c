@@ -8,13 +8,13 @@
  * protocol.c still owns the single command-family switch that routes
  * here.
  *
- * v0.1 ("bring-up") scope: the META group only.  Every other opcode --
- * Wi-Fi, BLE, GPIO proxy, power, diagnostics -- is rejected with
- * ALP_CC3501E_RESP_ERR_INVALID per the protocol header's contract ("v1
- * firmware rejects opcodes it does not implement with
- * ALP_CC3501E_RESP_ERR_INVALID").  Those land in v0.2+ and route to
- * TI's SimpleLink Wi-Fi / BLE APIs through the HAL backend; see
- * docs/cc3501e-bridge.md "v0.x roadmap".
+ * This TU owns the META group ONLY.  The Wi-Fi, BLE, socket, GPIO,
+ * camera, power, diagnostics and OTA families live in the sibling
+ * protocol_<family>.c TUs, and protocol_dispatch() routes every one of
+ * them.  An opcode that NO family implements is answered with
+ * ALP_CC3501E_RESP_ERR_INVALID, per the protocol header's contract
+ * ("firmware rejects opcodes it does not implement with
+ * ALP_CC3501E_RESP_ERR_INVALID").
  *
  * Handlers that touch hardware (MAC read, self-reset) call the
  * cc3501e_hw_* shims declared in ../hal/cc3501e_hw.h.  The stub backend

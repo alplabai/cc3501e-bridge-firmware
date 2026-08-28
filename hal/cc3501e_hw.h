@@ -2,7 +2,7 @@
  * Copyright 2026 Alp Lab AB
  * SPDX-License-Identifier: Apache-2.0
  *
- * Hardware-abstraction shim consumed by firmware/cc3501e/src/.
+ * Hardware-abstraction shim consumed by this firmware's src/.
  * Each function maps a firmware-level operation onto the CC3501E
  * silicon via TI's SimpleLink CC33xx SDK / driverlib.
  *
@@ -12,11 +12,11 @@
  * implementations live under hal/ti/ (CC3501E_HAL_BACKEND=ti, linked
  * against TI's SimpleLink SDK on the bench build).
  *
- * v0.1 ("bring-up") surface is intentionally tiny: chip init, the idle
- * housekeeping tick, the factory MAC read, and a deferred self-reset.
- * The Wi-Fi / BLE / GPIO-proxy / camera-enable HAL surfaces land in
- * v0.2+ alongside their protocol handlers (see docs/cc3501e-bridge.md
- * "v0.x roadmap").
+ * The surface below is grouped by command family and now covers the
+ * whole bridge: chip init, the idle housekeeping tick, the factory MAC
+ * read and a deferred self-reset, plus the GPIO proxy, camera enables,
+ * Wi-Fi, sockets, BLE, OTA, power policy and diagnostics.  Each group
+ * sits beside the protocol handlers that call it.
  */
 
 #ifndef CC3501E_BRIDGE_HAL_CC3501E_HW_H
@@ -106,7 +106,7 @@ void cc3501e_hw_notify_reply_sent(void);
 /* --------------------------------------------------------------- */
 
 /* The CC3501E fronts E1M pads IO11 / IO13 / IO15..IO21 (plus mux/wake
- * lines) and the two camera-enable LDOs, per
+ * lines) and the two camera-enable LDOs, per alp-sdk's
  * metadata/e1m_modules/aen/from-cc3501e.tsv.  These shims drive the
  * proxied CC3501E GPIOs on the Alif's behalf.  @p pad is the CC3501E
  * GPIO index; @p dir / @p pull / @p edge use the alp_cc3501e_gpio_*
