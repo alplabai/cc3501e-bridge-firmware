@@ -11,10 +11,19 @@
  * sdio_slave_reply()/sdio_slave_reply_len() is clocked back on the
  * host's read block.  The framing is byte-identical to the SPI link.
  *
- * Inter-chip pins (metadata/e1m_modules/aen/inter-chip.tsv):
- * SDIO.CLK/CMD/D0..D3 on CC3501E GPIO_3/4/5/6/10/11.  SDIO is available
- * only when the board routes the Alif's single SDIO controller to the
- * CC3501E instead of an SD card (transport.h / docs/cc3501e-bridge.md).
+ * Inter-chip pins (alp-sdk repository, metadata/e1m_modules/aen/
+ * inter-chip.tsv), stated positionally because D2/D3 do NOT run in
+ * ascending GPIO order:
+ *
+ *   SDIO.CLK = GPIO_3    SDIO.D0 = GPIO_5    SDIO.D2 = GPIO_11
+ *   SDIO.CMD = GPIO_4    SDIO.D1 = GPIO_6    SDIO.D3 = GPIO_10
+ *
+ * TI gives SDIO_D2 = GPIO11 (pin 35) and SDIO_D3 = GPIO10 (pin 36), each
+ * selected at IOSEL 13h in the corresponding GPIOnPCFG register;
+ * GPIO10PCFG has no sdio_d2 encoding at all, so a D2/D3 swap is not
+ * merely wrong, it is unimplementable.  SDIO is available only when the
+ * board routes the Alif's single SDIO controller to the CC3501E instead
+ * of an SD card (transport.h / the alp-sdk repository's bridge doc).
  *
  * ============================ BENCH NOTE ============================
  * The frame glue below is complete and transport-agnostic.  The ONE
@@ -90,8 +99,10 @@ void sdio_hw_on_reply_block_sent(void)
 void bridge_transport_sdio_hw_init(void)
 {
 	/* Configure the CC3501E SDIO peripheral in DEVICE/function mode on
-     * GPIO_3/4/5/6/10/11 and register the block-transfer ISR so it
-     * drives sdio_hw_on_block_received() (request block in), clocks
+     * CLK=GPIO_3, CMD=GPIO_4, D0=GPIO_5, D1=GPIO_6, D2=GPIO_11,
+     * D3=GPIO_10 (see the header: D2/D3 are NOT in ascending GPIO
+     * order) and register the block-transfer ISR so it drives
+     * sdio_hw_on_block_received() (request block in), clocks
      * sdio_hw_reply_ptr()/sdio_hw_reply_len() back (reply block out)
      * and reports sdio_hw_on_reply_block_sent() when that read block
      * completes (arms the deferred CMD_RESET / OTA swap-reboot).
