@@ -31,7 +31,11 @@
  * This is distinct from BOTH:
  *   - ALP_CC3501E_PROTOCOL_VERSION (GET_VERSION) -- the wire-compat gate.
  *   - the GPE flash/image version (ti/deploy_validate.sh) -- the vendor-RoT
- *     anti-rollback gate; monotonic + date-derived, NOT this app SemVer.
+ *     anti-rollback gate; monotonic against the part last-seen stamp and
+ *     supplied EXPLICITLY, NOT this app SemVer.  (It was called
+ *     "date-derived" here, which described the epoch default that #15
+ *     removed -- that scheme wrapped every 194 days and generated a
+ *     rollback stamp.  There is no default any more.)
  *
  * The #ifndef fallback keeps a standalone compile (no -D) sane and MUST
  * track firmware-version.txt's current value. */
