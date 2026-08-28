@@ -42,10 +42,40 @@ VOUT="$fw/build/ti/cc3501e-bridge.out"               # the firmware built by bui
 DIR_OUT="${DIR_OUT:-$fw/build/ti/flashset}"
 [ -f "$VOUT" ] || { echo "missing $VOUT -- run firmware/cc3501e/ti/build_ti.sh --wifi --ble"; exit 1; }
 
-# GPE version: MAJOR=0, low 3 bytes of the epoch (monotonic; each byte <=255).
-# Same scheme as deploy_validate.sh -- guaranteed higher than a prior same-day set.
-_e=$(date +%s)
-VERSION="${VERSION:-0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))}"
+# GPE anti-rollback stamp.  MANDATORY -- there is deliberately no default.
+#
+# This used to derive one from the epoch:
+#     _e=$(date +%s)
+#     VERSION="${VERSION:-0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))}"
+# (_e>>16)&255 wraps every 2^24 s = 16,777,216 s = 194.18 days, so the generated
+# stamp moves BACKWARDS across every wrap.  The window wrapping inside a release
+# cycle was never the failure mode; the window wrapping since the unit was last
+# flashed is.  Measured in this checkout on 2026-08-29 the default came out as
+# 0.146.13.35, against a bench part whose last confirmed flash is 0.149.65.9 --
+# i.e. a rollback stamp, generated silently, by default.
+#
+# SWRU626 10.4.1: "An uploaded application version needs to pass both
+# authentication and version rollback checks."  So the set builds, the programmer
+# streams the full ~1.09 MB, exits 0, and BL2 then refuses to boot it -- this
+# repo's own documented "#1 cause of streams clean but dead link", with an empty
+# XDS110 query image table that reads like a dead secure element and is not one.
+#
+# A missing argument is a better failure than a bricked link, so VERSION is now
+# required.  Rules: major MUST be 0 (major >= 1 fails BL2 secure boot with
+# AUTH_ERROR 0x80), every field <= 255, and strictly greater than anything ever
+# flashed on that unit -- the SBL enforces monotonicity against the last-seen
+# version even when every rollback-protection fuse reads 0.
+: "${VERSION:?set VERSION explicitly, e.g. VERSION=0.149.66.0 (major must be 0, each field <= 255, and strictly greater than anything ever flashed on that unit -- there is no safe default)}"
+
+case "$VERSION" in
+  0.*.*.*) ;;
+  *) echo "VERSION must have major 0 (a GPE major >= 1 fails BL2 secure boot with AUTH_ERROR 0x80): got $VERSION" >&2; exit 2 ;;
+esac
+_v_bad=0
+for _f in $(echo "$VERSION" | tr '.' ' '); do
+  case "$_f" in ''|*[!0-9]*) _v_bad=1 ;; *) [ "$_f" -le 255 ] || _v_bad=1 ;; esac
+done
+[ "$_v_bad" = 0 ] || { echo "every VERSION field must be a number <= 255: got $VERSION" >&2; exit 2; }
 
 # WARM action_params: primary_vendor_image=true, everything else (incl. boot_sector)
 # false.  Regenerate it from REF_SET's full-set params unless one is provided.
