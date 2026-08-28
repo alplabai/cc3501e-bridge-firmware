@@ -45,7 +45,14 @@ permanent history someone has to read.
 ```sh
 # stub build -- the same one CI runs; the ti backend needs non-redistributable
 # TI tooling, so this is the compile coverage available to you
-cmake -B build/stub -S . -DCC3501E_HAL_BACKEND=stub -DALP_SDK_ROOT=<path-to-alp-sdk>
+# CMAKE_TOOLCHAIN_FILE is NOT optional: these are Cortex-M33 sources compiled
+# -mcpu=cortex-m33 -mthumb, so without it CMake picks the HOST compiler and the
+# build cannot work.  It must be ABSOLUTE -- a relative path resolves against
+# the BUILD directory, not the working directory.
+cmake -B build/stub -S . \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/arm-none-eabi.cmake" \
+  -DCC3501E_HAL_BACKEND=stub \
+  -DALP_SDK_ROOT=<path-to-alp-sdk>
 cmake --build build/stub
 
 # formatting, on the files you touched (clang-format 22.x)

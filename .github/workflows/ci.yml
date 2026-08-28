@@ -117,13 +117,70 @@ jobs:
           # working directory, so "firmware/toolchain/..." was looked for at
           # "build/firmware/toolchain/..." and reported as
           # "Could not find toolchain file".
+          # -Werror is passed HERE rather than baked into CMakeLists.txt so a
+          # developer's local build still completes and shows its warnings.
+          # CMakeLists already sets -Wall -Wextra -Wshadow -Wpedantic; without
+          # -Werror every warning those produce merged green, which is the
+          # entire reason this job "looked present and did not gate" (#11).
           cmake -B build -S firmware \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
             -DCC3501E_HAL_BACKEND=stub \
-            -DALP_SDK_ROOT="$PWD/alp-sdk"
+            -DALP_SDK_ROOT="$PWD/alp-sdk" \
+            -DCMAKE_C_FLAGS="-Werror"
 
       - name: build
         run: cmake --build build -j"$(nproc)"
+
+      # The SDIO branch of src/main.c was NEVER compiled by CI: only the
+      # default -DCC3501E_CONTROL_TRANSPORT=spi was ever configured, while both
+      # transports are advertised as always compiling.  A second configure is
+      # cheap and is the only thing that makes that claim true (#11).
+      - name: configure (SDIO transport)
+        run: |
+          cmake -B build-sdio -S firmware \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
+            -DCC3501E_HAL_BACKEND=stub \
+            -DALP_SDK_ROOT="$PWD/alp-sdk" \
+            -DCC3501E_CONTROL_TRANSPORT=sdio \
+            -DCMAKE_C_FLAGS="-Werror"
+
+      - name: build (SDIO transport)
+        run: cmake --build build-sdio -j"$(nproc)"
+
+  protocol-vectors:
+    name: wire vectors are regenerated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: firmware
+
+      # tests/gen_protocol_vectors.py parses ALP_CC3501E_PROTOCOL_VERSION out of
+      # alp-sdk's canonical header -- this firmware compiles that header rather
+      # than a mirror, so the vectors have to be pinned against it, not against
+      # a copy that can drift.
+      - uses: actions/checkout@v4
+        with:
+          repository: alplabai/alp-sdk
+          path: alp-sdk
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The script advertised this check in its own docstring and in README.md,
+      # and NO job ran it -- so tests/protocol_vectors.txt was unpinned from the
+      # moment this repo was extracted, and had in fact drifted: every reply
+      # vector was missing the CC3501E_REPLY_PAD padding src/protocol.c applies,
+      # so the "canonical" vectors described frames the firmware never emits
+      # (#11).
+      - name: regenerate and diff
+        working-directory: firmware
+        env:
+          ALP_SDK_ROOT: ${{ github.workspace }}/alp-sdk
+        run: |
+          set -euo pipefail
+          python3 tests/gen_protocol_vectors.py --check
 
   protocol-version-parity:
     name: protocol version parity
