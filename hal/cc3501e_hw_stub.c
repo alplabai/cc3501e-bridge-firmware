@@ -65,6 +65,11 @@ void cc3501e_hw_notify_reply_sent(void)
 /* exercisable on the host with no silicon.  Real pad I/O is in       */
 /* hal/ti/.                                                          */
 /* --------------------------------------------------------------- */
+/* The CC3501E exposes GPIO0..GPIO37, so this 32 is NOT the device's pad count --
+ * it is a stub-side array bound.  A host proxying a pad >= 32 against the stub
+ * gets ERR_INVAL where real silicon would accept it.  Harmless for the
+ * silicon-free build's purpose (wire-contract coverage), but do not read this
+ * number as a hardware fact.  Issue #20. */
 #define STUB_GPIO_MAX 32u
 static uint8_t stub_gpio_level[STUB_GPIO_MAX];
 static uint8_t stub_cam[2];

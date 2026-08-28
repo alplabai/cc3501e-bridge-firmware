@@ -153,9 +153,14 @@ half of the policy may run there:
 
 - the radio half calls `Wlan_Set()`, a blocking vendor call -- the same reason
   `handle_sock_recv()` cannot call `lwip_recv()` and the worker seam exists;
-- the core half calls `Power_setPolicy()` / `Power_enablePolicy()`, which swap and
-  re-arm the function pointer the idle loop runs, racing the idle loop that may be
-  executing the very policy being replaced.
+- the core half calls `Power_enablePolicy()`, which arms the function pointer the
+  idle loop runs, racing an idle loop that may be executing it.
+
+  This bullet used to name `Power_setPolicy()` as well.  The core half
+  deliberately stopped calling it -- see `hal/ti/cc3501e_hw_ti_power.c`, which
+  explains at length that swapping the policy pointer at runtime is what made
+  #1683 intermittent, and that holding the DISALLOW constraints expresses every
+  preset without a policy swap.  Issue #20.
 
 Running either inline did not merely fail: on silicon every preset returned `-4`
 and the bridge itself went to `PING -> -5`. Both are therefore latched by the ISR
