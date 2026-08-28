@@ -164,16 +164,24 @@ The CMake build runs **outside** the Zephyr build (the Alif side's
 `west build` does not descend here).  Two backends:
 
 ```bash
-# Host-side / CI compile smoke -- silicon-free, no TI SDK needed:
-cmake -B build/stub -S firmware/cc3501e \
-  -DCMAKE_TOOLCHAIN_FILE=firmware/cc3501e/toolchain/arm-none-eabi.cmake \
-  -DCC3501E_HAL_BACKEND=stub
+# Host-side / CI compile smoke -- silicon-free, no TI SDK needed.
+# ALP_SDK_ROOT is MANDATORY: this firmware compiles alp-sdk's canonical
+# <alp/protocol/cc3501e.h> rather than a mirrored copy, and CMake FATAL_ERRORs
+# without it.  The toolchain file must be an ABSOLUTE path -- CMake resolves a
+# relative one against the BUILD directory, not the working directory.
+cmake -B build/stub -S . \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/arm-none-eabi.cmake" \
+  -DCC3501E_HAL_BACKEND=stub \
+  -DALP_SDK_ROOT=<path-to-alp-sdk>
 cmake --build build/stub
 
-# Production image (bench) -- needs TI ticlang + the SimpleLink CC33xx SDK:
-cmake -B build/ti -S firmware/cc3501e \
-  -DCMAKE_TOOLCHAIN_FILE=firmware/cc3501e/toolchain/ticlang.cmake \
-  -DCC3501E_HAL_BACKEND=ti
+# Production image (bench) -- needs TI ticlang + the SimpleLink CC33xx SDK.
+# In practice use ti/build_ti.sh (or ti/build_ti.ps1): the CMake ti path does
+# not apply the four post-generation patches those scripts do.
+cmake -B build/ti -S . \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/ticlang.cmake" \
+  -DCC3501E_HAL_BACKEND=ti \
+  -DALP_SDK_ROOT=<path-to-alp-sdk>
 cmake --build build/ti
 ```
 

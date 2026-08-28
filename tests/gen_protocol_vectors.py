@@ -29,12 +29,30 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import os
 import re
 import sys
 
-# Repo root, derived from this file's path (firmware/cc3501e/tests/ -> repo root).
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_HEADER = _REPO_ROOT / "include" / "alp" / "protocol" / "cc3501e.h"
+# The protocol header lives in alp-sdk, not here: this firmware compiles the
+# CANONICAL <alp/protocol/cc3501e.h> rather than a mirror, which is the whole
+# point of the single-sourcing in ADR 0031.
+#
+# parents[3] assumed the pre-extraction alp-sdk/firmware/cc3501e/tests/ layout.
+# Standalone it climbs TWO levels above the repo root, so --check died with
+# FileNotFoundError instead of pinning anything -- and worse, if a stale
+# include/alp/protocol/cc3501e.h ever existed at that out-of-tree path the
+# script would silently source a FOREIGN protocol version and pass (#11).
+#
+# ALP_SDK_ROOT is the supported way to point at a checkout.  The fallback keeps
+# a pre-extraction tree working (two levels up = alp-sdk root when this repo
+# still sat at alp-sdk/firmware/cc3501e).
+_ENV_SDK_ROOT = os.environ.get("ALP_SDK_ROOT")
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_HEADER = (
+    pathlib.Path(_ENV_SDK_ROOT).expanduser() / "include" / "alp" / "protocol" / "cc3501e.h"
+    if _ENV_SDK_ROOT
+    else _REPO_ROOT.parent.parent / "include" / "alp" / "protocol" / "cc3501e.h"
+)
 _PROTOCOL_VERSION_TXT = pathlib.Path(__file__).parent.parent / "protocol-version.txt"
 
 _DEFINE_RE = re.compile(r"^#define\s+ALP_CC3501E_PROTOCOL_VERSION\s+(\d+)", re.MULTILINE)
@@ -45,6 +63,18 @@ def _read_protocol_version() -> int:
     wire-protocol header instead of hardcoding it here, so a version bump
     that forgets this file fails --check instead of silently drifting.
     Also cross-checks protocol-version.txt against the same value."""
+    if not _HEADER.is_file():
+        # An actionable message, not a bare FileNotFoundError two levels above the
+        # repo -- which is what this raised standalone before #11.
+        sys.exit(
+            "cannot find the canonical protocol header at:\n"
+            "    %s\n"
+            "This firmware compiles alp-sdk's <alp/protocol/cc3501e.h> rather than a\n"
+            "mirror, so it has to come from an alp-sdk checkout.  Point ALP_SDK_ROOT\n"
+            "at one:\n"
+            "    ALP_SDK_ROOT=<path-to-alp-sdk> python3 tests/gen_protocol_vectors.py --check"
+            % _HEADER
+        )
     match = _DEFINE_RE.search(_HEADER.read_text(encoding="utf-8"))
     if not match:
         sys.exit(f"cannot find #define ALP_CC3501E_PROTOCOL_VERSION in {_HEADER}")
@@ -92,9 +122,27 @@ def frame(cmd: int, flags: int, payload: bytes = b"") -> bytes:
     return bytes([cmd, flags, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF]) + payload
 
 
+# src/protocol.h:80.  Reply payloads are padded up to a multiple of this so the
+# host DW SSI can move one burst-aligned chunk; an odd length collapses its DMA
+# burst to one transaction per byte.
+REPLY_PAD = 8
+
+
 def reply(cmd: int, status: int, data: bytes = b"") -> bytes:
-    """Build a solicited reply frame (payload = status + data)."""
-    return frame(cmd, FLAG_SOLICITED, bytes([status]) + data)
+    """Build a solicited reply frame (payload = status + data, zero-padded).
+
+    The padding is NOT cosmetic and omitting it made these vectors describe
+    frames the firmware never emits: src/protocol.c:470-473 rounds every reply
+    payload up to a multiple of CC3501E_REPLY_PAD, so ping_reply_ok was pinned
+    at payload_len=1 while the firmware sends 8 (#11).  Pad bytes are never
+    interpreted -- every reply carries its own length -- but they ARE on the
+    wire, and a vector file that disagrees with the wire pins nothing.
+    """
+    payload = bytes([status]) + data
+    rem = len(payload) % REPLY_PAD
+    if rem:
+        payload += bytes(REPLY_PAD - rem)
+    return frame(cmd, FLAG_SOLICITED, payload)
 
 
 HEADER = """\

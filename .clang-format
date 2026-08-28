@@ -7,8 +7,13 @@
 # Indentation is TABS (each developer renders them at their preferred width;
 # TabWidth below only feeds clang-format's column math).  Alignment stays in
 # spaces ("smart tabs"), so columns line up regardless of tab width.  Vendored
-# upstream code (zephyr/**, vendors/**) keeps its own style and is excluded from
-# the format gate -- see .github/workflows/pr-static-analysis.yml.
+# upstream code keeps its own style.  The format gate is the `clang-format
+# (diff only)` job in .github/workflows/ci.yml, and it only ever looks at the
+# C/H files a PR actually changed -- so vendored trees are excluded by not being
+# touched, not by a path list.  This comment used to cite
+# .github/workflows/pr-static-analysis.yml and scripts/setup-clang-format.sh,
+# neither of which exists in this repo (both were alp-sdk paths), and described
+# a vendor exclusion the real gate does not implement.
 ---
 Language: Cpp
 BasedOnStyle: LLVM
