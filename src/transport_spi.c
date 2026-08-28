@@ -47,8 +47,12 @@ __attribute__((weak)) void bridge_transport_spi_hw_init(void)
  * no-op default so the symbol resolves on any non-ti backend.  The ti backend
  * (hal/ti/transport_hw_ti_spi.c) overrides it with the real SPI_close + reopen
  * + re-arm. */
-__attribute__((weak)) void bridge_transport_spi_hw_reinit(void)
+__attribute__((weak)) bool bridge_transport_spi_hw_reinit(void)
 {
+	/* No SPI slave on this backend, so there is nothing to re-arm and nothing
+	 * that can fail.  True keeps the stub/native builds behaving exactly as
+	 * before -- they have no READY line for the caller to gate. */
+	return true;
 }
 
 __attribute__((weak)) bool bridge_transport_spi_is_dead(void)

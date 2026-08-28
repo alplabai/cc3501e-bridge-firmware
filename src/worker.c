@@ -549,7 +549,12 @@ void worker_run_pending(void)
 
 	if (go) {
 		cc3501e_bridge_busy(); /* radio op about to kill the slave DMA -> hold host off */
-		worker_execute(cmd);   /* may block for seconds (Wlan_* init + get) */
+		/* Whether the slave is armed for the host's next clock.  Starts true:
+		 * the ops that SKIP the re-init below (the two hot socket ops, and the
+		 * three whose HAL bodies re-init themselves) never tore the slave down
+		 * here, so their READY raise is unconditional as before.  Issue #5. */
+		bool rearmed = true;
+		worker_execute(cmd); /* may block for seconds (Wlan_* init + get) */
 
 		/* Radio<->SPI coexistence fix: the worker body just ran a radio HAL op
 		 * (a Wlan_* call), during which the bridge SPI slave could not be
@@ -615,7 +620,7 @@ void worker_run_pending(void)
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !body_already_reinit) {
 			cc3501e_bridge_busy();
-			bridge_transport_spi_hw_reinit();
+			rearmed = bridge_transport_spi_hw_reinit();
 		}
 
 		/* CONNECT / AP_START are FIRE-AND-FORGET at the worker level: their outcome
@@ -636,6 +641,15 @@ void worker_run_pending(void)
 		if (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA || cmd == ALP_CC3501E_CMD_WIFI_AP_START) {
 			worker_reset();
 		}
-		cc3501e_bridge_ready(); /* slave re-armed -> host may clock again */
+		/* Raise READY only if the slave is ACTUALLY armed.  arm_transfer()
+		 * deliberately leaves the line LOW when SPI_transfer() rejects the
+		 * re-arm, so the host's READY gate times out visibly instead of it
+		 * clocking a frame into a slave that never latches.  Raising it here
+		 * unconditionally threw that away and re-introduced the #1133 lie.
+		 * On a failed arm the line stays LOW and cc3501e_hw_tick()'s
+		 * g_arm_fail_count self-heal drives the recovery.  Issue #5. */
+		if (rearmed) {
+			cc3501e_bridge_ready(); /* slave re-armed -> host may clock again */
+		}
 	}
 }
