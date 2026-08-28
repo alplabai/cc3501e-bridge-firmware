@@ -127,13 +127,29 @@ add_executable(cc3501e-bridge ${CC3501E_BRIDGE_SOURCES})
 target_compile_definitions(cc3501e-bridge PRIVATE
     CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16})
 
-# Include paths: firmware src + hal, and the repo-root include/ so the
-# firmware includes the CANONICAL <alp/protocol/cc3501e.h> directly --
-# no mirrored header, no drift (the payoff of embedding in alp-sdk).
+# Include paths: firmware src + hal, plus an alp-sdk include root so the
+# firmware compiles the CANONICAL <alp/protocol/cc3501e.h> directly -- no
+# mirrored header, no drift.  That was free while this tree lived INSIDE
+# alp-sdk; extracted, the header has to be located explicitly, because
+# ../../include now points at whatever sibling checkout happens to sit there,
+# on whatever branch.  ALP_SDK_ROOT overrides; the default preserves the
+# pre-extraction layout.  A missing header is refused here rather than
+# surfacing as a confusing "no such file" mid-compile, and src/protocol_meta.c
+# additionally asserts the header's protocol version at compile time, which is
+# what catches a header that is present but WRONG.
+set(ALP_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
+    "Root of an alp-sdk checkout (the directory containing include/alp/)")
+if(NOT EXISTS "${ALP_SDK_ROOT}/include/alp/protocol/cc3501e.h")
+    message(FATAL_ERROR
+        "cannot find <alp/protocol/cc3501e.h> under '${ALP_SDK_ROOT}'.\n"
+        "This firmware compiles the canonical header from an alp-sdk checkout.\n"
+        "Configure with -DALP_SDK_ROOT=<path-to-alp-sdk>.")
+endif()
+message(STATUS "cc3501e-bridge: alp-sdk include root: ${ALP_SDK_ROOT}")
 target_include_directories(cc3501e-bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/hal
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    ${ALP_SDK_ROOT}/include)
 
 target_compile_options(cc3501e-bridge PRIVATE
     -mcpu=cortex-m33 -mthumb -mfloat-abi=soft

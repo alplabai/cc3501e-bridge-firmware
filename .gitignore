@@ -1,0 +1,4 @@
+# Build artifacts from ti/build_ti.{ps1,sh} and the CMake stub build.
+# The TI build drops a ~14 MB .out and a ~2 MB .map here; none of it belongs
+# in history (the shippable image is signed and published under prebuilt/).
+build/

@@ -48,7 +48,15 @@ param(
     [int]$OtaWindowBytes = 0,
     [switch]$OtaWindowFinish,
     [switch]$WifiHostDriver,        # link the CC35xx Wi-Fi host driver (-DCC3501E_WIFI; enables GET_MAC / scan / connect bodies)
-    [switch]$Ble                    # ALSO link Apache NimBLE + ble_interface (-DCC3501E_BLE; enables BLE enable/advertise). Implies -WifiHostDriver (shared HIF -> Wlan_Start first).
+    [switch]$Ble,                   # ALSO link Apache NimBLE + ble_interface (-DCC3501E_BLE; enables BLE enable/advertise). Implies -WifiHostDriver (shared HIF -> Wlan_Start first).
+    # Root of an alp-sdk checkout, i.e. the directory CONTAINING include/alp/.
+    # This firmware compiles the CANONICAL <alp/protocol/cc3501e.h> rather than a
+    # mirrored copy, so the wire contract cannot drift -- but that means the header
+    # has to come from somewhere, and since this tree was extracted out of alp-sdk
+    # it is no longer simply two levels up.  The default keeps the pre-extraction
+    # layout working (a checkout still sitting at <alp-sdk>/firmware/cc3501e); pass
+    # -AlpSdkRoot explicitly for a standalone clone.
+    [string]$AlpSdkRoot = ""
 )
 
 # -Ble implies -WifiHostDriver: the BLE controller shares the HIF with Wi-Fi, so
@@ -58,8 +66,27 @@ param(
 if ($Ble) { $WifiHostDriver = $true }
 
 $ErrorActionPreference = 'Stop'
-$fw   = Split-Path $PSScriptRoot -Parent          # firmware/cc3501e
-$repo = (Resolve-Path "$fw\..\..").Path           # repo root
+$fw   = Split-Path $PSScriptRoot -Parent          # this firmware tree
+
+# Resolve the alp-sdk include root, and REFUSE rather than compile against
+# whatever happens to be two levels up.  Before the extraction that relative
+# guess was always right; now it lands on a sibling checkout whose branch nobody
+# chose -- which is how a protocol-4 header reached a protocol-5 build and broke
+# it at the first missing opcode.  A stale header that still COMPILES is the
+# worse case, so the version assert in src/protocol.c backs this up.
+if ($AlpSdkRoot) {
+    $repo = (Resolve-Path $AlpSdkRoot).Path
+} else {
+    $repo = (Resolve-Path "$fw\..\..").Path
+}
+$protoHdr = "$repo\include\alp\protocol\cc3501e.h"
+if (-not (Test-Path $protoHdr)) {
+    throw ("cannot find <alp/protocol/cc3501e.h> under '$repo'.`n" +
+           "  This firmware compiles the canonical header from an alp-sdk checkout.`n" +
+           "  Pass -AlpSdkRoot <path-to-alp-sdk> (the directory containing include/alp/).")
+}
+Write-Host "== alp-sdk include root: $repo =="
+
 $out  = "$fw\build\ti"
 $tc   = "$TiclangRoot\bin\tiarmclang.exe"
 New-Item -ItemType Directory -Force $out | Out-Null

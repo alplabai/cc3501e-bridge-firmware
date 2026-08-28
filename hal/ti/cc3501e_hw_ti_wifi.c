@@ -662,7 +662,21 @@ static void wifi_clear_stale_assoc(void)
 /* STA L3 bring-up: bounded DHCP-lease poll after the L2 connect event.
  * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 50 * 200 ms = 10 s budget
  * (the worker drain sleeps between tries so the tcpip thread runs DHCP). */
-#define CC3501E_STA_DHCP_TRIES   50u
+#define CC3501E_STA_DHCP_TRIES 50u
+
+/* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
+ * cc3501e_hw_wifi_ap_start() for why each one matters.  Values mirror TI's
+ * ParseRoleUpApCmd() reference defaults for CC35xx. */
+#ifndef CC3501E_AP_STA_LIMIT
+/* TI clamps this to [1, 8] and defaults to 4.  Zero means no client may ever
+ * associate, which is #1562. */
+#define CC3501E_AP_STA_LIMIT 4u
+#endif
+#ifndef CC3501E_AP_SAE_PWE
+/* SAE password element derivation; TI's reference default. */
+#define CC3501E_AP_SAE_PWE 2u
+#endif
+
 #define CC3501E_STA_DHCP_POLL_US 200000u
 
 int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
@@ -829,12 +843,45 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	WlanPowerManagement_e pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE; /* = 0 */
 	(void)Wlan_Set(WLAN_SET_POWER_MANAGEMENT, (void *)&pm);
 
-	RoleUpApCmd_t ap    = { 0 };
-	ap.ssid             = ssid_buf;
-	ap.channel          = 6u; /* common 2.4 GHz default */
-	ap.secParams.Type   = (uint8_t)cc3501e_wifi_sec(security);
-	ap.secParams.Key    = (int8_t *)psk;
-	ap.secParams.KeyLen = psk_len;
+	/* A ZEROED RoleUpApCmd_t IS NOT A USABLE AP.  Several of its fields have a
+	 * meaningful zero that is not "leave at default", and TI's own reference
+	 * filler sets every one of them before Wlan_RoleUp
+	 * (ParseRoleUpApCmd(), demos/network_terminal/cmd_parser.c in the CC35xx
+	 * SDK).  This code used to pass the zero-init struct with only
+	 * ssid/channel/secParams filled, which is the root cause of #1562:
+	 *
+	 *   sta_limit = 0 -- the field "limits the number of stations that the AP
+	 *     has", so zero permits ZERO clients.  TI defaults it to 4 and clamps
+	 *     anything outside [1, 8] back to 4, i.e. 0 is not a legal value at
+	 *     all -- it is the uninitialised value reaching the NWP.  BENCH
+	 *     (2026-08-28, two radios, the measurement that finally separated
+	 *     "AP is down" from "AP refuses clients"): the AP beaconed
+	 *     CONTINUOUSLY for 275 s at 33-95% signal on a second radio while 16
+	 *     association attempts from an Intel AX200 all stalled in
+	 *     `associating` and never reached `connected` -- identically for WPA2
+	 *     and for an OPEN AP, which rules the security path out -- and the
+	 *     firmware's WLAN event counter never moved off the 3 role-up events,
+	 *     so the NWP never even reported an association attempt.
+	 *   countryDomain = {0,0,0} -- TI sets the "00" world regulatory domain.
+	 *   sae_anticlogging_threshold = 0 -- that is SAE_ANTI_CLOGGING_ALWAYS,
+	 *     a real setting, not "unset"; TI uses SAE_ANTI_CLOGGING_DEFAULT (5).
+	 *   sae_pwe = 0 -- TI uses 2.  Both SAE fields matter only for the WPA3
+	 *     security type, but they are wrong in the same way for it.
+	 *
+	 * hidden = FALSE and tx_pow = 0 (= max) already match TI's defaults, so
+	 * they stay implicit in the zero-init rather than being restated. */
+	RoleUpApCmd_t ap              = { 0 };
+	ap.ssid                       = ssid_buf;
+	ap.channel                    = 6u; /* common 2.4 GHz default */
+	ap.sta_limit                  = CC3501E_AP_STA_LIMIT;
+	ap.countryDomain[0]           = '0';
+	ap.countryDomain[1]           = '0';
+	ap.countryDomain[2]           = '\0';
+	ap.sae_pwe                    = CC3501E_AP_SAE_PWE;
+	ap.sae_anticlogging_threshold = (uint8_t)SAE_ANTI_CLOGGING_DEFAULT;
+	ap.secParams.Type             = (uint8_t)cc3501e_wifi_sec(security);
+	ap.secParams.Key              = (int8_t *)psk;
+	ap.secParams.KeyLen           = psk_len;
 	if (Wlan_RoleUp(WLAN_ROLE_AP, &ap, WLAN_WAIT_FOREVER) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}

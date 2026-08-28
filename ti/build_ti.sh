@@ -57,8 +57,23 @@ done
 [ "$BLE" = 1 ] && WIFI_HOST_DRIVER=1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fw="$(cd "$HERE/.." && pwd)"                 # firmware/cc3501e
-repo="$(cd "$fw/../.." && pwd)"              # repo root
+fw="$(cd "$HERE/.." && pwd)"                 # this firmware tree
+
+# alp-sdk include root.  This firmware compiles the CANONICAL
+# <alp/protocol/cc3501e.h> instead of mirroring it, so the wire contract cannot
+# fork -- but the header has to come from a real checkout, and since this tree
+# was extracted out of alp-sdk it is no longer simply two levels up.  Guessing
+# lands on whatever sibling checkout is there, on whatever branch: on 2026-08-28
+# that fed a protocol-4 header to a protocol-5 build.  Default preserves the
+# pre-extraction layout; set ALP_SDK_ROOT for a standalone clone.
+repo="$(cd "${ALP_SDK_ROOT:-$fw/../..}" && pwd)"
+if [ ! -f "$repo/include/alp/protocol/cc3501e.h" ]; then
+  echo "cannot find <alp/protocol/cc3501e.h> under '$repo'"
+  echo "  this firmware compiles the canonical header from an alp-sdk checkout"
+  echo "  set ALP_SDK_ROOT to the directory containing include/alp/"
+  exit 3
+fi
+echo "== alp-sdk include root: $repo =="
 out="$fw/build/ti"
 tc="$TICLANG_ROOT/bin/tiarmclang"
 # Require the externally-staged TI tooling before touching it, so an
