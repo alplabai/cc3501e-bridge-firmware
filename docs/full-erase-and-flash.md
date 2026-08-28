@@ -70,6 +70,19 @@ SN=<your XDS110 serial>
 
 ## 1. Ask the part what it is, before deciding anything
 
+> **Who can run this section.** `get_fuse_data` and `full_flash_erase` both sign
+> an action request at run time, so they need the vendor **private** key via
+> `--signing_module`. `programming` does not — it takes only `--tool_settings`
+> and consumes pre-signed artefacts.
+>
+> That split matters when the person holding the part is not the person holding
+> the key: a module can be **restored by whoever has a complete signed set**,
+> with no key involved. If you are recovering someone else's module, build and
+> sign the set for them and let them run step 5 alone — do not send a signing
+> key to make an erase possible until you have established the erase is actually
+> required.
+
+
 ```sh
 "$TB" programmer -i XDS110 -param1 "$SN" get_fuse_data \
     --flash_type PY25Q64LB \
@@ -110,8 +123,19 @@ highest of:
 
   ```sh
   python3 -c "d=open('primary_vendor_image.sign.bin','rb').read(); \
-      print('.'.join(str(b) for b in d[0x24:0x28]))"
+      print('%d.%d.%d.%d' % (d[0x24], d[0x25], d[0x26], d[0x28]))"
   ```
+
+  **The four fields are not contiguous.** `0x24` major, `0x25` minor, `0x26`
+  patch, `0x27` **padding**, `0x28` the fourth field. The obvious slice
+  `d[0x24:0x28]` returns *major.minor.patch.padding*, so it reports the fourth
+  field as `0` whatever it really is. Determined by building `0.253.7.9` and
+  reading back `00 fd 07 00 09`.
+
+  Worth avoiding for a specific reason: that misread makes two genuinely
+  different stamps look identical. `0.254.0.1` and `0.254.0.7` both display as
+  `0.254.0.0` under the naive slice — so a set built to clear a floor can look
+  like it does not, or one that does *not* clear it can look like it does.
 
   Offset `0x24` is the GPE version of the **vendor image** specifically. Do not
   read it from the other components and expect a version: the same offset in
@@ -147,7 +171,10 @@ path in the README, wrong for this one. Use `ti/build_full_set.py`, which is the
 script this procedure was validated with:
 
 ```sh
-TOOLBOX=<path-to-simplelink-wifi-toolbox> SIGNING_DIR=<dir with the vendor key, sign module and cc35xx-conf.bin> REF_SET=<a prior COMPLETE set> python3 ti/build_full_set.py 0.149.65.0
+TOOLBOX=<path-to-simplelink-wifi-toolbox> \
+SIGNING_DIR=<dir with the vendor key, sign module and cc35xx-conf.bin> \
+REF_SET=<a prior COMPLETE set> \
+python3 ti/build_full_set.py 0.149.65.0
 ```
 
 It prints every component with its size so you can see the set is complete
@@ -184,8 +211,10 @@ Verify the stamp you actually produced before going near the part:
 
 ```sh
 python3 -c "d=open('<flashset>/primary_vendor_image.sign.bin','rb').read(); \
-    print('stamp', '.'.join(str(b) for b in d[0x24:0x28]))"
+    print('stamp %d.%d.%d.%d' % (d[0x24], d[0x25], d[0x26], d[0x28]))"
 ```
+
+(`0x27` is padding — see step 2. `ti/build_full_set.py` prints this correctly.)
 
 ---
 

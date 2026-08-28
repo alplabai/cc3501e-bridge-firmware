@@ -60,9 +60,21 @@ def run(step, args):
 
 
 def stamp(path):
+    """GPE version of a vendor image.
+
+    The four fields are NOT contiguous: 0x24 major, 0x25 minor, 0x26 patch,
+    0x27 padding, 0x28 the fourth field.  The obvious d[0x24:0x28] slice reads
+    the padding as the fourth field and reports it as 0 whatever it is, which
+    makes 0.254.0.1 and 0.254.0.7 indistinguishable -- and a set built to clear
+    a floor then looks like it does not.  Verified by building 0.253.7.9 and
+    reading back `00 fd 07 00 09`.
+
+    Only meaningful for the vendor image; the same offsets in the boot sector,
+    TBL and TI wireless FW are ordinary payload.
+    """
     with open(path, "rb") as f:
         d = f.read()
-    return ".".join(str(b) for b in d[0x24:0x28]), len(d)
+    return "%d.%d.%d.%d" % (d[0x24], d[0x25], d[0x26], d[0x28]), len(d)
 
 
 def main():
