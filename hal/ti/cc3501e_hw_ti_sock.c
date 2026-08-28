@@ -377,15 +377,26 @@ int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint1
 	}
 	uint32_t used = ring_used();
 	if (used == 0u) {
-		/* Armed but EMPTY -> report "not handled" so the caller falls through to
-		 * the worker path.  Answering OK with 0 bytes looked harmless but broke
-		 * single-shot callers: cc3501e_sock_recv goes through poll_by_repeat,
-		 * which treats ALP_OK as final, so one recv on a socket whose data had not
-		 * landed yet returned 0 bytes and gave up (measured: `NET recv -> 0 (0 B)`
-		 * on a connection that was about to deliver 389 B).  The fast path is an
-		 * OPTIMISATION for when data is already staged; it must never take a
-		 * request it cannot satisfy. */
-		return -1;
+		/* Armed but EMPTY.  This is its OWN answer (-2), distinct from "not my
+		 * handle" (-1), because the two need opposite handling and conflating them
+		 * cost a data-loss bug (#7):
+		 *
+		 *   -1 "not my handle" -> the worker is the ONLY reader of that fd, so the
+		 *      caller must fall through to it.
+		 *   -2 "armed but empty" -> the PUMP is the only reader of this fd.  Falling
+		 *      through submitted a SOCK_RECV worker job whose lwip_recvfrom() then
+		 *      pulled bytes B1 out of the same socket, while cc3501e_hw_tick ->
+		 *      cc3501e_hw_sock_pump (which main.c runs on the very next line) pulled
+		 *      B2 into this ring microseconds later.  The host's next poll hit the
+		 *      fast path, got B2 with RESP_OK, and B1 was stranded in the worker
+		 *      slot -- a TCP stream delivered with a hole and RESP_OK on every frame.
+		 *
+		 * Still NOT "OK with 0 bytes": cc3501e_sock_recv goes through
+		 * poll_by_repeat, which treats ALP_OK as final, so one recv on a socket
+		 * whose data had not landed yet returned 0 bytes and gave up (measured:
+		 * `NET recv -> 0 (0 B)` on a connection that was about to deliver 389 B).
+		 * The caller answers BUSY instead, which is what poll_by_repeat retries. */
+		return -2;
 	}
 	uint32_t       n     = (used < cap) ? used : cap;
 	const uint32_t idx   = rx_ring.tail % CC3501E_SOCK_RING_BYTES;
@@ -527,5 +538,30 @@ int cc3501e_hw_sock_close(uint16_t handle)
 {
 	(void)handle;
 	return CC3501E_HW_ERR_NOTIMPL;
+}
+
+/* The three prefetch-seam functions are called UNCONDITIONALLY --
+ * hal/ti/cc3501e_hw_ti.c's tick runs cc3501e_hw_sock_pump() and
+ * src/protocol_sockets.c's dispatch runs cc3501e_hw_sock_recv_ring() -- so
+ * without these a ti build without -WifiHostDriver / -Ble does not link at all
+ * (undefined symbol cc3501e_hw_sock_pump / _prefetch / _recv_ring), defeating
+ * the whole point of this #else arm.  Bodies match hal/cc3501e_hw_stub.c. */
+void cc3501e_hw_sock_pump(void)
+{
+}
+
+void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
+{
+	(void)handle;
+	(void)on;
+}
+
+int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len)
+{
+	(void)handle;
+	(void)buf;
+	(void)cap;
+	if (out_len != 0) *out_len = 0u;
+	return -1; /* never the prefetched handle -> caller uses the worker path */
 }
 #endif /* CC3501E_WIFI */
