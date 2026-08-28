@@ -635,7 +635,10 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
  * SS0 deassert is invisible, so a stale FIFO byte satisfies the NEXT phase
  * instantly and the device runs permanently ahead of the host.  Every gap between
  * two polled transfers therefore costs a PERMANENT byte-phase shift, and the RX
- * FIFO holds only 8 frames before it silently overruns (SPIWFF3DMA.h:84-86, :97;
+ * FIFO overruns silently once full.  (Depth: SWRU626 ch.18 gives 32 LOCATIONS,
+ * and this transport configures an 8-bit data size, so 32 bytes -- not the
+ * "8 frames" this comment used to claim.  The overrun conclusion is unchanged;
+ * only the number was wrong.  Issue #20.)  (SPIWFF3DMA.h:84-86, :97;
  * the RX-overrun IRQ that would flush is enabled ONLY in the DMA branch,
  * SPIWFF3DMA.c:800-806, so nothing self-heals).
  *

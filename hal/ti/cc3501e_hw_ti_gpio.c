@@ -56,7 +56,12 @@ static bool gpio_pad_reserved(uint8_t pad)
 	/* CONFIG_UART2_0 console glue: TX=5, RX=6. */
 	case 5u:
 	case 6u:
-	/* Not bonded on this device (gpioPinConfigs marks 7/8/9 unavailable). */
+	/* 7/8/9 are NOT "not bonded" -- TI documents them as SWDIO (pin 40), SWCLK
+	 * (pin 39) and LOGGER (pin 38).  They are unavailable to the GPIO proxy
+	 * because the debug/logging functions own them, which is a different and
+	 * much better reason: driving SWDIO or SWCLK from the host would cut the
+	 * debug probe off mid-session.  gpioPinConfigs marking them unavailable is
+	 * the mechanism, not the justification.  Issue #20. */
 	case 7u:
 	case 8u:
 	case 9u:
@@ -191,8 +196,17 @@ void cc3501e_bridge_ready(void)
  * ring returns an empty list, so a host may drain on ANY rising edge -- including
  * every ordinary re-arm -- without needing to tell attention from flow control.
  * That is what makes one wire enough. */
-/* ~2-4 us of LOW at the CC35 core clock -- comfortably wider than the host pad
- * synchroniser, far too short to look like a busy/flow-control drop. */
+/* A bounded LOW pulse -- wider than the host pad synchroniser, far too short to
+ * look like a busy/flow-control drop.
+ *
+ * The width is NOT the "~2-4 us" this comment used to assert.  At the 160 MHz
+ * core clock a 300-iteration volatile spin is on the order of a few microseconds
+ * only if each iteration costs ~1-2 clocks, which it does not; the real figure
+ * depends on the compiled loop body and has never been measured on a scope here.
+ * Treat 300 as an empirically-chosen constant, not a derived timing.  If the
+ * pulse width ever matters, measure it -- and note that the READY line is an
+ * open connection on the current E1M-AEN rev, so it cannot be measured from the
+ * host side at all.  Issue #20. */
 #ifndef CC3501E_ATTN_PULSE_LOW_SPINS
 #define CC3501E_ATTN_PULSE_LOW_SPINS 300u
 #endif
