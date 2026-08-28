@@ -6,9 +6,14 @@
 # project -- so this is the house style, not a mirror of any one platform.
 # Indentation is TABS (each developer renders them at their preferred width;
 # TabWidth below only feeds clang-format's column math).  Alignment stays in
-# spaces ("smart tabs"), so columns line up regardless of tab width.  Vendored
-# upstream code (zephyr/**, vendors/**) keeps its own style and is excluded from
-# the format gate -- see .github/workflows/pr-static-analysis.yml.
+# spaces ("smart tabs"), so columns line up regardless of tab width.
+#
+# The gate in THIS repo is the `clang-format` job in .github/workflows/ci.yml.
+# It is DIFF-ONLY: it checks the .c/.h files a pull request actually touches,
+# never the whole tree.  There is no path-based exclusion list here -- the
+# vendor-shaped sources (the TI-derived startup in ti/, the SimpleLink-facing
+# HAL under hal/ti/) are simply not looked at until a change touches them,
+# because a tree-wide reformat would bury a real review in noise.
 ---
 Language: Cpp
 BasedOnStyle: LLVM
@@ -56,8 +61,8 @@ ReflowComments: false
 # DontAlign puts the `\` directly after the line's content instead.
 AlignEscapedNewlines: DontAlign
 
-# Pin behaviour across clang-format versions.  CI pins clang-format-22 (via the
-# pip wheel -- see .github/workflows/pr-static-analysis.yml + scripts/setup-clang-format.sh),
+# Pin behaviour across clang-format versions.  CI pins clang-format 22.1.5
+# exactly (`pipx install "clang-format==22.1.5"` in ci.yml's clang-format job),
 # but the LLVM default for Cpp11BracedListStyle has flipped between major versions
 # (v14 vs v18+), which formats the `(alp_i2c_config_t){ .foo = ... }`
 # designated-initialiser idiom differently.  Locking it explicitly keeps the output

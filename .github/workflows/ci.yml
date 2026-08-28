@@ -82,13 +82,40 @@ jobs:
           # working directory, so "firmware/toolchain/..." was looked for at
           # "build/firmware/toolchain/..." and reported as
           # "Could not find toolchain file".
+          #
+          # -Werror is added HERE, not in CMakeLists.txt.  The tree is built
+          # -Wall -Wextra -Wshadow -Wpedantic, but without -Werror every one of
+          # those warnings merges green -- a shadowed variable or an implicit
+          # truncation reads as scrollback, not as a failure.  Making it a
+          # configure-time flag keeps the gate on the merge path without turning
+          # a developer's local build -- or the bench ticlang build, which is a
+          # different compiler with different diagnostics -- into a wall of hard
+          # errors mid-edit.
           cmake -B build -S firmware \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
             -DCC3501E_HAL_BACKEND=stub \
+            -DCMAKE_C_FLAGS="-Werror" \
             -DALP_SDK_ROOT="$PWD/alp-sdk"
 
       - name: build
         run: cmake --build build -j"$(nproc)"
+
+      # CC3501E_CONTROL_TRANSPORT=spi is the default, so the spi build above
+      # never compiles the sdio branch of src/main.c: an sdio-only break lands
+      # on a customer board that routes the Alif's single SDIO controller to the
+      # CC3501E and nowhere before that.  Both transports are cheap to compile
+      # (the framing is shared), so build the other selection too.
+      - name: configure (sdio transport)
+        run: |
+          cmake -B build-sdio -S firmware \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
+            -DCC3501E_HAL_BACKEND=stub \
+            -DCC3501E_CONTROL_TRANSPORT=sdio \
+            -DCMAKE_C_FLAGS="-Werror" \
+            -DALP_SDK_ROOT="$PWD/alp-sdk"
+
+      - name: build (sdio transport)
+        run: cmake --build build-sdio -j"$(nproc)"
 
   protocol-version-parity:
     name: protocol version parity
@@ -122,6 +149,40 @@ jobs:
             echo "Bump BOTH, in the same change, or the host and the companion disagree on the wire."
             exit 1
           fi
+
+  wire-vectors:
+    name: wire vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: firmware
+      - uses: actions/checkout@v4
+        with:
+          repository: alplabai/alp-sdk
+          path: alp-sdk
+
+      # Pin the interpreter rather than trusting whatever `python` the runner
+      # image happens to expose; the generator is the only Python on the merge
+      # path and a silent interpreter change here reads as a vector diff.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # tests/protocol_vectors.txt is the human-readable decode of the frames
+      # this firmware and the host driver must agree on, generated from the
+      # canonical <alp/protocol/cc3501e.h>.  NOTHING compiles it, so when a
+      # cmd, status code or payload layout changes and the file is not
+      # regenerated, the drift stays invisible until someone reads the stale
+      # vectors on the bench and debugs the wrong side of the link.  --check
+      # re-renders from the header and fails on any difference; ALP_SDK_ROOT is
+      # how the generator finds that header, and it is the SAME alp-sdk
+      # checkout the stub build compiles against.
+      - name: check the wire vectors against the canonical header
+        working-directory: firmware
+        env:
+          ALP_SDK_ROOT: ${{ github.workspace }}/alp-sdk
+        run: python tests/gen_protocol_vectors.py --check
 
   clang-format:
     name: clang-format (diff only)
@@ -175,12 +236,24 @@ jobs:
       # artifacts customers flash; a mismatch means the manifest, the binary or
       # both are wrong, and the flashing recipe in README tells people to verify
       # exactly this before writing to a part.
+      #
+      # That same recipe's FIRST step is an `openssl dgst -sha256 -verify
+      # <VALIDATION_public.pem> -signature prebuilt/<image>.bin.sig ...`, so a
+      # blob shipped without its .sig makes the documented check impossible to
+      # perform -- and the person at the bench discovers that with a part in
+      # front of them.  Presence is all that is checked here: the validation
+      # public key is deliberately NOT in this repo, so CI cannot verify the
+      # signature itself and does not pretend to.
       - name: verify each prebuilt against its manifest
         run: |
           set -euo pipefail
           rc=0
           for bin in prebuilt/cc3501e-*.bin; do
             [ -e "$bin" ] || continue
+            sig="$bin.sig"
+            if [ ! -f "$sig" ]; then
+              echo "::error::$bin has no $sig (README's flashing recipe verifies it)"; rc=1
+            fi
             man="$bin.sha256"
             if [ ! -f "$man" ]; then
               echo "::error::$bin has no $man"; rc=1; continue

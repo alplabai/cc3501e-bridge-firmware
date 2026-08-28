@@ -44,13 +44,32 @@ permanent history someone has to read.
 
 ```sh
 # stub build -- the same one CI runs; the ti backend needs non-redistributable
-# TI tooling, so this is the compile coverage available to you
-cmake -B build/stub -S . -DCC3501E_HAL_BACKEND=stub -DALP_SDK_ROOT=<path-to-alp-sdk>
+# TI tooling, so this is the compile coverage available to you.
+#
+# CMAKE_TOOLCHAIN_FILE is NOT optional (CMakeLists.txt's header comment says so
+# too): these sources are compiled -mcpu=cortex-m33 -mthumb unconditionally, so
+# the host compiler cannot build them even with the HAL stubbed.  Pass it as an
+# ABSOLUTE path.  CMake resolves a relative toolchain path against the BUILD
+# directory FIRST and only then against the source directory, so whether a bare
+# `toolchain/arm-none-eabi.cmake` resolves depends on where you invoke it from.
+# It happens to work from this repo root; it does NOT work from a parent
+# workspace with `-S <subdir>`, which is the shape CI uses and where it was
+# reported as "Could not find toolchain file" (see .github/workflows/ci.yml).
+# An absolute path is unambiguous everywhere -- use one.
+cmake -B build/stub -S . \
+    -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/arm-none-eabi.cmake" \
+    -DCC3501E_HAL_BACKEND=stub \
+    -DALP_SDK_ROOT=<path-to-alp-sdk>
 cmake --build build/stub
 
 # formatting, on the files you touched (clang-format 22.x)
 clang-format -i <your files> && clang-format --dry-run --Werror <your files>
 ```
+
+CI runs that configure with `-DCMAKE_C_FLAGS="-Werror"`, and repeats it with
+`-DCC3501E_CONTROL_TRANSPORT=sdio` so the sdio branch of `src/main.c` is
+compiled too. Neither is on by default locally; add both to the command above
+when you want the same answer CI will give you.
 
 If you changed the wire protocol, `protocol-version.txt` and alp-sdk's
 `ALP_CC3501E_PROTOCOL_VERSION` must move **in the same change**. CI compares
