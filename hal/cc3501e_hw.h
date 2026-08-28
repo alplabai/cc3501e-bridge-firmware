@@ -233,7 +233,18 @@ int cc3501e_hw_sock_close(uint16_t handle);
  * one bridge transaction per frame instead of a submit/collect pair. */
 void cc3501e_hw_sock_pump(void); /* task ctx: does the lwIP read */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on);
-/* dispatch ctx: memcpy only.  >=0 = bytes taken, -1 = not the prefetched handle. */
+/* dispatch ctx: memcpy only, never lwIP.  Three distinct answers:
+ *
+ *   >= 0  bytes taken from the ring.
+ *   -1    NOT the prefetched handle.  The worker path is the only reader of that
+ *         fd, so the caller SHOULD fall through to it.
+ *   -2    armed for this handle but the ring is momentarily empty.  The caller
+ *         MUST NOT fall through: answer BUSY and let the host re-poll.
+ *
+ * EXCLUSIVITY RULE (#7): exactly one code path may call lwip_* on a prefetched
+ * fd, and for an armed handle that path is cc3501e_hw_sock_pump().  Falling
+ * through to the worker's cc3501e_hw_sock_recv() on an armed-but-empty ring made
+ * two readers race the same socket and silently dropped a chunk of the stream. */
 int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len);
 
 /* --------------------------------------------------------------- */

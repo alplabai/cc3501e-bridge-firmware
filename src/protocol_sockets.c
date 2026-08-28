@@ -113,6 +113,16 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 			uint16_t  got = 0u;
 			const int rc =
 			    cc3501e_hw_sock_recv_ring(handle, &reply_data[hdr], (uint16_t)room, &got);
+			if (rc == -2) {
+				/* Armed for this handle but momentarily empty.  The pump is the
+				 * ONLY reader of this fd -- do NOT fall through and submit a
+				 * worker job, or cc3501e_hw_sock_recv()'s lwip_recvfrom() becomes
+				 * a second reader on the same socket and the stream loses a chunk
+				 * (#7).  BUSY is what poll_by_repeat retries on, so the host comes
+				 * back and the pump will have staged the bytes by then. */
+				*reply_data_len = 0u;
+				return ALP_CC3501E_RESP_ERR_BUSY;
+			}
 			if (rc >= 0) {
 				/* from[] is zeroed for STREAM sockets; data_len then the bytes. */
 				memset(reply_data, 0, hdr);
