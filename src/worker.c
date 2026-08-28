@@ -28,6 +28,7 @@
  *      the SPI ISR cannot observe a half-updated job on real silicon.
  */
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "worker.h"
@@ -173,6 +174,18 @@ static void worker_execute(uint8_t cmd)
 		 * SPI (blocks), so it is worker-routed off the SPI ISR.  Argless. */
 		rv = cc3501e_hw_ble_adv_stop();
 		break;
+	case ALP_CC3501E_CMD_BLE_SCAN_STOP:
+		/* Same shape as BLE_ADV_STOP: the body is
+		 * busy(); nimble_scan_stop(); spi_hw_reinit(); ready() -- it tears the SPI
+		 * slave down and re-opens it, so it must not run in the callback that is
+		 * building this command's own reply.  Argless.  Issue #5. */
+		rv = cc3501e_hw_ble_scan_stop();
+		break;
+	case ALP_CC3501E_CMD_BLE_DISCONNECT:
+		/* Blocks on the disconnect HCI event over the shared HIF, then re-syncs
+		 * the bridge.  Argless.  Issue #5. */
+		rv = cc3501e_hw_ble_disconnect();
+		break;
 	case ALP_CC3501E_CMD_BLE_DISABLE:
 		/* Tears down adv+scan via NimBLE; issues HCI over the shared HIF + re-syncs
 		 * the bridge SPI (blocks), so it is worker-routed off the SPI ISR.  Argless. */
@@ -255,6 +268,14 @@ static void worker_execute(uint8_t cmd)
 		         : cc3501e_hw_wifi_connect_sta(ssid, c->ssid_len, psk, c->psk_len, c->security);
 		break;
 	}
+	case ALP_CC3501E_CMD_WIFI_DISCONNECT:
+		/* Wlan_Disconnect() is an NWP command over the shared HIF.  Inline it
+		 * blocked the SPI callback framing this reply and left the slave
+		 * unresynced, because the busy/ready bracket and the post-op
+		 * bridge_transport_spi_hw_reinit() both live in this drain.  Argless.
+		 * Issue #5. */
+		rv = cc3501e_hw_wifi_disconnect();
+		break;
 	case ALP_CC3501E_CMD_WIFI_AP_STOP:
 		/* Tears the soft-AP down; blocks while the radio goes down and the bridge
 		 * SPI re-syncs, exactly like BLE_ADV_STOP / BLE_DISABLE above -- so it is
@@ -559,7 +580,41 @@ void worker_run_pending(void)
 		 * Deliberately conservative: OPEN / CONNECT / CLOSE keep the re-init,
 		 * because connect in particular can drive the stack hard enough to touch
 		 * the HIF.  Only the two hot data ops are exempt. */
-		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND) {
+		/* Re-assert BUSY immediately before the re-init.  The bracket taken above
+		 * has almost certainly been released by now: every BLE HAL body ends with
+		 * its own cc3501e_bridge_ready() (cc3501e_hw_ti_ble.c:116, :133, :166,
+		 * :179, :206, :245, :263, :278, :326, :345, :362), and the hooks are raw
+		 * level writes -- so that inner ready() cancels this drain's outer busy()
+		 * and the SPI_close/SPI_open below would otherwise run with the line HIGH
+		 * and the host free to clock.  That is the alp-sdk#1691 condition the
+		 * comments say must never happen, and it made
+		 * hal/ti/cc3501e_hw_ti_sock.c:57's claim that "worker_run_pending() holds
+		 * READY LOW across the whole job" false for every BLE opcode.
+		 *
+		 * A depth-counted bracket is the tempting fix and is UNSOUND here: these
+		 * same hooks are driven per-SPI-phase from the transfer-complete callback
+		 * (transport_hw_ti_spi.c on_transfer -> busy(), arm_transfer -> ready()),
+		 * and arm_transfer's g_arm_fail_count path returns WITHOUT its ready() --
+		 * so every failed arm would leak one level of depth and the line would
+		 * eventually never rise again.  Re-asserting here needs no shared counter
+		 * and no cross-context atomicity.  Issue #5. */
+		/* SKIP for the three ops routed here by #5 as well.  Their HAL bodies
+		 * ALREADY end with bridge_transport_spi_hw_reinit(), so paying the
+		 * drain's re-init too means TWO back-to-back SPI_close/SPI_open cycles,
+		 * each re-rolling the 12-attempt SPI_open that this transport calls the
+		 * roll where "the first roll that loses killed the link permanently".
+		 *
+		 * Silicon-measured on E1M-AEN801, same host image, only this branch
+		 * differing.  With the double re-init, `ble scan-stop` wedged the link
+		 * every time -- "scan stopped" then get_version -5 and bench 50/50 fails.
+		 * With the skip it does not.  The control (this change absent) was clean,
+		 * so worker-routing WITHOUT this skip is a regression, not a fix. */
+		const bool body_already_reinit = (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) ||
+		                                 (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT) ||
+		                                 (cmd == ALP_CC3501E_CMD_WIFI_DISCONNECT);
+		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
+		    !body_already_reinit) {
+			cc3501e_bridge_busy();
 			bridge_transport_spi_hw_reinit();
 		}
 
