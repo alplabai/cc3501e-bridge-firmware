@@ -25,7 +25,9 @@
 #
 # Usage:
 #   TOOLBOX=... PUBLIC_KEY=... SIGNING_MODULE=... CONF_BIN=... REF_SET=... \
-#     [VERSION=0.b.c.d] [ACTION_PARAMS=...] firmware/cc3501e/ti/regen_flashset.sh
+#     VERSION=0.b.c.d [ACTION_PARAMS=...] firmware/cc3501e/ti/regen_flashset.sh
+#
+# VERSION is MANDATORY (there is no safe default) -- see the GPE-version rule below.
 set -euo pipefail
 
 TOOLBOX="${TOOLBOX:?stage + set: simplelink-wifi-toolbox executable}"
@@ -42,10 +44,48 @@ VOUT="$fw/build/ti/cc3501e-bridge.out"               # the firmware built by bui
 DIR_OUT="${DIR_OUT:-$fw/build/ti/flashset}"
 [ -f "$VOUT" ] || { echo "missing $VOUT -- run firmware/cc3501e/ti/build_ti.sh --wifi --ble"; exit 1; }
 
-# GPE version: MAJOR=0, low 3 bytes of the epoch (monotonic; each byte <=255).
-# Same scheme as deploy_validate.sh -- guaranteed higher than a prior same-day set.
-_e=$(date +%s)
-VERSION="${VERSION:-0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))}"
+# GPE version = the CC35 vendor-RoT anti-rollback gate.  MANDATORY: there is no safe
+# default, so this script refuses to build a set without one.
+#
+# It used to default to MAJOR=0 plus the low 3 bytes of `date +%s`.  That 24-bit window
+# WRAPS every 194.18 days, so the stamp walks BACKWARDS across a wrap: on 2026-08-28 it
+# evaluates to 0.145.198.56 -- below the bench part's last-seen 0.149.64.0 (README.md)
+# and below the 0.149.63.0 floor recorded in prebuilt/CHANGELOG.md.  A set built from
+# that default streams the full ~1.09 MB, exits 0, and the SBL then refuses to boot it:
+# dead link, and it reads as a dead part.
+version_rule() {
+  cat >&2 <<'EOF'
+GPE VERSION rule -- VERSION=a.b.c.d :
+  * a (major) MUST be 0.  A GPE major >= 1 FAILS the SES/BL2 secure-boot
+    AUTHENTICATION (boot report @0x28000104 sets AUTH_ERROR 0x80) and the app core
+    never launches -- host reads get_version=-5.
+  * every field is byte-sized: a, b, c and d must each be <= 255.
+  * the value MUST be GREATER than anything ever flashed on that unit.  The SBL
+    enforces monotonicity against the part's LAST-SEEN version even when every
+    *_rollback_protection_* fuse reads 0 -- a WARM run burns no fuses, so the
+    all-zero programming_report.txt is the trap, not permission to go backwards.
+    A rollback streams the full ~1.09 MB, exits 0, and then refuses to boot.
+Where to find the unit's last-seen version:
+  * README.md -- "STOP -- check the unit's flash history"; this bench part is at 0.149.64.0
+  * prebuilt/CHANGELOG.md -- the per-artifact stamp table and the 0.149.63.0 floor
+  * BRINGUP_STATUS.md -- "The #1 cause of *streams clean but dead link*"
+  * the XDS110 `query` image table read off the part in front of you
+Example:
+  VERSION=0.149.65.0 firmware/cc3501e/ti/regen_flashset.sh
+EOF
+}
+if [ -z "${VERSION:-}" ]; then
+  echo "VERSION is MANDATORY -- refusing to guess a GPE stamp." >&2
+  version_rule
+  exit 2
+fi
+if [[ ! "$VERSION" =~ ^0\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] ||
+   [ "${BASH_REMATCH[1]}" -gt 255 ] || [ "${BASH_REMATCH[2]}" -gt 255 ] ||
+   [ "${BASH_REMATCH[3]}" -gt 255 ]; then
+  echo "invalid VERSION='$VERSION' -- not a legal GPE stamp." >&2
+  version_rule
+  exit 2
+fi
 
 # WARM action_params: primary_vendor_image=true, everything else (incl. boot_sector)
 # false.  Regenerate it from REF_SET's full-set params unless one is provided.

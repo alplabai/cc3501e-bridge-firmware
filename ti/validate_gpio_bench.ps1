@@ -62,13 +62,14 @@ param(
     [Parameter(Mandatory = $true)][string]$ToolSettings,   # tool_settings.json (references primary_vendor_image.sign.bin)
     # GPE image version = vendor-RoT ANTI-ROLLBACK gate (monotonic, >= the unit's),
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
-    # The bench unit is at 0.9.0.7 -> major MUST be >= 1 now. See deploy_validate.sh
-    # for the date-derived scheme (major.yy.mmdd.hhmm); pass a >=1.x value here.
-    # GPE image version -- major MUST be 0 (major >= 1 fails BL2 secure-boot with
+    # Its major MUST be 0 (major >= 1 fails BL2 secure-boot with
     # AUTH_ERROR 0x80), every field <= 255, and monotonic vs the part's last-seen
     # version even when the rollback fuses read 0.  Pass -Version explicitly on a
-    # part with flash history.
-    [string]$Version       = "0.1.0.1",
+    # part with flash history.  Same a.b.c.d scheme as deploy_validate.sh and
+    # regen_flashset.sh, which now REQUIRE an explicit VERSION because there is no
+    # safe default; this bench part's last-seen stamp is 0.149.64.0 (README.md,
+    # "STOP -- check the unit's flash history").
+    [Parameter(Mandatory = $true)][string]$Version,
     [string]$CcXdsSerial   = "",         # XDS110 serial on the CC3501E (toolbox -param1); blank = single-probe auto
 
     # --- Alif host example build + flash ---
@@ -144,14 +145,67 @@ Write-Host "   program over XDS110 $xdsLabel"
 $progArgs = @('programmer', '-i', 'XDS110')
 if (-not [string]::IsNullOrEmpty($CcXdsSerial)) { $progArgs += @('-param1', $CcXdsSerial) }
 $progArgs += @('programming', '--tool_settings', $ToolSettings)
-& $ToolboxExe @progArgs
-# -1141 = SECAP reject (intermittent); one retry per BRINGUP_STATUS.md.
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "   program returned $LASTEXITCODE -- retrying once (intermittent -1141 SECAP reject)"
-    & $ToolboxExe @progArgs
-    if ($LASTEXITCODE -ne 0) { throw "CC3501E warm program failed" }
+$progLog = "$pkg\program.log"
+
+# Run the programmer with its output teed to $progLog -- the streamed-byte check below
+# needs the log, and the exit code alone is not a sufficient success signal (see #712
+# under the check).  $ErrorActionPreference drops to 'Continue' across the call so that
+# native stderr chatter merged in by 2>&1 cannot raise a terminating NativeCommandError
+# and swallow the log; the exit code is returned and checked explicitly instead.
+function Invoke-CcProgrammer {
+    param([string]$Exe, [string[]]$ProgArgs, [string]$LogPath)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @ProgArgs 2>&1 | ForEach-Object { "$_" }
+        $rc  = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+    ($out -join [Environment]::NewLine) | Set-Content -Path $LogPath
+    $out | ForEach-Object { Write-Host "   $_" }
+    return $rc
 }
-Write-Host "   CC3501E warm-flashed."
+
+$progRc = Invoke-CcProgrammer -Exe $ToolboxExe -ProgArgs $progArgs -LogPath $progLog
+# -1141 = SECAP reject (intermittent); one retry per BRINGUP_STATUS.md.
+if ($progRc -ne 0) {
+    Write-Host "   program returned $progRc -- retrying once (intermittent -1141 SECAP reject)"
+    $progRc = Invoke-CcProgrammer -Exe $ToolboxExe -ProgArgs $progArgs -LogPath $progLog
+    if ($progRc -ne 0) { throw "CC3501E warm program failed" }
+}
+
+# The programmer returns 0 even when it SKIPS the vendor image: if the staged
+# tool_settings' programming_instructions / action_request are stale or image-coupled to
+# a different build, the vendor-image write is silently no-op'd -- it streams only the
+# ~1.3 KB programming-instructions and leaves the OLD resident image (this is #712,
+# which cost a full bench session on #708).  A zero exit code is NOT sufficient.
+#
+# Verify the FULL vendor image actually streamed.  NB: programming_report.txt's
+# primary_vendor_image_done bit is NOT a usable signal on this bench -- it reads 0 on
+# EVERY report, including the known-good set that brought Wi-Fi/BLE up.  The reliable
+# discriminator is the streamed byte count vs the vendor image size: full stream
+# (~1.09 MB decimal = 1.04 MiB, i.e. what a directory listing shows -- both are the same
+# 1094764 B, don't read the MiB figure as a short write) = written, ~1.3 KB = skipped.
+# This mirrors the check in deploy_validate.sh (its Linux twin).
+$vsize    = (Get-Item "$pkg\primary_vendor_image.sign.bin").Length
+$streamed = [int64]0
+foreach ($m in (Select-String -Path $progLog -Pattern 'Writing binary size of\s+(\d+)' -AllMatches).Matches) {
+    $n = [int64]$m.Groups[1].Value
+    if ($n -gt $streamed) { $streamed = $n }
+}
+if ($vsize -gt 0 -and $streamed -ge ($vsize / 2)) {
+    Write-Host "   CC3501E warm-flashed + vendor image streamed ($streamed B of $vsize B)."
+} else {
+    Write-Host "ERROR: programmer exited 0 but did NOT stream the vendor image (streamed=$streamed B, expected ~$vsize B)."
+    Write-Host "       -> stale / image-coupled programming manifest: only the ~1.3 KB instructions were"
+    Write-Host "       written and the OLD resident image survives (#712).  This harness re-signs only the"
+    Write-Host "       vendor_image half; programming_instructions + action_request are image-coupled and"
+    Write-Host "       are NOT regenerated here.  To deliver a fresh image, use the matched-full-set"
+    Write-Host "       pipeline instead:"
+    Write-Host "         firmware/cc3501e/ti/regen_flashset.sh"
+    throw "CC3501E vendor image was NOT streamed (streamed=$streamed B of $vsize B) -- see #712"
+}
 
 # ---------------------------------------------------------------------------
 # 3. Build the Alif host example (examples/aen/aen-cc3501e-gpio).

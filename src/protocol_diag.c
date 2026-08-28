@@ -31,7 +31,8 @@
  * This is distinct from BOTH:
  *   - ALP_CC3501E_PROTOCOL_VERSION (GET_VERSION) -- the wire-compat gate.
  *   - the GPE flash/image version (ti/deploy_validate.sh) -- the vendor-RoT
- *     anti-rollback gate; monotonic + date-derived, NOT this app SemVer.
+ *     anti-rollback gate; monotonic against the part's last-seen stamp and
+ *     supplied explicitly, NOT this app SemVer.
  *
  * The #ifndef fallback keeps a standalone compile (no -D) sane and MUST
  * track firmware-version.txt's current value. */

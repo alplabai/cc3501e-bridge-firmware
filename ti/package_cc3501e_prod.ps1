@@ -28,15 +28,19 @@ param(
     [Parameter(Mandatory = $true)][string]$ConfBin,        # cc35xx-conf.bin (memory/flash config)
     # GPE image version = vendor-RoT ANTI-ROLLBACK gate (monotonic, >= the unit's),
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
-    # Bench unit poisoned to 0.9.0.7 -> major MUST be >= 1. See deploy_validate.sh
-    # for the date-derived default (major.yy.mmdd.hhmm).
-    # GPE image version. MUST be monotonic vs anything ever flashed on the part
+    # It MUST be monotonic vs anything ever flashed on the part
     # (the SBL enforces this against the last-seen version even when every
     # rollback-protection fuse reads 0), and MUST have major=0 -- a GPE major >= 1
     # fails BL2 secure-boot with AUTH_ERROR 0x80 and the app core never launches.
-    # Every field must be <= 255.  This default is a FLOOR-SAFE placeholder only:
-    # pass -Version explicitly for any part with flash history.
-    [string]$Version       = "0.1.0.0",
+    # Every field must be <= 255.  Same a.b.c.d scheme as deploy_validate.sh and
+    # regen_flashset.sh, which now REQUIRE an explicit VERSION because there is no
+    # safe default (the old epoch-derived one wraps every 194.18 days and goes
+    # BACKWARDS across a wrap).  There is no floor-safe default here either: a
+    # low stamp is only ever valid on a FRESH never-activated unit, which is the
+    # only target this script supports, and on anything with flash history it is
+    # a rollback.  README.md and prebuilt/CHANGELOG.md record the last-seen
+    # stamps (the bench part is at 0.149.64.0, above a 0.149.63.0 floor).
+    [Parameter(Mandatory = $true)][string]$Version,
     [string]$FlashType     = "PY25Q64LB",
     [string]$XdsSerial     = "",         # XDS110 serial for -Program (e.g. L50015YR)
     [switch]$RollbackProtection,         # burn anti-rollback fuses (recommended for production)
@@ -78,6 +82,21 @@ if ($Program) {
     if ($XdsSerial -eq "") { throw "-Program needs -XdsSerial" }
     $rb = if ($RollbackProtection) { "yes" } else { "no" }
     Write-Host "== factory_program FRESH unit (XDS110 $XdsSerial, rollback=$rb) =="
+    # !!! KNOWN DEFECT -- READ BEFORE RUNNING WITH -Program !!!
+    # The call below does NOT program the HSM-signed image built in steps 2-3, and it
+    # passes NO --version, so $Version never reaches the part.  factory_programming is
+    # handed the raw ELF ($vout) plus --signing_module and re-wraps/re-signs it itself,
+    # at whatever GPE version the toolbox defaults to -- so the anti-rollback stamp
+    # actually burned into a production unit is NOT the one printed above, and $signed
+    # is written to disk and then ignored.  The script still reports success.
+    # NOT repaired here, deliberately: the repair is either `--version $Version` or
+    # feeding the pre-signed image, and neither flag spelling is verified against this
+    # toolbox's factory_programming CLI anywhere in this repo.  factory_programming
+    # ACTIVATES a fresh part and burns fuses -- one-shot per unit, not undoable -- so a
+    # guessed flag risks scrapping production silicon.  Confirm the toolbox's
+    # factory_programming options on the bench, then fix this call and delete this
+    # block.  Until then treat -Program as UNVALIDATED for release use, and verify the
+    # programmed stamp over the XDS110 `query` image table before shipping the unit.
     & $ToolboxExe programmer -i XDS110 -param1 $XdsSerial factory_programming `
         --activation_type vendor_key --flash_type $FlashType --enable_ota `
         --signing_module $SigningModule --vendor_out_file $vout --conf_bin_file $ConfBin `
