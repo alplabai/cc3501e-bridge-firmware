@@ -1,0 +1,14 @@
+# Every change here is reviewed by the maintainer.
+#
+# This firmware ships as a signed binary flashed onto customer modules, and its
+# wire protocol has a second half in alp-sdk -- so there is no file in this tree
+# where an unreviewed change is low-consequence.
+* @alpCaner
+
+# Called out separately because a mistake in these is the expensive kind:
+# a wrong version pairing silently discards a flash, and a prebuilt is the
+# artifact people actually write to a part.
+/prebuilt/                @alpCaner
+/firmware-version.txt     @alpCaner
+/protocol-version.txt     @alpCaner
+/.github/workflows/       @alpCaner

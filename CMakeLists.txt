@@ -9,16 +9,23 @@
 # protocol + atomic cross-side changes, the same way firmware/gd32-bridge/
 # is.  Invoke directly:
 #
-#   # Host-side / CI compile smoke (no TI SDK needed):
-#   cmake -B build/stub -S firmware/cc3501e \
-#     -DCMAKE_TOOLCHAIN_FILE=firmware/cc3501e/toolchain/arm-none-eabi.cmake \
-#     -DCC3501E_HAL_BACKEND=stub
+#   # Host-side / CI compile smoke (no TI SDK needed).  The Arm toolchain file
+#   # is NOT optional: these sources are built -mcpu=cortex-m33 -mthumb, so the
+#   # host compiler cannot produce them even with the HAL stubbed.
+#   # ALP_SDK_ROOT points at an alp-sdk checkout -- this firmware compiles the
+#   # CANONICAL <alp/protocol/cc3501e.h> rather than a mirrored copy, so the
+#   # wire contract cannot fork, and a build with no alp-sdk cannot work.
+#   cmake -B build/stub -S . \
+#     -DCMAKE_TOOLCHAIN_FILE=toolchain/arm-none-eabi.cmake \
+#     -DCC3501E_HAL_BACKEND=stub \
+#     -DALP_SDK_ROOT=<path-to-alp-sdk>
 #   cmake --build build/stub
 #
 #   # Production image (bench: needs TI ticlang + SimpleLink CC33xx SDK):
-#   cmake -B build/ti -S firmware/cc3501e \
-#     -DCMAKE_TOOLCHAIN_FILE=firmware/cc3501e/toolchain/ticlang.cmake \
-#     -DCC3501E_HAL_BACKEND=ti
+#   cmake -B build/ti -S . \
+#     -DCMAKE_TOOLCHAIN_FILE=toolchain/ticlang.cmake \
+#     -DCC3501E_HAL_BACKEND=ti \
+#     -DALP_SDK_ROOT=<path-to-alp-sdk>
 #   cmake --build build/ti
 #
 # The output image lives at build/<dir>/cc3501e-bridge(.hex/.bin on ti).

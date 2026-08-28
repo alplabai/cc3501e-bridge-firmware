@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI for the CC3501E bridge firmware.
+#
+# What this CAN check, and what it deliberately cannot:
+#
+#   * The `ti` backend needs TI ticlang 5.1.1, the SimpleLink Wi-Fi SDK
+#     10.10.01.08, SysConfig 1.28.0 and the Wi-Fi Toolbox 4.2.4 -- none of
+#     which is redistributable, so no hosted runner can build it.  CI builds
+#     the `stub` backend, which compiles every protocol/dispatch/event source
+#     in the tree; only the hardware-touching HAL is replaced.  That still
+#     catches the class of break that actually happens here: a protocol change
+#     that does not compile, a handler that stops matching its table entry, a
+#     header that drifts from alp-sdk.
+#   * On-silicon behaviour is NOT covered.  The bench is a physical
+#     E1M-AEN801 with an XDS110; nothing here substitutes for it.  A change
+#     that alters radio, SPI-slave or OTA behaviour still needs a bench run
+#     before it is believed.
+#
+# The protocol header comes from alp-sdk, not from this repo -- this firmware
+# compiles the CANONICAL <alp/protocol/cc3501e.h> so the wire contract cannot
+# fork.  That is why alp-sdk is checked out here and passed as ALP_SDK_ROOT.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stub-build:
+    name: stub build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: firmware
+
+      # The wire contract lives in alp-sdk.  Pinned to its default branch
+      # deliberately: this build's whole point is to fail when the two drift,
+      # and a pinned SHA here would hide exactly that.
+      - uses: actions/checkout@v4
+        with:
+          repository: alplabai/alp-sdk
+          path: alp-sdk
+
+      # This is Cortex-M33 firmware -- the sources are compiled
+      # -mcpu=cortex-m33 -mthumb unconditionally, so the host compiler cannot
+      # build it even with the hardware-touching HAL stubbed.
+      # toolchain/arm-none-eabi.cmake is the invocation CMakeLists.txt
+      # documents for exactly this "CI compile smoke" case.
+      - name: install the Arm GNU toolchain
+        run: |
+          sudo apt-get update -qq
+          # libnewlib-arm-none-eabi is NOT optional and is a separate package
+          # on Debian/Ubuntu: gcc-arm-none-eabi alone installs the compiler
+          # with no C library headers, so the first #include <string.h> fails
+          # with "No such file or directory" -- which reads like a source bug
+          # and is not one.
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+          # Prove the headers are reachable before CMake tries, so a packaging
+          # regression reports itself here rather than as a confusing
+          # "fatal error: string.h" against a source file.
+          printf '#include <string.h>\nint main(void){return 0;}\n' > /tmp/hdr.c
+          arm-none-eabi-gcc -mcpu=cortex-m33 -mthumb -c /tmp/hdr.c -o /tmp/hdr.o
+          echo "newlib headers reachable"
+
+      - name: configure
+        run: |
+          # CMAKE_TOOLCHAIN_FILE must be ABSOLUTE here.  CMake resolves a
+          # relative toolchain path against the BUILD directory, not the
+          # working directory, so "firmware/toolchain/..." was looked for at
+          # "build/firmware/toolchain/..." and reported as
+          # "Could not find toolchain file".
+          cmake -B build -S firmware \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
+            -DCC3501E_HAL_BACKEND=stub \
+            -DALP_SDK_ROOT="$PWD/alp-sdk"
+
+      - name: build
+        run: cmake --build build -j"$(nproc)"
+
+  protocol-version-parity:
+    name: protocol version parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: firmware
+      - uses: actions/checkout@v4
+        with:
+          repository: alplabai/alp-sdk
+          path: alp-sdk
+
+      # Three numbers exist here and are NOT interchangeable (see
+      # prebuilt/CHANGELOG.md): the app SemVer, the wire protocol, and the GPE
+      # stamp on a flashed artifact.  This job pins the one that is a contract
+      # with the host: protocol-version.txt must equal alp-sdk's
+      # ALP_CC3501E_PROTOCOL_VERSION, and src/protocol_meta.c's compile-time
+      # assert must agree too.  A mismatch is how a build answers GET_VERSION
+      # with one number while behaving like another.
+      - name: compare protocol-version.txt with the canonical header
+        run: |
+          set -euo pipefail
+          fw=$(tr -d '[:space:]' < firmware/protocol-version.txt)
+          hdr=$(grep -oP '#define\s+ALP_CC3501E_PROTOCOL_VERSION\s+\K[0-9]+' \
+                  alp-sdk/include/alp/protocol/cc3501e.h)
+          echo "firmware/protocol-version.txt = $fw"
+          echo "alp-sdk ALP_CC3501E_PROTOCOL_VERSION = $hdr"
+          if [ "$fw" != "$hdr" ]; then
+            echo "::error::protocol version mismatch: this tree says $fw, alp-sdk says $hdr."
+            echo "Bump BOTH, in the same change, or the host and the companion disagree on the wire."
+            exit 1
+          fi
+
+  clang-format:
+    name: clang-format (diff only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Diff-only, not tree-wide: this tree carries vendor-shaped sources and
+      # a tree-wide reformat would bury a real review in noise.
+      - name: install clang-format 22
+        run: pipx install "clang-format==22.1.5"
+
+      - name: check changed C/H files
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then base=$(git rev-parse HEAD~1); fi
+          files=$(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.c' '*.h' || true)
+          if [ -z "$files" ]; then echo "no C/H files changed"; exit 0; fi
+          echo "$files"
+          # shellcheck disable=SC2086
+          clang-format --dry-run --Werror $files
+
+  no-build-artifacts:
+    name: no build artifacts or crash dumps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `git add -A` on the Windows bench has swept a 14 MB .out, a 2 MB .map
+      # and several MSYS *.stackdump files into this history already.  Cheap to
+      # check, expensive to undo.
+      - name: reject tracked artifacts
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -E '\.(stackdump|out|map|o|obj)$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::build artifacts / crash dumps are tracked:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "clean"
+
+  prebuilt-integrity:
+    name: prebuilt integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every shipped blob must match its own .sha256 manifest.  These are the
+      # artifacts customers flash; a mismatch means the manifest, the binary or
+      # both are wrong, and the flashing recipe in README tells people to verify
+      # exactly this before writing to a part.
+      - name: verify each prebuilt against its manifest
+        run: |
+          set -euo pipefail
+          rc=0
+          for bin in prebuilt/cc3501e-*.bin; do
+            [ -e "$bin" ] || continue
+            man="$bin.sha256"
+            if [ ! -f "$man" ]; then
+              echo "::error::$bin has no $man"; rc=1; continue
+            fi
+            want=$(tr -d '[:space:]' < "$man")
+            have=$(sha256sum "$bin" | cut -d' ' -f1)
+            if [ "$want" != "$have" ]; then
+              echo "::error::$bin sha256 mismatch: manifest $want, actual $have"; rc=1
+            else
+              echo "ok  $bin  $have"
+            fi
+          done
+          exit $rc

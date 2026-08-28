@@ -2,3 +2,7 @@
 # The TI build drops a ~14 MB .out and a ~2 MB .map here; none of it belongs
 # in history (the shippable image is signed and published under prebuilt/).
 build/
+
+# Cygwin/MSYS crash dumps.  The Windows bench shell drops these in the repo
+# root and `git add -A` has swept them into history more than once.
+*.stackdump
