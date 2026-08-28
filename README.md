@@ -129,11 +129,26 @@ Verify the flash took by asking the device, not by trusting the programmer:
 
 Three distinct version numbers are in play here and they are **not**
 interchangeable -- app SemVer (`0.4.1`), wire protocol (`5`), and the GPE
-image stamp (`0.4.1.0`).  `prebuilt/CHANGELOG.md` has the table.  The stamp is
-what the programmer's rollback/version gate compares against the signed
-`programming_instructions`; on the WARM path it is NOT a fuse burn (a warm
-programming run leaves every `*_rollback_protection_*` fuse at `0`, confirmed in
-`programming_report.txt` on 2026-08-28).
+image stamp (`0.4.1.0`).  `prebuilt/CHANGELOG.md` has the table.
+
+> **STOP -- check the unit's flash history before using this artifact's `0.4.1.0`
+> stamp.**  The CC35 SBL enforces GPE-version **monotonicity against the last-seen
+> version on that part**, and it does so **even when every `*_rollback_protection_*`
+> fuse reads `0`**.  A warm programming run burns no fuses, so the report will show
+> all-zero fuses and look permissive -- that is the trap, not the answer.  Flash a
+> stamp LOWER than anything ever flashed on the unit and it streams clean (exit 0,
+> the full ~1.09 MB) and then the SBL refuses to boot it: **dead link**, with an
+> empty XDS110 `query` image table.  Bench units used for OTA or flash iteration sit
+> far above `0.4.1.0` -- the bench part here is at `0.149.64.0`.  For such a unit,
+> re-wrap this same image at a legal stamp instead:
+>
+> ```sh
+> VERSION=0.149.65.0 ti/regen_flashset.sh   # > the unit's last-seen version, major MUST be 0
+> ```
+>
+> `major` must be `0`: a GPE major `>= 1` fails BL2 secure-boot with `AUTH_ERROR`.
+> `BRINGUP_STATUS.md` "The #1 cause of *streams clean but dead link*" has the full
+> rule and the recovery path.
 
 Build from source only when you are changing the firmware -- see below.
 

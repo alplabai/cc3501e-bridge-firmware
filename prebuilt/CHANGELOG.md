@@ -24,7 +24,19 @@ Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 |---|---|---|
 | App SemVer (`firmware-version.txt`) | **0.4.1** | the `fw_version` marker the bridge reports in `DIAG` (`0x0401`) |
 | Wire protocol (`ALP_CC3501E_PROTOCOL_VERSION`) | **5** | `GET_VERSION`; unchanged from 0.4.0, so a 0.4.0 host talks to this image |
-| GPE image `--version` (this artifact's stamp) | **0.4.1.0** | the version the programmer's rollback/version gate compares |
+| GPE image `--version` (this artifact's stamp) | **0.4.1.0** | the version the SBL compares against the part's last-seen version |
+
+> **Anti-rollback -- read before flashing this artifact.** The stamp must be
+> monotonically **>=** anything ever flashed on that unit, and the CC35 SBL
+> enforces that **even when every `*_rollback_protection_*` fuse reads `0`**.
+> A warm programming run burns no fuses, so an all-zero fuse report looks
+> permissive and is not. A stamp below the unit's last-seen version streams
+> clean (exit 0, the full ~1.09 MB) and then fails to boot: dead link, empty
+> XDS110 `query` image table. Any unit used for OTA or flash iteration is far
+> above `0.4.1.0` -- re-wrap this same image at a legal stamp
+> (`VERSION=<higher> ti/regen_flashset.sh`) rather than assuming the binary is
+> bad. `major` must stay `0`: a GPE major `>= 1` fails BL2 secure-boot with
+> `AUTH_ERROR`.
 
 **The soft-AP now accepts clients (alp-sdk#1562).** `cc3501e_hw_wifi_ap_start()`
 built its role-up command as a zero-initialised `RoleUpApCmd_t` and filled only

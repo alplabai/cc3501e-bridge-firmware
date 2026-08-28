@@ -30,7 +30,13 @@ param(
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
     # Bench unit poisoned to 0.9.0.7 -> major MUST be >= 1. See deploy_validate.sh
     # for the date-derived default (major.yy.mmdd.hhmm).
-    [string]$Version       = "1.0.0.0", # GPE image version; MUST be monotonic (major>=1)
+    # GPE image version. MUST be monotonic vs anything ever flashed on the part
+    # (the SBL enforces this against the last-seen version even when every
+    # rollback-protection fuse reads 0), and MUST have major=0 -- a GPE major >= 1
+    # fails BL2 secure-boot with AUTH_ERROR 0x80 and the app core never launches.
+    # Every field must be <= 255.  This default is a FLOOR-SAFE placeholder only:
+    # pass -Version explicitly for any part with flash history.
+    [string]$Version       = "0.1.0.0",
     [string]$FlashType     = "PY25Q64LB",
     [string]$XdsSerial     = "",         # XDS110 serial for -Program (e.g. L50015YR)
     [switch]$RollbackProtection,         # burn anti-rollback fuses (recommended for production)

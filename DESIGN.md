@@ -83,10 +83,32 @@ paths parse the SemVer and pass the packed value in:
 `#ifndef` fallback equal to the current release for standalone compiles.
 
 **GPE flash version** is *not* the app version. It is a monotonic
-anti-rollback counter the vendor RoT enforces. `deploy_validate.sh`
-derives it as `major.<yy>.<mmdd>.<hhmm>` (e.g. `1.26.0705.1432`) with
-`major >= 1`, because the bench unit was poisoned to `0.9.0.7` by ad-hoc
-bumps; `1.x` always beats it and every flash strictly increases.
+anti-rollback counter, and it is enforced by the SBL against the
+last-seen version on the part **even when every rollback-protection fuse
+reads 0** -- a warm programming run burns no fuses, so an all-zero fuse
+report is not permission to go backwards.
+
+Two hard rules, both bench-proven, both easy to get wrong:
+
+- **`major` MUST be `0`.** A vendor image with `major >= 1` fails
+  SES/BL2 secure-boot authentication (boot report `@0x28000104` sets
+  `AUTH_ERROR 0x80`) and the app core never launches -- the host then
+  reads `get_version = -5`. Byte-identical firmware authenticated at
+  `0.0.1.0` and `AUTH_ERROR`'d at `1.0.0.0`.
+- **Each field must be `<= 255`.** A human date like
+  `1.<yy>.<mmdd>.<hhmm>` is INVALID: `mmdd = 0705` and `hhmm = 1531`
+  overflow a byte and silently corrupt the version.
+
+`deploy_validate.sh:50` therefore derives it as major `0` plus the low
+three bytes of the epoch:
+`0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))`.
+
+> An earlier revision of this section prescribed exactly the two schemes
+> above as REQUIREMENTS -- `major >= 1` and `major.<yy>.<mmdd>.<hhmm>`.
+> Both produce an unbootable part. It cited `deploy_validate.sh`, which
+> had already been corrected in the same PR that added this paragraph.
+> `ti/package_cc3501e_prod.ps1` and `ti/validate_gpio_bench.ps1` carried
+> the same wrong default (`1.0.0.0` / `1.0.0.1`) until 2026-08-28.
 
 ## Selectable host-control transport
 

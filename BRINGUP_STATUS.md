@@ -42,16 +42,25 @@ expects v5) -- match`, 20/20 soak PINGs, `GET_MAC ok 44:3e:8a:10:b6:9e`,
 (`5`), and the GPE stamp on the flashed artifact (`0.149.64.0` for the current bench
 image). Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
 
-**What the GPE stamp does, precisely.** It is the version the programmer's
-rollback/version gate compares, and `programming_instructions` must be built at the
-**same** `--version` as the vendor image or the write is rejected -- that matched pair
-is what `ti/regen_flashset.sh` exists to guarantee, and it is the coupling that
-actually bites. It is NOT, on the WARM path, a fuse burn: a warm programming run
-(`primary_vendor_image=true`, `boot_sector=false`) leaves every
-`*_rollback_protection_*` fuse at `0`, confirmed in `programming_report.txt` on
-2026-08-28. Earlier notes here and in the bench memories described every flash as
-burning an irreversible floor; that applies to fuse-programming runs, not to the warm
-reflash used for iteration.
+**What the GPE stamp does, precisely -- and the trap in reading the fuses.**
+Two independent couplings, and you must satisfy BOTH:
+
+1. **Monotonicity against the last-seen version.** The stamp must be `>=` anything
+   ever flashed on that unit. See "The #1 cause of *streams clean but dead link*"
+   below: a rollback streams the full ~1.09 MB, exits 0, and then the SBL simply
+   refuses to boot the image -- dead link.
+2. **The matched pair.** `programming_instructions` must be built at the **same**
+   `--version` as the vendor image or the write is rejected. That is what
+   `ti/regen_flashset.sh` exists to guarantee.
+
+**Do NOT read the rollback fuses as permission to go backwards.** A WARM programming
+run (`primary_vendor_image=true`, `boot_sector=false`) burns no fuses, so
+`programming_report.txt` shows every `*_rollback_protection_*` at `0` -- and that
+report is exactly what tempts you to conclude no floor is enforced. It is enforced
+anyway: the SBL compares against the last-seen version independently of the fuses
+(bench-proven on `e1m-aen-evk-01`, 2026-07-12). An earlier revision of this section
+made precisely that misreading and told the reader the warm path had no floor; it was
+wrong, and following it bricks the link on any unit whose history you do not know.
 
 ### Fixed since the last revision
 
@@ -159,8 +168,12 @@ deassert callback double-advances the READY state machine.
 - **STA connect** is asynchronous and validated across the bridge: association
   no longer wedges the link, and a `GET_VERSION`/`ver` check after connect still
   responds.
-- **Socket APIs** are implemented; keep credentialed socket soak in production
-  validation because it depends on local network availability.
+- **Socket APIs** are present on the wire but **do not connect** -- see the TL;DR
+  row and alp-sdk#1746. `sock tcp-get` cannot open a TCP connection to any
+  destination on fw 0.4.0/0.4.1 (LAN `-1` `ALP_ERR_INVAL`, public `-4`
+  `ALP_ERR_TIMEOUT`) while the same targets fetch fine from the host on the same
+  LAN, so this is not a network-availability caveat. A credentialed socket soak
+  is blocked on the connect path working at all.
 
 ## 3. BLE
 
