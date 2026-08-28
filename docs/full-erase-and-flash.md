@@ -13,6 +13,12 @@ only want a newer application image, use the warm path in
 [`../README.md`](../README.md) instead — it is faster and it cannot brick the
 part, which this procedure can.
 
+> **Verified end-to-end on an E1M-AEN801, 2026-08-28.** Programmed a complete
+> set on a working part (booted), ran `full_flash_erase` (part dead,
+> `get_version failed (-5)` on every attempt), then programmed the same set
+> again and the part came back (`protocol v5`, `fw 0x0401`). The partial-write
+> behaviour in step 5 was found during that run, not by reading the tool.
+
 ---
 
 ## Read this before you erase anything
@@ -107,6 +113,13 @@ highest of:
       print('.'.join(str(b) for b in d[0x24:0x28]))"
   ```
 
+  Offset `0x24` is the GPE version of the **vendor image** specifically. Do not
+  read it from the other components and expect a version: the same offset in
+  `boot_sector_image.bin`, `primary_tbl_image.bin` and
+  `primary_ti_wireless_fw_image.bin` is ordinary payload, and it reads as
+  plausible-looking nonsense (`252.239.85.0`, `0.1.0.0`, `0.1.8.0` on the sets
+  here) — which is worse than an obvious error, because it looks like an answer.
+
 - any stamp recorded in your flashing logs for that unit, and
 - the stamps in `prebuilt/CHANGELOG.md` if you ever flashed a published artifact.
 
@@ -129,10 +142,29 @@ one:
 | `primary_vendor_image` (our application) | yes | yes |
 
 Pick `VERSION` above the floor from step 2, with `major = 0` and every field
-`<= 255`, then build the set. `ti/regen_flashset.sh` builds a **warm** set —
-correct for the fast path in the README, **not** for this one; a full set is
-generated with `prog_req_content` carrying `boot_sector`, `primary_tbl`,
-`primary_ti_wsoc` **and** `primary_vendor_image` all true.
+`<= 255`. **`ti/regen_flashset.sh` builds a WARM set** — correct for the fast
+path in the README, wrong for this one. Use `ti/build_full_set.py`, which is the
+script this procedure was validated with:
+
+```sh
+TOOLBOX=<path-to-simplelink-wifi-toolbox> SIGNING_DIR=<dir with the vendor key, sign module and cc35xx-conf.bin> REF_SET=<a prior COMPLETE set> python3 ti/build_full_set.py 0.149.65.0
+```
+
+It prints every component with its size so you can see the set is complete
+before you erase, and it deletes stale `*.flashready.bin` for you.
+
+Two couplings it handles that are easy to get wrong by hand:
+
+- **The boot sector is version-coupled to the programming instructions.** It
+  takes `--version` *and* embeds the instruction image, so a full set cannot
+  reuse an old boot sector beside a new vendor image. Note also that
+  `--programming_instruction_image_path` is **mutually exclusive** with the
+  three `--flash_discovery_config_*` options — the signed instruction image
+  already carries that configuration, and passing both is rejected.
+- **TBL and TI wireless firmware carry TI's versions, not yours.** Their
+  builders take a signed container and have no `--version` at all, so they are
+  reused as-is from a prior complete set. You cannot re-stamp them and should
+  not try.
 
 Whatever tooling builds it, one rule is absolute:
 
@@ -187,8 +219,40 @@ Expect roughly 1.1 MB streamed for the vendor image alone, plus the boot sector,
 TBL and TI wireless firmware. An intermittent ACK timeout before an image header
 that clears on retry is benign; a timeout that repeats is not.
 
-**Do not trust the programmer's exit status as proof.** It reports success on
-writes the SBL will later refuse. Verification is step 6.
+### Count the writes — a run can silently program nothing
+
+**A programming run can finish, report no error, and write none of the four
+images.** Seen on the first restore attempt of the validation run: the log
+showed exactly three writes and then ended —
+
+```
+Writing binary size of 144676 bytes    <- ti_programmer, the toolbox's own loader
+Writing binary size of 240 bytes       <- programming_action_request
+Writing binary size of 1340 bytes      <- programming_instructions
+```
+
+No error, no `Saved report image bin file` line. A byte-identical second
+invocation wrote everything. Cold-cycling after a run like that gives you a dead
+part and no reason — which is how a recoverable module gets written off as
+bricked.
+
+**A restore that actually happened writes a `content_*` block per component.**
+On this SoM:
+
+| Component | Expected content write |
+|---|---|
+| `boot_sector` | 1084 B |
+| `primary_ti_wsoc` | 171740 B |
+| `primary_vendor_image` | 1097308 B (varies with your image) |
+| `primary_tbl` | 135008 B |
+
+each preceded by a 12-byte `header_*` write, and the run ending with
+`Saved report image bin file at .../programming_report.txt`. If you do not see
+those, **re-run before concluding anything** — and before touching the part's
+power.
+
+**Do not trust the exit status as proof either.** It reports success on writes
+the SBL will later refuse. Device-side verification is step 6.
 
 ---
 
