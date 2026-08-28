@@ -64,7 +64,11 @@ param(
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
     # The bench unit is at 0.9.0.7 -> major MUST be >= 1 now. See deploy_validate.sh
     # for the date-derived scheme (major.yy.mmdd.hhmm); pass a >=1.x value here.
-    [string]$Version       = "1.0.0.1", # GPE image version; MUST be monotonic (major>=1)
+    # GPE image version -- major MUST be 0 (major >= 1 fails BL2 secure-boot with
+    # AUTH_ERROR 0x80), every field <= 255, and monotonic vs the part's last-seen
+    # version even when the rollback fuses read 0.  Pass -Version explicitly on a
+    # part with flash history.
+    [string]$Version       = "0.1.0.1",
     [string]$CcXdsSerial   = "",         # XDS110 serial on the CC3501E (toolbox -param1); blank = single-probe auto
 
     # --- Alif host example build + flash ---

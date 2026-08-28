@@ -49,6 +49,33 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
 	return ALP_CC3501E_RESP_OK;
 }
 
+/* The wire protocol this firmware tree IMPLEMENTS.  It is deliberately a
+ * literal, not a copy of the header's value: its whole job is to disagree with
+ * <alp/protocol/cc3501e.h> when the two drift apart.
+ *
+ * This firmware compiles the CANONICAL header out of an alp-sdk checkout rather
+ * than mirroring it, so the wire contract cannot silently fork -- but only as
+ * long as the checkout it reaches is the RIGHT one.  Before this tree was
+ * extracted from alp-sdk the build guessed that path two directories up and was
+ * always right; afterwards the same guess lands on whichever sibling checkout
+ * happens to be there, on whatever branch it happens to be on.  That is not
+ * hypothetical: on 2026-08-28 a protocol-4 header reached this protocol-5 build
+ * and it failed on the first missing opcode.
+ *
+ * A missing opcode is the LUCKY failure -- it is loud.  A header that differs
+ * only in a VALUE would compile cleanly and produce an image that answers
+ * GET_VERSION with one number while behaving like another, which the host would
+ * then trust.  This assert makes that case just as loud, at compile time.
+ *
+ * Bumping the protocol means changing BOTH this literal and the header, in the
+ * same change. */
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL 5
+
+_Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
+               "<alp/protocol/cc3501e.h> is not the protocol version this firmware "
+               "implements -- the build is pointed at the wrong (or a stale) alp-sdk "
+               "checkout; pass -AlpSdkRoot / ALP_SDK_ROOT at the right one");
+
 /* GET_VERSION (0x01): wire-protocol compatibility gate.  Returns the
  * 16-bit ALP_CC3501E_PROTOCOL_VERSION (LE); the host refuses to talk
  * to a firmware whose value != its compile-time ALP_CC3501E_PROTOCOL_VERSION.

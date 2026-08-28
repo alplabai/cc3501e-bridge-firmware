@@ -98,18 +98,18 @@ image, already built and signed:
 ```sh
 # 1. Verify what you are about to flash (never skip this).
 openssl dgst -sha256 -verify <VALIDATION_public.pem> \
-    -signature prebuilt/cc3501e-v0.4.0.bin.sig prebuilt/cc3501e-v0.4.0.bin
-sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.4.0.bin.sha256)  prebuilt/cc3501e-v0.4.0.bin"
+    -signature prebuilt/cc3501e-v0.4.1.bin.sig prebuilt/cc3501e-v0.4.1.bin
+sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.4.1.bin.sha256)  prebuilt/cc3501e-v0.4.1.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
-#    THIS artifact's stamp (0.4.0.0) -- see the warning below.  An existing
+#    THIS artifact's stamp (0.4.1.0) -- see the warning below.  An existing
 #    flash-set built at another version will NOT do; regenerate it:
-#      VERSION=0.4.0.0 ti/regen_flashset.sh
+#      VERSION=0.4.1.0 ti/regen_flashset.sh
 #
 # 3. Drop the blob in as the primary vendor image, and remove any stale
 #    pre-flattened image -- a leftover *.flashready.bin is used in preference
 #    to the file you just copied.
-cp prebuilt/cc3501e-v0.4.0.bin <flashset>/primary_vendor_image.sign.bin
+cp prebuilt/cc3501e-v0.4.1.bin <flashset>/primary_vendor_image.sign.bin
 rm -f <flashset>/*.flashready.bin
 
 # 4. Program over XDS110/SWD (~18 s).
@@ -125,13 +125,30 @@ expensive trap on this part.  `programming_instructions` is built from
 
 Verify the flash took by asking the device, not by trusting the programmer:
 `GET_VERSION` must answer wire protocol **5**, and `GET_DIAG_INFO` must report
-`fw_version=0x0400`.
+`fw_version=0x0401`.
 
 Three distinct version numbers are in play here and they are **not**
-interchangeable -- app SemVer (`0.4.0`), wire protocol (`5`), and the GPE
-anti-rollback stamp (`0.4.0.0`).  `prebuilt/CHANGELOG.md` has the table and the
-anti-rollback rules; read them before flashing a part that has been used for
-OTA testing, because its floor may already be above this artifact's stamp.
+interchangeable -- app SemVer (`0.4.1`), wire protocol (`5`), and the GPE
+image stamp (`0.4.1.0`).  `prebuilt/CHANGELOG.md` has the table.
+
+> **STOP -- check the unit's flash history before using this artifact's `0.4.1.0`
+> stamp.**  The CC35 SBL enforces GPE-version **monotonicity against the last-seen
+> version on that part**, and it does so **even when every `*_rollback_protection_*`
+> fuse reads `0`**.  A warm programming run burns no fuses, so the report will show
+> all-zero fuses and look permissive -- that is the trap, not the answer.  Flash a
+> stamp LOWER than anything ever flashed on the unit and it streams clean (exit 0,
+> the full ~1.09 MB) and then the SBL refuses to boot it: **dead link**, with an
+> empty XDS110 `query` image table.  Bench units used for OTA or flash iteration sit
+> far above `0.4.1.0` -- the bench part here is at `0.149.64.0`.  For such a unit,
+> re-wrap this same image at a legal stamp instead:
+>
+> ```sh
+> VERSION=0.149.65.0 ti/regen_flashset.sh   # > the unit's last-seen version, major MUST be 0
+> ```
+>
+> `major` must be `0`: a GPE major `>= 1` fails BL2 secure-boot with `AUTH_ERROR`.
+> `BRINGUP_STATUS.md` "The #1 cause of *streams clean but dead link*" has the full
+> rule and the recovery path.
 
 Build from source only when you are changing the firmware -- see below.
 
@@ -209,10 +226,11 @@ release blob is version-pinned at `prebuilt/cc3501e-vX.Y.Z.bin`.
 validates that blob (relaying the image to the CC3501E over the
 inter-chip link) -- it is not a customer-facing utility, and lives
 in `alp-sdk-internal`, not this public tree.
-`prebuilt/` holds the signed release blob; `cc3501e-v0.4.0.bin` is the
-current one (wire protocol 5).  `cc3501e-v0.3.0.bin` is kept for
-traceability but answers protocol **4**, so a host built from this tree
-refuses it.
+`prebuilt/` holds the signed release blob; `cc3501e-v0.4.1.bin` is the
+current one (wire protocol 5).  `cc3501e-v0.4.0.bin` is kept for
+traceability and answers the same protocol, but its soft-AP accepts no
+clients (alp-sdk#1562) -- prefer 0.4.1.  `cc3501e-v0.3.0.bin` answers
+protocol **4**, so a host built from this tree refuses it.
 
 ## Status
 
@@ -225,5 +243,5 @@ refuses it.
 | TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the v0.1 critical path — SPI is the default. |
 | Async events: attention edge on READY | ✅ shipped and silicon-validated (#130, alp-sdk#1721): the CC35 pulses an attention edge on the rev-1 READY wire (`GPIO17` -> Alif `P2_6`) and the host drains on the edge — 135/135 firmware pushes delivered with the timer poll at 60 s. **Build-time opt-in** (`build_ti.ps1 -AttnPulse`, default OFF: the wire is a rev-1 bodge absent on the stock EVK), and only `EVT_WIFI_CONNECTED`/`_DISCONNECTED` have a producer today. A *dedicated* HOST_IRQ pad remains a future board rev (see DESIGN.md). |
 | `flash.py` real flashing | 🔮 moved to `alp-sdk-internal` (Alp-internal OTA-build tooling); blocked on TI's `cc3501e-flasher` CLI (not public yet); manual SWD/J-Link is the interim bench path |
-| `prebuilt/` populated | ✅ `cc3501e-v0.4.0.bin` signed (full bridge: META + Wi-Fi + BLE + sockets + OTA, proto v5 incl. `OTA_UPDATE_MODE`); see `prebuilt/CHANGELOG.md`. |
+| `prebuilt/` populated | ✅ `cc3501e-v0.4.1.bin` signed (full bridge: META + Wi-Fi + BLE + OTA, proto v5 incl. `OTA_UPDATE_MODE`); fixes the soft-AP that accepted no clients (alp-sdk#1562). **Sockets are present but do NOT connect** (alp-sdk#1746) — see `prebuilt/CHANGELOG.md`. |
 | Wi-Fi / BLE / GPIO-proxy groups | ✅ implemented and silicon-validated (alp-sdk v0.8.0 on E1M-AEN801): Wi-Fi scan with security decode, real BLE scan (ble_gap_disc), GPIO proxy warm-boot, OTA-over-bridge staged (see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)). |
