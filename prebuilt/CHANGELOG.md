@@ -7,6 +7,62 @@ named `cc3501e-vX.Y.Z.bin` (matching `firmware/cc3501e/firmware-version.txt`).
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1]
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0 + Wi-Fi toolbox 4.2.4) via
+`ti/build_ti.ps1 -Ble -AlpSdkRoot <alp-sdk>`.
+
+- `cc3501e-v0.4.1.bin`         -- signed firmware image (full shipped stack)
+- `cc3501e-v0.4.1.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
+  (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
+  verify with `openssl dgst -sha256 -verify <pub> -signature
+  cc3501e-v0.4.1.bin.sig cc3501e-v0.4.1.bin`)
+- `cc3501e-v0.4.1.bin.sha256`  -- integrity manifest (`7f550c79502f6b001f1e651d1229f61a0878cd29b78d33dae6621021148f324f`)
+
+| Number | Value | What it gates |
+|---|---|---|
+| App SemVer (`firmware-version.txt`) | **0.4.1** | the `fw_version` marker the bridge reports in `DIAG` (`0x0401`) |
+| Wire protocol (`ALP_CC3501E_PROTOCOL_VERSION`) | **5** | `GET_VERSION`; unchanged from 0.4.0, so a 0.4.0 host talks to this image |
+| GPE image `--version` (this artifact's stamp) | **0.4.1.0** | the version the programmer's rollback/version gate compares |
+
+**The soft-AP now accepts clients (alp-sdk#1562).** `cc3501e_hw_wifi_ap_start()`
+built its role-up command as a zero-initialised `RoleUpApCmd_t` and filled only
+`ssid`, `channel` and `secParams`. That left `sta_limit` at **0** -- a field TI's
+header describes as "limits the number of stations that the AP's has", so the AP
+was configured to admit **zero** clients. TI's own reference filler
+(`ParseRoleUpApCmd()`) defaults it to 4 and clamps anything outside `[1, 8]` back
+to 4, so 0 was never a legal value; it was simply the uninitialised value reaching
+the NWP.
+
+The AP beaconed perfectly throughout, which is why this survived so long: with one
+radio a broken AP and a working one look identical. Measured with a second radio
+(an Intel AX200 driven as a real client), from a cold boot:
+
+| | 0.4.0 | 0.4.1 |
+|---|---|---|
+| WPA2 association | 0 of 16 attempts over 275 s | associated (t+13s, t+20s across runs) |
+| Open association | 0 of 12 attempts over 180 s | associated at t+13s |
+| firmware `wifievt` | frozen at 3 (role-up only) | 4 -- the station event |
+
+Three sibling fields with the same zero-is-a-real-setting problem are now set from
+TI's reference too: `countryDomain` (the `"00"` world domain), `sae_pwe`, and
+`sae_anticlogging_threshold` (0 is `SAE_ANTI_CLOGGING_ALWAYS`, not "unset"). The
+latter two affect the WPA3 security type only.
+
+**Known limitation, unchanged:** a second `wifi ap` on a device already in AP role
+does not take -- association fails until the part is cold-cycled. `ap-stop` is NOT
+a workaround: it runs `WIFI_AP_STOP` in the SPI ISR and wedges the bridge
+(alp-sdk#1564). Cold-cycle between AP experiments.
+
+**Also unchanged from 0.4.0:** `ap start` still returns `-4 unconfirmed` even when
+the AP is fully serviceable, because `WIFI_AP_START` has no status latch to confirm
+against (alp-sdk#1385). And **sockets still do not connect** (alp-sdk#1746) -- that
+is untouched by this release; do not read "0.4.1 fixes Wi-Fi" as covering sockets.
+
+Everything else is identical to 0.4.0: same wire protocol, same host driver
+contract, no ABI change.
+
 ## [0.4.0]
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK

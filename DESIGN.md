@@ -149,6 +149,35 @@ came up is dropped.
     bring-up is the one SWRU626 §21 bench item (no public SDK SDIO-device
     driver) — off the v0.1 critical path.
 
+## SimpleLink command structs: a zero-init is NOT a set of defaults
+
+TI's `Wlan_*` command structs are plain C structs the caller fills and the NWP
+obeys literally.  Several of their fields have a meaningful zero rather than an
+"unset" zero, so `Cmd_t c = { 0 };` plus the two or three fields you care about
+silently configures the radio with values nobody chose.
+
+This cost weeks on #1562.  `cc3501e_hw_wifi_ap_start()` filled `ssid`, `channel`
+and `secParams` on a zeroed `RoleUpApCmd_t` and left `sta_limit` at 0 -- a field
+TI documents as "limits the number of stations that the AP's has".  Zero
+permitted zero clients.  The AP beaconed flawlessly (275 s at 33-95% on a second
+radio), so every single-radio observation looked healthy, and the failure only
+appears when something actually tries to associate.  TI's own reference filler
+`ParseRoleUpApCmd()` (`demos/network_terminal/cmd_parser.c`) defaults it to 4 and
+clamps anything outside `[1, 8]` back to 4 -- 0 is not merely a poor default, it
+is outside the legal range.
+
+Three sibling fields in the same struct had the same problem: `countryDomain`
+`{0,0,0}` where TI sets the `"00"` world domain, `sae_anticlogging_threshold` 0
+which *is* `SAE_ANTI_CLOGGING_ALWAYS` rather than unset, and `sae_pwe` 0 where TI
+uses 2.
+
+**The rule for this HAL: when filling a SimpleLink command struct, diff your
+field list against TI's reference filler for that command, and set everything it
+sets.**  Fields you deliberately leave at the zero value get a comment saying so
+(`hidden = FALSE` and `tx_pow = 0` are genuinely TI's defaults, and are left
+implicit on purpose).  A zero you did not think about is a configuration you did
+not choose.
+
 ## Async events: the attention edge (shipped), and a dedicated HOST_IRQ (future)
 
 The Alif is SPI master, so the CC3501E can never initiate a transfer, yet the

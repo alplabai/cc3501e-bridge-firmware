@@ -24,7 +24,7 @@ only producers so far (see § 4).
 | **Wi-Fi GET_MAC / scan / RSSI** | PASS | Real scan records with security decode validated through the bridge. |
 | **Wi-Fi connect-STA** | PASS | Async connect survives the bridge; re-confirmed 2026-08-28 on fw 0.4.0 (`state: connected`, `rssi=-35 dBm`, DHCP lease). Association is INTERMITTENT in practice -- several attempts returned `wifi connect ... timed out` or `-5` and needed a cold cycle. |
 | **Sockets** | **FAIL - does not connect** | `sock tcp-get` cannot open a TCP connection to ANY destination on fw 0.4.0 / protocol 5: LAN targets return `-1` (`ALP_ERR_INVAL`), public ones `-4` (`ALP_ERR_TIMEOUT`), while the same targets fetch fine from the host on the same LAN. `sock_open` succeeds (`handle=1`); the firmware emits no new error (`lasterr` stays `2` = `RESP_ERR_BUSY`), so the failure is host-side or a worker that never completes the connect job. **alp-sdk#1746 -- do not treat sockets as shipped.** |
-| **Soft-AP** | Partial / unresolved | Advertises and keeps advertising well past the ~100 s of alp-sdk#1562 (cache-proof measurement, 2026-08-28), but a client could not ASSOCIATE to it across 181 s while it was confirmed still beaconing. One client only; needs a second radio to confirm. `ap start` also returns `-4 unconfirmed` -- there is no AP status latch (alp-sdk#1385), so AP state must be checked out of band. |
+| **Soft-AP** | PASS (fixed 2026-08-28, fw 0.4.1) | A real second radio (Intel AX200) associates from a cold boot -- **t+13s** WPA2, **t+13s** open, **t+20s** on the hold run -- and stays associated: **0 of 9** samples dropped across a 270 s hold, `connected` at t+291s at 93-94%, well past the ~100 s this issue was named for. `wifievt` steps 3 -> 4, the station event the broken build could never emit. **One live limitation:** a second `wifi ap` on a device already in AP role does NOT take (measured: no association across ~340 s, `wifievt` stuck at 3) -- cold-cycle between AP experiments, and do NOT use `ap-stop` to reset, it wedges the bridge (alp-sdk#1564). Root cause was `RoleUpApCmd_t.sta_limit` left at **0** by a zero-init, i.e. an AP permitted zero clients; it beaconed perfectly, which is why one radio could never tell the difference (alp-sdk#1562). `ap start` still returns `-4 unconfirmed` -- there is no AP status latch (alp-sdk#1385), so AP state is still checked out of band. |
 | **BLE** (enable / advertise / scan / connect + GATT scaffolding) | PASS for enable + real scan (re-confirmed 2026-08-28: 9-15 real advertisers) | NimBLE enable and `ble_gap_disc` scan validated with real advertisers; full runtime GATT/event parity remains v1.0 work. |
 | **CAM enables** | PASS | `which` 0 -> GPIO_1 (LDO0), 1 -> GPIO_0 (LDO1); mapping fixed from U4 pins 54/55. |
 | **GPIO proxy** + camera enables | PASS | Firmware HAL, host API, portable proxy, ztests, and warm-boot GPIO example are validated. |
@@ -33,14 +33,25 @@ only producers so far (see § 4).
 
 ## 0.5 Current state (2026-08-28)
 
-**Shipping version.** App SemVer **0.4.0** (`fw_version=0x0400` over `GET_DIAG_INFO`),
-wire protocol **5**, prebuilt `prebuilt/cc3501e-v0.4.0.bin` GPE-stamped `0.4.0.0`.
-Verified on E1M-AEN801: `GET_VERSION -> protocol v5 (host expects v5) -- match`,
-20/20 soak PINGs, `GET_MAC ok 44:3e:8a:10:b6:9e`, `WIFI_SCAN ok -> 6 AP(s)`.
+**Shipping version.** App SemVer **0.4.1** (`fw_version=0x0401` over `GET_DIAG_INFO`),
+wire protocol **5**. Verified on E1M-AEN801: `GET_VERSION -> protocol v5 (host
+expects v5) -- match`, 20/20 soak PINGs, `GET_MAC ok 44:3e:8a:10:b6:9e`,
+`WIFI_SCAN ok -> 6 AP(s)`, and soft-AP association from a second radio.
 
-**Three version numbers, not interchangeable** -- app SemVer (`0.4.0`), wire protocol
-(`5`), and the GPE anti-rollback stamp (`0.4.0.0`) burned irreversibly into the part.
-Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
+**Three version numbers, not interchangeable** -- app SemVer (`0.4.1`), wire protocol
+(`5`), and the GPE stamp on the flashed artifact (`0.149.64.0` for the current bench
+image). Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
+
+**What the GPE stamp does, precisely.** It is the version the programmer's
+rollback/version gate compares, and `programming_instructions` must be built at the
+**same** `--version` as the vendor image or the write is rejected -- that matched pair
+is what `ti/regen_flashset.sh` exists to guarantee, and it is the coupling that
+actually bites. It is NOT, on the WARM path, a fuse burn: a warm programming run
+(`primary_vendor_image=true`, `boot_sector=false`) leaves every
+`*_rollback_protection_*` fuse at `0`, confirmed in `programming_report.txt` on
+2026-08-28. Earlier notes here and in the bench memories described every flash as
+burning an irreversible floor; that applies to fuse-programming runs, not to the warm
+reflash used for iteration.
 
 ### Fixed since the last revision
 
@@ -52,11 +63,34 @@ Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
 - **Shell stack overflow (alp-sdk#1743).** `sock tcp-get` overflowed the 2 KB Zephyr
   shell stack and halted the board; `CONFIG_SHELL_STACK_SIZE` is now 4096 when the
   `alp` console is enabled.
+- **Soft-AP accepted no clients (alp-sdk#1562).** `RoleUpApCmd_t` was zero-initialised
+  and only `ssid`/`channel`/`secParams` were filled, leaving `sta_limit = 0` -- TI's
+  header calls that field "limits the number of stations that the AP's has", and their
+  own reference filler defaults it to 4 and clamps anything outside `[1, 8]`, so `0` was
+  never a legal value. The AP beaconed correctly the whole time, which is exactly why
+  a single-radio bench could not tell a working AP from a broken one for weeks. Fixed
+  along with the three other fields a zero-init does not supply (`countryDomain`,
+  `sae_anticlogging_threshold`, `sae_pwe`).
+
+  **The measurement that settled it** (two radios, 2026-08-28):
+
+  | | broken (fw 0x0400) | fixed (fw 0x0401) |
+  |---|---|---|
+  | associations | 0 of 16 over 275 s | 1 of 1 at t+13s |
+  | open AP | 0 of 12 over 180 s | associated at t+13s |
+  | `wifievt` | frozen at 3 | 4 |
+
+  The **open-AP arm is what makes this a root cause** rather than a plausible story:
+  open and WPA2 failing identically eliminated the PSK path and the cipher, which is
+  where both this issue and an `AES-GCMP-128`-vs-`AES-CCMP-128` lead pointed.
 
 ### Open, with measurements
 
 - **Sockets do not connect (alp-sdk#1746).** See the TL;DR row. This is the single
-  biggest gap: the socket surface is documented and shipped but non-functional.
+  biggest gap: the socket surface is documented and shipped but non-functional. Note
+  that #1562 turned out to be a zero-init field reaching the NWP; the socket path is
+  worth re-reading with the same suspicion, since `sock_open` succeeding while connect
+  never completes has that shape.
 - **One BLE scan costs exactly 100 frame errors (alp-sdk#1754).** `frames ok=15 err=0`
   -> one `ble scan` -> `err=100`, then frozen at 100 while `ok` keeps climbing. The
   counter is a plain `uint32_t` with no saturation, so 100 is a real count -- a bounded
@@ -76,7 +110,16 @@ Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
   Treat "wedges after N connects" as unproven.
 - **Interactive `alp companion` verbs need the right app.** `aen-cc3501e-bringup` never
   calls `alp_console_companion_set()`, so every companion command answers `companion not
-  registered`. Use `examples/peripheral-io/alp-console` (alp-sdk).
+  registered`. Use `examples/peripheral-io/alp-console` (alp-sdk). The same message
+  appears for ~30 s after any cold cycle while the Alif app is still booting -- poll,
+  do not conclude the app is wrong.
+- **`netsh wlan show networks` serves a CACHE.** It reported our AP at 95% on the tick
+  a connect attempt failed with "the specific network is not available", and reported
+  `ABSENT` on the tick a connect SUCCEEDED. Both directions of that error occurred on
+  this bench in one afternoon. An association attempt is strictly stronger evidence
+  than a scan listing; never conclude an AP is up or down from the scan alone.
+- **Never call `ap-stop` to reset AP state.** It runs `WIFI_AP_STOP` in the SPI ISR and
+  wedges the bridge (alp-sdk#1564, parked). Cold-cycle between AP experiments instead.
 
 ## 1. Inter-chip link
 
@@ -368,12 +411,18 @@ rollback, which earlier bench runs misread as a dead secure element.
 1. **Async-event producers** - the transport shipped (#130, alp-sdk#1721); the
    gap is producers. `EVT_GPIO_INTERRUPT` (`gpio_irq_cb()` only clears the edge)
    and the BLE events never call `event_ring_push()`. This is a push at the
-   source, not new hardware. Separately, confirm whether the shipped
-   `cc3501e-v0.4.0.bin` was built with `-AttnPulse` -- the flag is default OFF.
+   source, not new hardware. Separately: the shipped `cc3501e-v0.4.1.bin` was
+   built with `ti/build_ti.ps1 -Ble` and **no `-AttnPulse`**, so it does NOT
+   emit the attention edge -- a host that arms attention falls back to its
+   timer poll. Same for `cc3501e-v0.4.0.bin`. Decide whether the release
+   recipe should pass the flag (the wire is a rev-1 bodge absent on a stock
+   EVK, which is why it defaults off).
 2. **Full runtime GATT/event parity** - finish the v1.0 portable BLE event
    surface; the attention transport it needs already exists.
-3. **Credentialed socket soak** - run against a lab network during production
-   validation.
+3. **Sockets do not connect at all (alp-sdk#1746)** - unchanged in 0.4.1, and
+   a prerequisite for any credentialed socket soak. Worth re-reading the
+   connect path for the same defect class #1562 turned out to be: a field left
+   at its zero value reaching the NWP.
 4. **OTA cold swap-boot** - repeat final swap validation on a correctly
    activated cold-bootable CC3501E unit.
 5. **`flash.py` real flashing** - now Alp-internal tooling (moved to
