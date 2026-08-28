@@ -71,6 +71,13 @@ static volatile bool reset_pending;
  * reboot.  Gates reset_pending in cc3501e_hw_tick(). */
 volatile bool reply_drained; /* shared with cc3501e_hw_ti_ota.c -- see cc3501e_hw_ti_internal.h */
 
+/* Replies that have fully clocked back to the host since boot.  Gates the PSA-FWU
+ * accept below (issue #16); also useful as a "has this image ever served anyone"
+ * witness.  Written only from cc3501e_hw_notify_reply_sent() (SPI ISR context),
+ * read from the bring-up task -- a single aligned word, so the volatile read is
+ * enough; nothing here needs a read-modify-write to be atomic across the two. */
+static volatile uint32_t g_host_txn_count;
+
 /* Deferred OTA swap-reboot latch: cc3501e_hw_ota_finish() sets it; cc3501e_hw_tick()
  * calls psa_fwu_request_reboot() once reply_drained confirms the FINISH ack has
  * clocked back (same ack-before-reboot race fix as reset_pending). */
@@ -336,18 +343,43 @@ void cc3501e_hw_tick(void)
 	 * services that finalize the commit are up (accept from cc3501e_hw_init, pre-scheduler,
 	 * does not finalize).  Mirrors examples/.../ota_example: init -> accept -> reboot-to-commit.
 	 * After commit the image is permanent -> subsequent COLD boots launch it. */
-	static bool fwu_accept_done = false;
-	if (!fwu_accept_done) {
-		fwu_accept_done = true;
+	static bool fwu_inited = false;
+	if (!fwu_inited) {
+		fwu_inited = true;
 		psa_fwu_init();
 #ifdef CC3501E_OTA_SELFTEST
 		/* One-shot bench validation: OTA-install the embedded candidate to the
 		 * alternate vendor slot and reboot so BL2 swaps it to primary.  If it
 		 * succeeds the device reboots here (does not return); the swapped image
 		 * is a PLAIN build (no SELFTEST) that accept()s itself below on its
-		 * TRIAL boot -> permanent.  If install fails, fall through to accept. */
+		 * TRIAL boot -> permanent.  If install fails, fall through to accept.
+		 * Deliberately NOT behind the host-transaction gate: it installs to the
+		 * ALTERNATE slot and does not commit anything, so waiting buys nothing. */
 		(void)cc3501e_ota_install(cc3501e_ota_candidate, cc3501e_ota_candidate_len);
 #endif
+	}
+
+	/* Commit only once this image has PROVED it can serve the host (issue #16).
+	 *
+	 * Accepting on the first tick threw away the MCUboot trial/auto-revert that
+	 * SWRU626 10.3.2 inherits ("vendor images comply with standard MCUBoot formats
+	 * and methods of operation"): the accept landed before the SPI slave had served
+	 * a single frame, so a candidate that authenticates and boots but then wedges
+	 * the bridge became PERMANENT within milliseconds.  Recovery from that is
+	 * SWD-only on a coprocessor with no UART to the probe -- i.e. no field recovery.
+	 *
+	 * One fully-drained reply is the cheapest honest evidence: it means the slave
+	 * armed, framed a request, dispatched it and clocked the answer back out.  The
+	 * accept then runs on the bring-up task with the reply already delivered, so
+	 * the reboot below cannot cut a host transaction short -- the same discipline
+	 * the deferred CMD_RESET path uses.
+	 *
+	 * If the gate never opens, the image is left in PSA_FWU_TRIAL and the next cold
+	 * boot reverts it.  That is the intended safety net, and it is also the cost:
+	 * an image nothing ever talks to will not survive a power cycle. */
+	static bool fwu_accept_done = false;
+	if (!fwu_accept_done && g_host_txn_count > 0u) {
+		fwu_accept_done = true;
 		if (psa_fwu_accept() == PSA_SUCCESS_REBOOT) {
 			psa_fwu_request_reboot(); /* finalize commit; device reboots, image now permanent */
 		}
@@ -472,4 +504,13 @@ void cc3501e_hw_request_reset(void)
 void cc3501e_hw_notify_reply_sent(void)
 {
 	reply_drained = true;
+	/* Monotonic, unlike reply_drained -- which cc3501e_hw_ti_ota.c CLEARS when it
+	 * arms an OTA op.  The FWU accept gate in cc3501e_hw_tick() needs evidence that
+	 * a host transaction has EVER completed, so it must not be resettable by an
+	 * unrelated OTA op mid-flight.  Saturates rather than wraps: the gate only ever
+	 * asks "> 0", and a wrap to 0 would silently re-open a window that is supposed
+	 * to be one-way.  Issue #16. */
+	if (g_host_txn_count != UINT32_MAX) {
+		g_host_txn_count++;
+	}
 }
