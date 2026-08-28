@@ -60,8 +60,20 @@ jobs:
       - name: install the Arm GNU toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          # libnewlib-arm-none-eabi is NOT optional and is a separate package
+          # on Debian/Ubuntu: gcc-arm-none-eabi alone installs the compiler
+          # with no C library headers, so the first #include <string.h> fails
+          # with "No such file or directory" -- which reads like a source bug
+          # and is not one.
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi
           arm-none-eabi-gcc --version | head -1
+          # Prove the headers are reachable before CMake tries, so a packaging
+          # regression reports itself here rather than as a confusing
+          # "fatal error: string.h" against a source file.
+          printf '#include <string.h>\nint main(void){return 0;}\n' > /tmp/hdr.c
+          arm-none-eabi-gcc -mcpu=cortex-m33 -mthumb -c /tmp/hdr.c -o /tmp/hdr.o
+          echo "newlib headers reachable"
 
       - name: configure
         run: |
