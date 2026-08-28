@@ -19,7 +19,9 @@
 
 #include <ti/drivers/Power.h> /* Power_setConstraint/Policy (pulls PowerWFF3.h via DeviceFamily_CC35XX) */
 
+#ifdef CC3501E_WIFI
 #include <wlan_if.h> /* Wlan_Set -- the RADIO half of the power policy */
+#endif
 
 #include "alp/protocol/cc3501e.h"
 
@@ -103,6 +105,14 @@ static uint8_t  pp_policy_latched = ALP_CC3501E_PP_BALANCED;
 static uint32_t pp_idle_ms_latched;
 /* Set by the SPI-dispatch ISR, consumed by the TASK -- see cc3501e_hw_power_service(). */
 static volatile bool pp_radio_dirty;
+/* Separate from pp_radio_dirty: the CORE half runs ONLY on an explicit host
+ * CMD_POWER_POLICY.  A Wi-Fi role-up used to reach it too -- cc3501e_hw_ti_wifi.c
+ * calls cc3501e_hw_power_reapply_radio() unconditionally after a successful
+ * Wlan_RoleUp(STA), which set pp_radio_dirty, and the service ran pp_apply_core()
+ * on the BALANCED default that pp_policy_latched initialises to.  A plain
+ * `wifi connect`, with no POWER_POLICY ever sent, therefore flipped the part from
+ * "the core never idled" to "the sleep policy runs on every idle".  Issue #14. */
+static volatile bool pp_core_dirty;
 /* Result of the last TASK-side apply, surfaced via cc3501e_hw_power_radio_ok()
  * because POWER_POLICY has no async-result opcode of its own. */
 static volatile bool pp_radio_ok = true;
@@ -180,11 +190,40 @@ static void pp_apply_core(uint8_t policy)
 	case ALP_CC3501E_PP_BALANCED:
 	case ALP_CC3501E_PP_LOW_POWER:
 	case ALP_CC3501E_PP_DEEP_SLEEP:
-		/* Drop our DISALLOW constraints so the policy can reach the deepest state
-		 * its latency budget allows.  All three share the same CORE behaviour --
-		 * WFF3 exposes a single SLEEP state -- and differ on the RADIO, where
-		 * DEEP_SLEEP takes the N-DTIM long sleep interval (pp_apply_radio()). */
-		pp_release_constraint(PowerWFF3_DISALLOW_SLEEP);
+		/* Release IDLE only.  DISALLOW_SLEEP is held for EVERY preset, because the
+		 * CC35xx SLEEP state is one this bridge cannot come back from (#14):
+		 *
+		 *  - SWRU626 7.1.2: "The MCU domain is powered off ... Modules without
+		 *    retention are reset and need to be reconfigured when exiting SLEEP",
+		 *    and Table 7-1's Host M33 Sleep row: "All switchable power domains are
+		 *    OFF (Core/AAOD)".  SPI0 and the uDMA live in AAOD.
+		 *  - SWRU626 3.8.1.1 enumerates every selectable wake publisher in
+		 *    HOSTMCU_AON.CFGWICSNS.VAL[17:0] -- ELP timer, GPIO wake src 0/1,
+		 *    doorbell 0..7, nab_host_irq, ble_rfc_gpo_8_irq, RTC, two DebugSS
+		 *    sources, secured_error_irq, core wdt irq.  THERE IS NO SPI PUBLISHER.
+		 *
+		 * The CC3501E is the SPI SLAVE and can never initiate a transfer, so if
+		 * SLEEP is entered the only wire the host owns cannot wake it: asserting
+		 * SS0 and clocking SCLK is lost silently, with no NAK and no slave-side
+		 * timeout.  Recovery is a WIFI_EN/nRESET cold cycle -- Table 7-3's
+		 * 20 ms + 380 ms + 500 ms plus the Wi-Fi association, BLE links, socket
+		 * state and any OTA session.
+		 *
+		 * IDLE is the deepest state the bridge survives.  Table 7-1 Host M33 Idle:
+		 * "all supplies and clocks are enabled ... the host domain is enabled and
+		 * initialized including the peripherals however the Host M33 clock is
+		 * gated" -- so SPI0 stays clocked and SPI0_IRQ wakes the M33 through the
+		 * NVIC.
+		 *
+		 * DEEP_SLEEP is therefore a RADIO-ONLY preset now: it still takes the
+		 * N-DTIM long sleep interval in pp_apply_radio(), which is the term with a
+		 * published saving (SWRS343A 6.11, 975 uA at DTIM=1 against 6.10's 60 mA
+		 * continuous listen).  The core-SLEEP saving it used to reach for
+		 * (6.13: 520 uA vs 22 mA) is not reachable safely, and TI publishes no
+		 * IDLE current at all, so the trade it was making was never quantified.
+		 * The wire contract in alp-sdk's <alp/protocol/cc3501e.h> should say so;
+		 * that header lives in the other repo. */
+		pp_hold_constraint(PowerWFF3_DISALLOW_SLEEP);
 		pp_release_constraint(PowerWFF3_DISALLOW_IDLE);
 		break;
 	default:
@@ -196,6 +235,7 @@ static void pp_apply_core(uint8_t policy)
  * not up yet (the caller latches and re-applies after role-up) and never fails
  * the whole policy call, so a host that sets power before Wi-Fi still gets the
  * core-side policy applied. */
+#ifdef CC3501E_WIFI
 static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 {
 	uint8_t               ps;
@@ -239,6 +279,19 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 	}
 	return ok;
 }
+#else  /* !CC3501E_WIFI -- no Wi-Fi host driver, so no Wlan_Set to call */
+/* Without this the whole ti build fails to link when built without
+ * -WifiHostDriver / -Ble: `undefined symbol Wlan_Set` out of this file.  Found
+ * while fixing the same class for the socket seams (#7), which left this as the
+ * last remaining undefined in that configuration.  The CORE half above is
+ * radio-independent and still applies; only the radio half is absent. */
+static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
+{
+	(void)policy;
+	(void)idle_ms;
+	return true; /* nothing to apply -> not a failure */
+}
+#endif /* CC3501E_WIFI */
 
 /* Re-apply the latched radio policy after a role comes up.  Called from the
  * Wi-Fi path once Wlan_RoleUp(STA) succeeds -- without this a power policy set
@@ -253,13 +306,23 @@ void cc3501e_hw_power_reapply_radio(void)
  * and the STA role-up path re-arms the dirty flag once the radio exists. */
 void cc3501e_hw_power_service(void)
 {
-	if (!pp_radio_dirty) {
+	if (!pp_radio_dirty && !pp_core_dirty) {
 		return;
 	}
-	pp_radio_dirty = false;
+	const bool do_core  = pp_core_dirty;
+	const bool do_radio = pp_radio_dirty;
+	pp_radio_dirty      = false;
+	pp_core_dirty       = false;
 
-	/* Core FIRST, then radio -- both on this task, never in the ISR (#1683). */
-	pp_apply_core(pp_policy_latched);
+	/* Core FIRST, then radio -- both on this task, never in the ISR (#1683).
+	 * The core half runs ONLY for an explicit host policy, never because a radio
+	 * role came up (#14). */
+	if (do_core) {
+		pp_apply_core(pp_policy_latched);
+	}
+	if (!do_radio) {
+		return;
+	}
 
 	const bool radio_up = (cc3501e_hw_radio_role() != ALP_CC3501E_ROLE_OFF);
 	const bool ok       = pp_apply_radio(pp_policy_latched, pp_idle_ms_latched);
@@ -322,6 +385,7 @@ int cc3501e_hw_set_power_policy(uint8_t policy, uint8_t wake_events, uint32_t id
 	 * CONSEQUENCE FOR THE WIRE CONTRACT: a RESP_OK to POWER_POLICY means QUEUED,
 	 * not APPLIED -- the same semantic OTA_BEGIN turned out to have.  A host that
 	 * needs the realised state polls it; see cc3501e_hw_power_radio_ok(). */
+	pp_core_dirty  = true; /* explicit host request -- the ONLY path to the core half */
 	pp_radio_dirty = true;
 
 	return CC3501E_HW_OK;
