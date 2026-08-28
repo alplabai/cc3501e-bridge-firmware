@@ -52,10 +52,21 @@ jobs:
           repository: alplabai/alp-sdk
           path: alp-sdk
 
+      # This is Cortex-M33 firmware -- the sources are compiled
+      # -mcpu=cortex-m33 -mthumb unconditionally, so the host compiler cannot
+      # build it even with the hardware-touching HAL stubbed.
+      # toolchain/arm-none-eabi.cmake is the invocation CMakeLists.txt
+      # documents for exactly this "CI compile smoke" case.
+      - name: install the Arm GNU toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          arm-none-eabi-gcc --version | head -1
+
       - name: configure
         run: |
           cmake -B build -S firmware \
-            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain/arm-none-eabi.cmake \
             -DCC3501E_HAL_BACKEND=stub \
             -DALP_SDK_ROOT="$PWD/alp-sdk"
 
