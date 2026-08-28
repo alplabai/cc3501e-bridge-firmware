@@ -62,8 +62,6 @@ param(
     [Parameter(Mandatory = $true)][string]$ToolSettings,   # tool_settings.json (references primary_vendor_image.sign.bin)
     # GPE image version = vendor-RoT ANTI-ROLLBACK gate (monotonic, >= the unit's),
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
-    # The bench unit is at 0.9.0.7 -> major MUST be >= 1 now. See deploy_validate.sh
-    # for the date-derived scheme (major.yy.mmdd.hhmm); pass a >=1.x value here.
     # GPE image version -- major MUST be 0 (major >= 1 fails BL2 secure-boot with
     # AUTH_ERROR 0x80), every field <= 255, and monotonic vs the part's last-seen
     # version even when the rollback fuses read 0.  Pass -Version explicitly on a

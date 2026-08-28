@@ -28,8 +28,6 @@ param(
     [Parameter(Mandatory = $true)][string]$ConfBin,        # cc35xx-conf.bin (memory/flash config)
     # GPE image version = vendor-RoT ANTI-ROLLBACK gate (monotonic, >= the unit's),
     # DISTINCT from the app SemVer (firmware-version.txt / GET_DIAG_INFO.fw_version).
-    # Bench unit poisoned to 0.9.0.7 -> major MUST be >= 1. See deploy_validate.sh
-    # for the date-derived default (major.yy.mmdd.hhmm).
     # GPE image version. MUST be monotonic vs anything ever flashed on the part
     # (the SBL enforces this against the last-seen version even when every
     # rollback-protection fuse reads 0), and MUST have major=0 -- a GPE major >= 1
@@ -78,9 +76,21 @@ if ($Program) {
     if ($XdsSerial -eq "") { throw "-Program needs -XdsSerial" }
     $rb = if ($RollbackProtection) { "yes" } else { "no" }
     Write-Host "== factory_program FRESH unit (XDS110 $XdsSerial, rollback=$rb) =="
+    # --vendor_app_version is the GPE anti-rollback stamp.  It was MISSING, so
+    # -Version was validated above and then never reached the part: every
+    # factory-programmed unit got the toolbox default instead of the stamp the
+    # operator asked for.  (The flag is spelled --vendor_app_version here, not
+    # --version as the `programming` action spells it.)
+    #
+    # NOT restructured to program the signed artifact from steps 2-3, despite
+    # what #8 suggests: factory_programming signs internally from
+    # --vendor_out_file via --signing_module (both already passed), which is a
+    # different contract from `programming --tool_settings`.  Feeding it a
+    # pre-signed image is not what its CLI accepts.
     & $ToolboxExe programmer -i XDS110 -param1 $XdsSerial factory_programming `
         --activation_type vendor_key --flash_type $FlashType --enable_ota `
         --signing_module $SigningModule --vendor_out_file $vout --conf_bin_file $ConfBin `
+        --vendor_app_version $Version `
         --rollback_protection $rb
     if ($LASTEXITCODE -ne 0) { throw "factory_programming failed (fresh unit required; -1141 = already activated)" }
     Write-Host ">> unit programmed -- cold-power-cycle to validate the launch"
