@@ -44,7 +44,8 @@
 
 #include "../cc3501e_hw.h"
 #include "cc3501e_hw_ti_internal.h" /* reply_drained / ota_reboot_pending / ota_reboot_rc / cc3501e_hw_ota_pump */
-#include "transport.h" /* bridge_transport_spi_hw_reinit (Wlan_Start DMA-coexistence fix) */
+#include "transport.h" /* bridge_transport_spi_hw_reinit (Wlan_Start DMA-coexistence fix);
+                        * cc3501e_bridge_busy -- READY driven LOW from init (#17) */
 
 /* Bridge SPI desync counter (transport_hw_ti_spi.c): increments each time the
  * slave re-arms the header phase on a reserved-range/0xA5 header (a misframe).
@@ -134,6 +135,26 @@ void cc3501e_hw_init(void)
 	 * uninitialized -> SPI_open faulted -> the slave never armed and POCI was never
 	 * driven (root-caused 2026-06-17 via deep analysis). */
 	Board_init();
+
+	/* Drive READY (GPIO17) LOW *here*, right after Board_init()'s GPIO_init(),
+	 * rather than lazily on the first arm_transfer().  GPIO17's RESET state is
+	 * output-disabled with an internal PULL-UP -- SWRS343A Table 5-1 pin 29
+	 * GPIO17 reset "PU", SWRU626 Table 16-72 GPIO17PCTL.CTL reset 1h "Pull up",
+	 * Table 16-71 GPIO17CFG.OUTDIS reset 1h "Output from the pad is disabled" --
+	 * so until something drives it the Alif reads HIGH at P2_6, which the bridge
+	 * protocol defines as "slave armed, clock me".
+	 *
+	 * That window is not short: it spans SPI_init(), the scheduler start and
+	 * cc3501e_hw_net_init()'s tcpip_init (which blocks waiting for the lwIP
+	 * thread).  A host gating on READY would assert SS0 and clock a header into
+	 * a slave whose DMA is not armed -- the byte-misalignment the READY protocol
+	 * exists to prevent.  No board pull-down is documented on the GPIO17 ->
+	 * P2_6 net, so the firmware cannot rely on one.  Issue #17.
+	 *
+	 * cc3501e_bridge_busy() is the strong override in cc3501e_hw_ti_gpio.c; its
+	 * ready_ensure_init() is idempotent, so the later lazy path still works. */
+	cc3501e_bridge_busy();
+
 	SPI_init();
 	/* The MCUboot/PSA-FWU TRIAL-image accept is done on the first cc3501e_hw_tick()
 	 * (POST-scheduler), NOT here -- the HSM/FWU services that finalize the OTA commit

@@ -126,8 +126,13 @@ int cc3501e_hw_gpio_write(uint8_t pad, uint8_t level)
  * Strong overrides of the worker's weak cc3501e_bridge_busy/ready() hooks.  The
  * line is flow-control to the host master: LOW = the bridge is BUSY (a radio op
  * is running and the SPI-slave DMA is dead, do not clock), HIGH = the slave is
- * armed and the host may clock a transaction.  Lazily configured push-pull,
- * idling LOW (busy) until the first ready() so the host holds off through boot.
+ * armed and the host may clock a transaction.  Configured push-pull and driven
+ * LOW (busy) from cc3501e_hw_init(), immediately after Board_init()'s GPIO_init()
+ * -- NOT lazily on first use.  The pad's RESET state is output-disabled with an
+ * internal pull-UP (SWRS343A Table 5-1 pin 29 "PU"; SWRU626 Table 16-72
+ * GPIO17PCTL.CTL reset 1h "Pull up"; Table 16-71 GPIO17CFG.OUTDIS reset 1h), so
+ * an undriven line reads HIGH at the host -- "armed" -- through the whole of
+ * boot.  ready_ensure_init() below stays as an idempotent guard.  Issue #17.
  * GPIO17 = the silicon-legal sibling of the SPI0 CS pair (it is not CS-capable,
  * GPIO16 is the CS); reserved from the host GPIO proxy in gpio_pad_reserved(). */
 #define CC3501E_READY_GPIO 17u
