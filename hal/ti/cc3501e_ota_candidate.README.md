@@ -3,8 +3,9 @@
 
 `cc3501e_ota_candidate.c` is **not** committed to this public repository. It is a
 generated, **signed firmware binary** (a `bin2c` C byte-array of the plain, radio-free
-`cc3501e-bridge` image in TI GPE format) used only by the `--ota-selftest` build to
-validate the OTA stage → swap → boot cycle.
+`cc3501e-bridge` image in TI GPE format) used only by the OTA self-test builds
+(`--ota-selftest` / `-OtaSelftest`, and `-OtaWindowSelftest`) to validate the OTA
+stage → swap → boot cycle.
 
 It lives in the private `alp-sdk-internal` repo because it is a prebuilt firmware
 **binary blob** built through the license-gated TI SimpleLink SDK toolchain — binary
@@ -14,17 +15,24 @@ only this compiled+signed artifact is withheld. See alp-sdk issue #590.
 
 ## Building the OTA self-test
 
-The default (customer) build never references this file. Only `--ota-selftest` does.
-Before an OTA self-test build, stage the artifact from `alp-sdk-internal` into this
-directory:
+The default (customer) build never references this file. Only the OTA self-test builds
+do — `build_ti.sh --ota-selftest`, `build_ti.ps1 -OtaSelftest` and
+`build_ti.ps1 -OtaWindowSelftest` (the windowed begin/write/flush/finish bench path)
+all embed it. Before an OTA self-test build, stage the artifact from
+`alp-sdk-internal` into this directory:
 
 ```
 cp <alp-sdk-internal>/firmware/cc3501e/hal/ti/cc3501e_ota_candidate.c \
-   firmware/cc3501e/hal/ti/cc3501e_ota_candidate.c
+   hal/ti/cc3501e_ota_candidate.c
 ```
 
-`build_ti.sh --ota-selftest` (and `build_ti.ps1 -OtaSelftest`) fail with a clear
-message if the file is absent. The staged copy is git-ignored.
+`build_ti.sh --ota-selftest` (and `build_ti.ps1 -OtaSelftest` /
+`-OtaWindowSelftest`) fail with a clear message if the file is absent.
+
+The staged copy is git-ignored — the root `.gitignore` lists
+`hal/ti/cc3501e_ota_candidate.c`. **Never force it into a commit** (`git add -f`, or
+committing it from a checkout without that rule): this repository is public and the
+file is a signed vendor image.
 
 ## Regenerating it
 

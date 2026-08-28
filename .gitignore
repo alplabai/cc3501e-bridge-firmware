@@ -6,3 +6,20 @@ build/
 # Cygwin/MSYS crash dumps.  The Windows bench shell drops these in the repo
 # root and `git add -A` has swept them into history more than once.
 *.stackdump
+
+# Firmware binaries.  Build output never belongs in history; the four signed,
+# published images under prebuilt/ are re-included by prebuilt/.gitignore.
+*.bin
+
+# The staged OTA self-test candidate: a bin2c C byte-array of a signed TI GPE
+# vendor image.  Binary blobs are internal-class per alp-sdk #590 and this is a
+# PUBLIC repository -- the file is staged from alp-sdk-internal for a local
+# -OtaSelftest / -OtaWindowSelftest build and never committed here.
+# See hal/ti/cc3501e_ota_candidate.README.md.
+hal/ti/cc3501e_ota_candidate.c
+
+# In-tree drop of the TI SimpleLink CC33xx SDK (the `-DSIMPLELINK_SDK_DIR`
+# alternative).  TI's SDK is not redistributable; extract it here if you want
+# an in-tree build, but it stays out of history.
+# See vendor/simplelink-cc33xx/README.md.
+vendor/simplelink-cc33xx/sdk/
