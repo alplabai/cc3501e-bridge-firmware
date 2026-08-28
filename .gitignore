@@ -8,3 +8,25 @@ build/
 *.stackdump
 build-tests/
 build-linux/
+# CONTRIBUTING.md documents the stub build as build/stub (covered by build/
+# above), but this hyphenated spelling is an easy slip and  swept
+# one into a commit while writing THIS rule set.  Cover it too.
+build-stub/
+
+# Binary firmware images.  prebuilt/.gitignore re-includes `cc3501e-*.bin`
+# because the signed prebuilt images shipped there ARE committed -- but that
+# re-include was written against a root `*.bin` rule that did not exist, so it
+# re-included nothing and every OTHER .bin in the tree stayed stageable.
+*.bin
+
+# The staged OTA self-test candidate: a bin2c C array of a SIGNED TI GPE vendor
+# image, internal-class per the project's public/internal split (alp-sdk#590).
+# hal/ti/cc3501e_ota_candidate.README.md tells developers to copy it in here and
+# said it was git-ignored -- it was NOT, so following that README and then
+# running `git add -A` would commit a license-gated signed firmware blob into
+# this PUBLIC repository, and a history rewrite is the only remedy.
+hal/ti/cc3501e_ota_candidate.c
+
+# The TI SimpleLink CC33xx SDK is NOT redistributable.
+# vendor/simplelink-cc33xx/README.md documents this path as git-ignored.
+vendor/simplelink-cc33xx/sdk/
