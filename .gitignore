@@ -6,3 +6,5 @@ build/
 # Cygwin/MSYS crash dumps.  The Windows bench shell drops these in the repo
 # root and `git add -A` has swept them into history more than once.
 *.stackdump
+build-tests/
+build-linux/
