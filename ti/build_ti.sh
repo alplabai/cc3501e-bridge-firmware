@@ -11,6 +11,12 @@
 # SAME include sets, defines, sources, and link order; only paths + tool names
 # are Linux-ified.
 #
+# That parity claim used to be false: the four POST-GENERATION patches the
+# .ps1 applies (minDmaTransferSize, GPIO17 READY, .bss.sock_ring TCM
+# placement, .TI.noinit) were all missing here, and this script shipped the
+# resulting image silently.  They are ported below, each with the same
+# post-condition that fails the build rather than shipping (#10).
+#
 # Usage:
 #   ./build_ti.sh                                  # default SPI bridge, no WiFi/BLE
 #   SDK_DIR=<ti-sdk>/simplelink_wifi_sdk_10_10_01_08 ./build_ti.sh --wifi
@@ -93,6 +99,49 @@ echo "== SysConfig: generate the board file (CONFIG_SPI_0) =="
 if [ "$WIFI_HOST_DRIVER" = 1 ]; then syscfgFile="$HERE/cc3501e_aen_wifi.syscfg"; else syscfgFile="$HERE/cc3501e_aen.syscfg"; fi
 "$SYSCONFIG_CLI" --product "$SDK_DIR/.metadata/product.json" --compiler ticlang \
     --output "$out" "$syscfgFile"
+
+# ---- POST-GENERATION PATCHES to the SysConfig board file -------------------
+# SysConfig hard-emits both of these values and exposes NO property to override
+# either, so they are patched here.  Each carries a post-condition that FAILS THE
+# BUILD: a silent no-op is exactly how build_ti.sh shipped images with a dead
+# READY line and a DMA-bound polled path while claiming parity with
+# build_ti.ps1 (#10).
+cfg="$out/ti_drivers_config.c"
+[ -f "$cfg" ] || { echo "build_ti.sh: SysConfig produced no $cfg"; exit 4; }
+
+# 1. .minDmaTransferSize 10 -> 1024.  SPI_MODE_BLOCKING takes the polled branch
+#    only when transaction->count < minDmaTransferSize; at 10 the polled payload
+#    phases fall into the DMA branch instead, which wedges psa_fwu.
+#    See build_ti.ps1 158-181.
+sed -i 's/[.]minDmaTransferSize = 10,/.minDmaTransferSize = 1024,/' "$cfg"
+grep -q '[.]minDmaTransferSize = 1024,' "$cfg" || {
+    echo "build_ti.sh: minDmaTransferSize patch did not apply in $cfg (SysConfig output drifted)."
+    echo "  Polled payload phases would fall into the DMA branch and wedge psa_fwu."
+    exit 4
+}
+
+# 2. GPIO17 = the bridge READY / host-IRQ line (CC35 GPIO17 -> Alif P2_6, net
+#    CC3501_iRQ).  cc3501e_aen.syscfg documents it as "WIFI_SPI0.READY", but
+#    SysConfig has no GPIO instance for it and emits GPIOWFF3_DO_NOT_CONFIG, so
+#    the pad is never muxed to a GPIO output and every GPIO_write(17, ...) is
+#    silently dropped.  Idles LOW = "bridge busy", which is what the firmware's
+#    own boot-time hold asserts too, so the host stays off the bus until the
+#    first cc3501e_bridge_ready().  See build_ti.ps1 184-200.
+python3 - "$cfg" <<'PYCFG'
+import io, sys
+p = sys.argv[1]
+old = "GPIOWFF3_DO_NOT_CONFIG, /* GPIO17 */"
+new = ("GPIO_CFG_OUTPUT_INTERNAL | GPIO_CFG_OUT_STR_LOW | GPIO_CFG_OUT_LOW,"
+       " /* GPIO17 = bridge READY */")
+t = io.open(p, encoding="utf-8", newline="").read()
+if old in t:
+    io.open(p, "w", encoding="utf-8", newline="").write(t.replace(old, new, 1))
+PYCFG
+grep -q 'GPIO17 = bridge READY' "$cfg" || {
+    echo "build_ti.sh: GPIO17 READY patch did not apply in $cfg (SysConfig output drifted)."
+    echo "  READY would never be driven and the host would fall back to blind inter-phase delays."
+    exit 4
+}
 
 echo "== SysConfig: MemoryConfigurator -> flash map (memcfg) =="
 # The MemoryConfigurator module ships in the Wi-Fi TOOLBOX, not the SDK -- pass BOTH
@@ -246,6 +295,76 @@ EOF
 stockCmd="$SDK_DIR/examples/rtos/LP_EM_CC35X1/demos/network_terminal/freertos/ticlang/linker.cmd"
 localCmd="$out/cc3501e_vendor.cmd"
 cp -f "$stockCmd" "$localCmd"
+
+# ---- POST-GENERATION PATCHES to the linker script -------------------------
+# The stock connectivity cmd has a rule for NEITHER section.  Ported from
+# build_ti.ps1 440-530 together with its post-conditions (#10).
+#
+# 3. .bss.sock_ring -> TCM.  MUST precede the generic
+#    `.bss: {} > DRAM_NON_SECURE` group, or the catch-all claims it first and the
+#    ring lands back in DRAM -- which is FULL (0x7f24f capacity against 0x7f0a0
+#    used, i.e. 431 bytes spare), so a 16 KB ring overflows the group.  TCM is
+#    also faster, and the ring is CPU-only memory: the pump memcpy's in, the
+#    dispatch memcpy's out, no DMA engine ever addresses it.  Verify in
+#    cc3501e-bridge.map that rx_ring resolves at 0x200xxxxx, NOT 0x28xxxxxx.
+#
+#    python3, not sed: the anchor is a literal C comment containing /* and */ and
+#    the inserted block is multi-line.  The .ps1 records that the regex this
+#    replaces once carried a literal tab and a raw newline -- it matched in the
+#    worktree it was authored in and silently failed in the next one.  A
+#    plain-string insert cannot drift that way.
+python3 - "$localCmd" <<'PYRING'
+import io, sys
+p = sys.argv[1]
+anchor = ("/* Move entire BSS section (including COMMON symbols) to DRAM"
+          " to save TCM space */")
+block = ("    /* Alp: socket prefetch ring in TCM (DRAM is full; TCM is faster"
+         " and CPU-only). */\n"
+         "    GROUP {\n"
+         "        .bss.sock_ring: {} palign(8)\n"
+         "    } > TCM_DRAM_NON_SECURE\n\n")
+t = io.open(p, encoding="utf-8", newline="").read()
+if ".bss.sock_ring" not in t and anchor in t:
+    io.open(p, "w", encoding="utf-8", newline="").write(t.replace(anchor, block + anchor, 1))
+PYRING
+grep -q 'bss[.]sock_ring' "$localCmd" || {
+    echo "build_ti.sh: sock-ring TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
+    echo "  The ring would fall back to the FULL DRAM bank and the link would overflow."
+    exit 4
+}
+
+# 4. .TI.noinit -> DRAM_NON_SECURE.  Without a rule the TI linker assigns it by
+#    DEFAULT rules -- first fitting range, FLASH_INT_VEC (RWX) at 0x14000000 --
+#    so the update-mode boot flag (transport_hw_ti_spi.c's g_persist) lands in
+#    FLASH, persist_writable() reads false forever, and OTA update mode can never
+#    be entered from a build_ti.sh image.
+#
+#    (NOLOAD) IS LOAD-BEARING, not decoration: without it the linker emits a
+#    `.cinit..TI.noinit.load` record into __TI_cinit_table and the C runtime
+#    ZEROES the struct on every boot, exactly like .bss.  If you touch this line,
+#    re-grep cc3501e-bridge.map and confirm that record is ABSENT.
+python3 - "$localCmd" <<'PYNOINIT'
+import io, re, sys
+p = sys.argv[1]
+block = ("    /* Alp: OTA-update-mode boot flag (.TI.noinit) -- must survive"
+         " NVIC_SystemReset.\n"
+         "     * (NOLOAD) keeps it OUT of __TI_cinit_table so the C runtime never"
+         " zeroes it. */\n"
+         "    GROUP {\n"
+         "        .TI.noinit: {} palign(4) (NOLOAD)\n"
+         "    } > DRAM_NON_SECURE\n\n"
+         "    /* System memory in DRAM */\n")
+t = io.open(p, encoding="utf-8", newline="").read()
+if ".TI.noinit" not in t:
+    t2 = re.sub(r"(?m)^[ \t]*/\* System memory in DRAM \*/[ \t]*\r?\n", block, t, count=1)
+    if t2 != t:
+        io.open(p, "w", encoding="utf-8", newline="").write(t2)
+PYNOINIT
+grep -q 'TI[.]noinit' "$localCmd" || {
+    echo "build_ti.sh: .TI.noinit placement did not apply to $localCmd -- the stock linker.cmd changed shape."
+    echo "  The update-mode boot flag would land in FLASH and OTA update mode could never be entered."
+    exit 4
+}
 
 echo "== Link =="
 linkcommon=(-Wl,-u,_c_int00 -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16)
