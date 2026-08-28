@@ -112,11 +112,10 @@ alp_cc3501e_resp_t handle_ble_scan_stop(const uint8_t *req,
                                         size_t        *reply_data_len)
 {
 	(void)req;
-	(void)reply_data;
-	(void)reply_cap;
 	*reply_data_len = 0u;
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
-	return hw_to_resp(cc3501e_hw_ble_scan_stop());
+	return handle_worker_routed(
+	    ALP_CC3501E_CMD_BLE_SCAN_STOP, 0u, req_len, reply_data, reply_cap, reply_data_len);
 }
 
 /* BLE_CONNECT (0x36): packed wire = addr_type(1) | addr[6].  Length-validated
@@ -137,6 +136,13 @@ alp_cc3501e_resp_t handle_ble_connect(const uint8_t *req,
 	return handle_worker_routed_payload(ALP_CC3501E_CMD_BLE_CONNECT, req, req_len, reply_data_len);
 }
 
+/* BLE_DISCONNECT (0x37): no reply data.  Worker-routed (argless), like
+ * BLE_ADV_STOP and BLE_DISABLE: cc3501e_hw_ble_disconnect() blocks on the
+ * disconnect HCI event over the shared HIF and then re-syncs the bridge SPI, so
+ * it MUST NOT run in protocol_dispatch's SPI-callback context.  Inline, a
+ * disconnect with a link actually up blocked the callback that was building the
+ * reply to this very command -- host saw ALP_ERR_TIMEOUT and the slave was left
+ * desynced.  Issue #5. */
 alp_cc3501e_resp_t handle_ble_disconnect(const uint8_t *req,
                                          size_t         req_len,
                                          uint8_t       *reply_data,
@@ -144,11 +150,10 @@ alp_cc3501e_resp_t handle_ble_disconnect(const uint8_t *req,
                                          size_t        *reply_data_len)
 {
 	(void)req;
-	(void)reply_data;
-	(void)reply_cap;
 	*reply_data_len = 0u;
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
-	return hw_to_resp(cc3501e_hw_ble_disconnect());
+	return handle_worker_routed(
+	    ALP_CC3501E_CMD_BLE_DISCONNECT, 0u, req_len, reply_data, reply_cap, reply_data_len);
 }
 
 /* BLE_GATT_REGISTER (0x38) descriptor header: version(1) | service_uuid(16) |

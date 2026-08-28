@@ -91,11 +91,16 @@ alp_cc3501e_resp_t handle_wifi_disconnect(const uint8_t *req,
                                           size_t        *reply_data_len)
 {
 	(void)req;
-	(void)reply_data;
-	(void)reply_cap;
 	*reply_data_len = 0u;
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
-	return hw_to_resp(cc3501e_hw_wifi_disconnect());
+	/* Worker-routed for the same reason as WIFI_AP_STOP below: with an
+	 * association actually up, Wlan_Disconnect() is an NWP command over the
+	 * shared HIF and blocked the SPI callback that was framing this reply.  It
+	 * was also the only radio op here with no busy/ready bracket and no post-op
+	 * bridge_transport_spi_hw_reinit(), because both live in the worker drain
+	 * this path never reached.  Issue #5. */
+	return handle_worker_routed(
+	    ALP_CC3501E_CMD_WIFI_DISCONNECT, 0u, req_len, reply_data, reply_cap, reply_data_len);
 }
 
 /* WIFI_AP_STOP (0x15): no reply data.  Worker-routed (alp-sdk#1563): tearing the
