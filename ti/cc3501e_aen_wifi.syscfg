@@ -106,18 +106,29 @@ spi0.spi.picoPin.$assign = "GPIO29";  /* peripheral data IN  (needs Alif MOSI he
 spi0.spi.pociPin.$assign = "GPIO28";  /* peripheral data OUT (needs Alif MISO here -- HW cross) */
 spi0.spi.csnPin.$assign  = "GPIO16";  /* CS -> GPIO16 (only silicon-legal CS; pulled LOW to assert) */
 
-/* SHIP-CRITICAL (host-DMA on the FREE channels 12/13): the on-chip Wi-Fi/BLE
- * radio is a SEPARATE subsystem (NWP) from the AP M33 the bridge runs on, so its
- * DMA ops do not block the AP CPU -- the bridge SPI callback keeps re-arming the
- * hardware-SS0 phases while the radio works.  The radio lower-MAC claims only host-DMA
- * channels 0..11 (TRM swru626 §11: UART 0-3, SPI 4-5, TEMP 6-10, HIF hard-codes
- * ch11 in hif.c).  The controller has 14 channels (0..13); 12 and 13 are FREE --
- * the radio never remuxes them.  Pin the bridge SPI's RX DMA to ch12, TX DMA to
- * ch13 so the bridge drains/fills its FIFO autonomously on channels Wlan_Start/
- * scan/connect cannot steal.  (Earlier pins on radio-used channels -- auto
- * ch11=HIF, then ch8/ch6=TEMP -- died the instant the radio re-pointed the shared
- * mux; a non-DMA polling path died too, preempted by the worker's Wlan_Start.
- * DMA on the FREE channels avoids both failure modes.)
+/* SHIP-CRITICAL (host-DMA on channels 12/13 -- keep in sync with
+ * cc3501e_aen.syscfg): the on-chip Wi-Fi/BLE radio is a SEPARATE subsystem (NWP)
+ * from the AP M33 the bridge runs on, so its DMA ops do not block the AP CPU --
+ * the bridge SPI callback keeps re-arming the hardware-SS0 phases while the radio
+ * works.  What the TRM actually says: swru626 §11.3.1 is a table of PERIPHERAL
+ * REQUEST INDICES -- "the list of peripherals and their index supported by each
+ * DMA channel" -- NOT a map of channel ownership.  The indices are 0-3
+ * UART0/UART1 RX/TX, 4-5 SPI0 RX/TX, 6-7 SPI1 RX/TX, 8-11 I2C0/I2C1 RX/TX, 12-13
+ * SDMMC RX/TX, 14-15 SDIO RX/TX, 16-17 DCAN RX/TX, 18 ADC Read, 20 PDM Read,
+ * 22-23 Wi-Fi/BLE Host Interface (HIF), 24-25 UART2 RX/TX (HIF is 22/23, not 11;
+ * index 11 is I2C1 TX; there is no "TEMP" peripheral in that chapter).  §11.1
+ * states the channels are "independently configured and operated" with "flexible
+ * channel assignments": the TRM reserves NO channel to the radio and guarantees
+ * no channel is free.
+ *
+ * Pinning the bridge SPI's RX DMA to ch12 and TX DMA to ch13 is therefore a BENCH
+ * OBSERVATION of SDK behaviour, not a documented guarantee: on this SDK the radio
+ * was never seen to remux 12/13, so the bridge drains/fills its FIFO autonomously
+ * while Wlan_Start/scan/connect run.  (Earlier auto-assigned pins -- ch11, then
+ * ch8/ch6 -- died the instant the radio re-pointed the shared mux; a non-DMA
+ * polling path died too, preempted by the worker's Wlan_Start.  Pinning 12/13
+ * avoids both failure modes.)  Re-verify on silicon after any SDK or
+ * radio-firmware bump.
  *
  * SysConfig exposes no minDmaTransferSize property, so build_ti.ps1 patches the
  * GENERATED ti_drivers_config.c to 1024 unconditionally (a whole 516 B frame must

@@ -81,13 +81,24 @@ spi0.spi.picoPin.$assign = "GPIO29";  /* peripheral data IN  (needs Alif MOSI he
 spi0.spi.pociPin.$assign = "GPIO28";  /* peripheral data OUT (needs Alif MISO here -- HW cross) */
 spi0.spi.csnPin.$assign  = "GPIO16";  /* CSN resource paired with Alif SPI1_SS0_C; GPIO17 is READY. */
 
-/* host-DMA on the FREE channels 12/13 (SHIP-CRITICAL -- keep in sync with
+/* host-DMA on channels 12/13 (SHIP-CRITICAL -- keep in sync with
  * cc3501e_aen_wifi.syscfg).  The transport opens the slave SPI_MODE_CALLBACK so
- * the driver DMAs the FIFO; the on-chip radio (a separate NWP) claims only
- * host-DMA channels 0..11 (TRM swru626 §11: UART 0-3, SPI 4-5, TEMP 6-10, HIF
- * ch11) of the 14, so channels 12/13 are FREE and the radio never remuxes them.
- * Pin RX DMA to ch12, TX DMA to ch13 so Wlan_Start/scan/connect cannot steal the
- * bridge's channels.  The default/radio-free build matches the Wi-Fi build so
- * both run the one CALLBACK/DMA transport. */
+ * the driver DMAs the FIFO.  What the TRM actually says: swru626 §11.3.1 is a
+ * table of PERIPHERAL REQUEST INDICES -- "the list of peripherals and their
+ * index supported by each DMA channel" -- NOT a map of channel ownership.  The
+ * indices are 0-3 UART0/UART1 RX/TX, 4-5 SPI0 RX/TX, 6-7 SPI1 RX/TX, 8-11
+ * I2C0/I2C1 RX/TX, 12-13 SDMMC RX/TX, 14-15 SDIO RX/TX, 16-17 DCAN RX/TX,
+ * 18 ADC Read, 20 PDM Read, 22-23 Wi-Fi/BLE Host Interface (HIF), 24-25 UART2
+ * RX/TX (HIF is 22/23, not 11; index 11 is I2C1 TX; there is no "TEMP"
+ * peripheral in that chapter).  §11.1 states the channels are "independently
+ * configured and operated" with "flexible channel assignments": the TRM reserves
+ * NO channel to the radio and guarantees no channel is free.
+ *
+ * So pinning RX DMA to ch12 and TX DMA to ch13 rests on a BENCH OBSERVATION of
+ * SDK behaviour -- on this SDK the radio's Wlan_Start/scan/connect were never
+ * seen to remux 12/13, while auto-assigned channels were stolen -- and NOT on a
+ * documented guarantee.  Re-verify on silicon after any SDK or radio-firmware
+ * bump.  The default/radio-free build matches the Wi-Fi build so both run the
+ * one CALLBACK/DMA transport. */
 spi0.spi.dmaRxChannel.$assign = "DMA_CH12";
 spi0.spi.dmaTxChannel.$assign = "DMA_CH13";
