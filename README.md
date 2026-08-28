@@ -116,6 +116,12 @@ rm -f <flashset>/*.flashready.bin
 programmer -i XDS110 -param1 <PROBE_SN> programming --tool_settings <flashset>/tool_settings.warm.windows.json
 ```
 
+> **Part not responding, or state unknown?** `docs/full-erase-and-flash.md`
+> covers the recovery path -- full erase plus a complete four-component set --
+> and the checks to run BEFORE erasing, because an erase removes the boot
+> sector, the TBL and TI's wireless firmware, and a warm set cannot put them
+> back.
+
 **The image `--version` must match the version stamped into the signed
 `programming_instructions` in that flash-set.**  If it does not, the programmer
 reports success and the device silently keeps the old image -- the single most
