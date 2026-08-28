@@ -74,6 +74,9 @@
 static struct ble_npl_task s_task_host;
 static uint8_t             s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static OsiSyncObj_t        s_host_init_sync; /* signalled by ble_sync_cb */
+/* Declared up here, not with the scan cache below, because cc3501e_ensure_syncs()
+ * creates it and that function is defined earlier in the file. */
+static OsiSyncObj_t s_scan_done; /* signalled by BLE_GAP_EVENT_DISC_COMPLETE */
 
 /* ------------------------------------------------------------------ */
 /* Connection + GATT-client rendezvous state (worker-thread ownership).  */
@@ -142,6 +145,29 @@ static int cc3501e_ensure_syncs(void)
 		return -1;
 	}
 	if (osi_SyncObjCreate(&s_gattc_op_sync) != OSI_OK) {
+		return -1;
+	}
+	/* s_scan_done and s_host_init_sync used to be created and DELETED per use,
+	 * while their signallers stayed live:
+	 *
+	 *   - cc3501e_nimble_scan_run() called ble_gap_disc_cancel() and then deleted
+	 *     s_scan_done on the next line.  That cancel is what MAKES NimBLE queue
+	 *     BLE_GAP_EVENT_DISC_COMPLETE, whose callback signals that object -- on
+	 *     the host task, after the delete.
+	 *   - the host bring-up deleted s_host_init_sync while ble_hs_cfg.sync_cb
+	 *     could still signal it.
+	 *
+	 * Signalling a deleted OSI sync object is undefined, and whether the queued
+	 * event lands before or after the delete is a race -- which is the shape of an
+	 * intermittent failure.  Creating them once and never deleting removes the
+	 * class outright, and is what this function already does for the other three.
+	 *
+	 * Each user MUST osi_SyncObjClear() before waiting, or a stale signal from the
+	 * previous use satisfies the next wait instantly.  Issues #5, #6. */
+	if (osi_SyncObjCreate(&s_scan_done) != OSI_OK) {
+		return -1;
+	}
+	if (osi_SyncObjCreate(&s_host_init_sync) != OSI_OK) {
 		return -1;
 	}
 	s_syncs_ready = 1;
@@ -403,9 +429,11 @@ int cc3501e_nimble_host_start(void)
 		return rc;
 	}
 
-	if (osi_SyncObjCreate(&s_host_init_sync) != OSI_OK) {
+	if (cc3501e_ensure_syncs() != 0) {
 		return -1;
 	}
+	/* Drop a signal left by a previous bring-up attempt. */
+	(void)osi_SyncObjClear(&s_host_init_sync);
 
 	nimble_port_init();
 	ble_transport_ll_init();
@@ -439,7 +467,7 @@ int cc3501e_nimble_host_start(void)
 
 	/* Block ~1 s for host<->controller sync (the demo waits OSI_WAIT_FOR_SECOND). */
 	rc = osi_SyncObjWait(&s_host_init_sync, OSI_WAIT_FOR_SECOND);
-	(void)osi_SyncObjDelete(&s_host_init_sync);
+	/* NOT deleted: ble_hs_cfg.sync_cb can still signal it after this returns. */
 	if (rc != OSI_OK) {
 		return -1; /* never synced -> not enabled */
 	}
@@ -574,7 +602,6 @@ int cc3501e_nimble_host_disable(void)
 
 static cc3501e_nimble_scan_rec_t s_scan_cache[CC3501E_BLE_SCAN_CACHE_MAX];
 static volatile uint32_t         s_scan_count;
-static OsiSyncObj_t              s_scan_done;
 
 /* Locate a cached advertiser by address (dedup); -1 if not yet seen. */
 static int cc3501e_scan_cache_find(const uint8_t addr[6])
@@ -644,9 +671,12 @@ int cc3501e_nimble_scan(cc3501e_nimble_scan_rec_t *out,
 	}
 
 	s_scan_count = 0u;
-	if (osi_SyncObjCreate(&s_scan_done) != OSI_OK) {
+	if (cc3501e_ensure_syncs() != 0) {
 		return -1;
 	}
+	/* Drop any signal left by the PREVIOUS scan's late DISC_COMPLETE, or this
+	 * wait returns immediately and the scan reports zero advertisers. */
+	(void)osi_SyncObjClear(&s_scan_done);
 
 	struct ble_gap_disc_params dp;
 	memset(&dp, 0, sizeof(dp));
@@ -658,7 +688,6 @@ int cc3501e_nimble_scan(cc3501e_nimble_scan_rec_t *out,
 
 	int rc = ble_gap_disc(s_own_addr_type, duration_ms, &dp, cc3501e_scan_gap_event_cb, NULL);
 	if (rc != 0) {
-		(void)osi_SyncObjDelete(&s_scan_done);
 		return rc;
 	}
 
@@ -671,8 +700,10 @@ int cc3501e_nimble_scan(cc3501e_nimble_scan_rec_t *out,
 			break;
 		}
 	}
+	/* This cancel is exactly what queues a DISC_COMPLETE to the NimBLE host task,
+	 * so the object its callback signals MUST outlive this function.  It is no
+	 * longer deleted here -- see cc3501e_ensure_syncs().  Issue #5. */
 	(void)ble_gap_disc_cancel(); /* ensure the scan is stopped (idempotent) */
-	(void)osi_SyncObjDelete(&s_scan_done);
 
 	uint32_t n = s_scan_count;
 	if (n > cap) {
