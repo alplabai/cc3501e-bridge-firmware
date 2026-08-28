@@ -77,8 +77,13 @@ jobs:
 
       - name: configure
         run: |
+          # CMAKE_TOOLCHAIN_FILE must be ABSOLUTE here.  CMake resolves a
+          # relative toolchain path against the BUILD directory, not the
+          # working directory, so "firmware/toolchain/..." was looked for at
+          # "build/firmware/toolchain/..." and reported as
+          # "Could not find toolchain file".
           cmake -B build -S firmware \
-            -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain/arm-none-eabi.cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
             -DCC3501E_HAL_BACKEND=stub \
             -DALP_SDK_ROOT="$PWD/alp-sdk"
 
