@@ -89,14 +89,44 @@ static OsiSyncObj_t        s_host_init_sync; /* signalled by ble_sync_cb */
 /* peer-initiated DISCONNECT can always signal s_disc_sync.               */
 static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static int               s_syncs_ready;
-static OsiSyncObj_t      s_conn_sync;     /* signalled on BLE_GAP_EVENT_CONNECT    */
-static OsiSyncObj_t      s_disc_sync;     /* signalled on BLE_GAP_EVENT_DISCONNECT */
+static OsiSyncObj_t      s_conn_sync; /* signalled on BLE_GAP_EVENT_CONNECT    */
+static OsiSyncObj_t      s_disc_sync; /* signalled on BLE_GAP_EVENT_DISCONNECT */
+/* Defined in cc3501e_hw_ti.c (PRIMASK save/restore).  Forward-declared here the
+ * same way src/event_ring.c does, rather than pulling in a header, because the
+ * only thing this file needs from the worker is the critical section itself. */
+unsigned long worker_critical_enter(void);
+void          worker_critical_exit(unsigned long key);
+
 static OsiSyncObj_t      s_gattc_op_sync; /* signalled on a GATT read/write completion */
 static volatile int      s_conn_status;   /* status field of the CONNECT event    */
 static volatile int      s_gattc_op_status;
-static uint8_t          *s_gattc_read_buf; /* caller buffer for the pending read   */
-static uint16_t          s_gattc_read_cap;
 static volatile uint16_t s_gattc_read_len;
+
+/* The GATT read lands HERE, never in the caller's buffer.
+ *
+ * cc3501e_nimble_gatt_read() used to latch the caller's pointer into
+ * s_gattc_read_buf and never clear it.  That pointer is worker_execute()'s
+ * `uint8_t buf[ALP_CC3501E_MAX_PAYLOAD]` STACK LOCAL (src/worker.c:115, passed
+ * at :234).  On the 4 s timeout the function returned while ble_gattc_read was
+ * still outstanding, so a slow peer's ATT response arriving later ran
+ * cc3501e_gattc_read_cb and wrote peer-controlled bytes into a stack frame that
+ * had already returned -- the next command's locals, or another task's stack.
+ *
+ * A pending flag alone does NOT close this: the callback can pass its check and
+ * the waiter can then time out concurrently, so the copy still lands in a frame
+ * that died a moment later.  Not handing the callback a stack pointer at all is
+ * what removes the class.  The success path copies out of here while the caller
+ * is demonstrably still on the stack.
+ *
+ * BLE_ATT_ATTR_MAX_LEN (ble_att.h:215) is 512 -- the ATT ceiling on a
+ * characteristic value -- so this bounds the copy at the protocol limit rather
+ * than the 4096 the caller advertises.  Issue #6. */
+static uint8_t s_gattc_read_bounce[BLE_ATT_ATTR_MAX_LEN];
+/* Non-zero while a read is outstanding AND its result is still wanted. */
+static volatile uint8_t s_gattc_read_pending;
+/* Bumped on every read.  Passed to ble_gattc_read as cb_arg, so a late response
+ * for an EARLIER read cannot satisfy or corrupt a newer one. */
+static volatile uint32_t s_gattc_read_gen;
 
 /* Create the connect/disconnect/GATT sync objects exactly once.  Called from the
  * worker before it initiates a blocking GAP/GATT op; idempotent. */
@@ -789,11 +819,23 @@ static int cc3501e_gattc_read_cb(uint16_t                     conn_handle,
                                  void                        *arg)
 {
 	(void)conn_handle;
-	(void)arg;
+
+	/* Drop a response whose read is no longer outstanding (timed out) or which
+	 * belongs to an earlier generation -- otherwise a late reply would overwrite
+	 * a NEWER read's result and signal its waiter early.  Issue #6. */
+	const uint32_t      gen  = (uint32_t)(uintptr_t)arg;
+	const unsigned long key  = worker_critical_enter();
+	const int           mine = (s_gattc_read_pending != 0u) && (gen == s_gattc_read_gen);
+	worker_critical_exit(key);
+	if (!mine) {
+		return 0;
+	}
+
 	s_gattc_op_status = (error != NULL) ? (int)error->status : 0;
 	if (s_gattc_op_status == 0 && attr != NULL && attr->om != NULL) {
-		uint16_t n  = 0u;
-		int      rc = ble_hs_mbuf_to_flat(attr->om, s_gattc_read_buf, s_gattc_read_cap, &n);
+		uint16_t n = 0u;
+		int      rc =
+		    ble_hs_mbuf_to_flat(attr->om, s_gattc_read_bounce, sizeof(s_gattc_read_bounce), &n);
 		if (rc != 0) {
 			s_gattc_op_status = rc;
 		} else {
@@ -833,23 +875,48 @@ int cc3501e_nimble_gatt_read(uint16_t handle, uint8_t *out, uint16_t cap, uint16
 	}
 	(void)osi_SyncObjClear(&s_gattc_op_sync);
 	s_gattc_op_status = -1;
-	s_gattc_read_buf  = out;
-	s_gattc_read_cap  = cap;
 	s_gattc_read_len  = 0u;
 
-	/* ble_gatt.h:452 ble_gattc_read(conn_handle, attr_handle, cb, cb_arg). */
-	int rc = ble_gattc_read(s_conn_handle, handle, cc3501e_gattc_read_cb, NULL);
+	/* Claim this generation and mark the read outstanding BEFORE issuing it, so a
+	 * callback that fires immediately still matches.  Issue #6. */
+	unsigned long  key   = worker_critical_enter();
+	const uint32_t gen   = ++s_gattc_read_gen;
+	s_gattc_read_pending = 1u;
+	worker_critical_exit(key);
+
+	/* ble_gatt.h:452 ble_gattc_read(conn_handle, attr_handle, cb, cb_arg).  The
+	 * generation rides in cb_arg -- that is what lets a late reply identify
+	 * itself as stale. */
+	int rc = ble_gattc_read(s_conn_handle, handle, cc3501e_gattc_read_cb, (void *)(uintptr_t)gen);
 	if (rc != 0) {
+		key                  = worker_critical_enter();
+		s_gattc_read_pending = 0u;
+		worker_critical_exit(key);
 		return rc;
 	}
-	if (cc3501e_wait_signaled(&s_gattc_op_sync, 4u) != 0) {
+
+	const int waited = cc3501e_wait_signaled(&s_gattc_op_sync, 4u);
+
+	/* Retire the read either way.  On the timeout path ble_gattc_read is still
+	 * outstanding and nothing can cancel it, so clearing this is what makes the
+	 * eventual callback a no-op. */
+	key                  = worker_critical_enter();
+	s_gattc_read_pending = 0u;
+	worker_critical_exit(key);
+
+	if (waited != 0 || s_gattc_op_status != 0) {
 		return -1;
 	}
-	if (s_gattc_op_status != 0) {
-		return -1;
+
+	uint16_t n = s_gattc_read_len;
+	if (n > cap) {
+		n = cap;
+	}
+	if (n > 0u) {
+		memcpy(out, s_gattc_read_bounce, n);
 	}
 	if (out_len != NULL) {
-		*out_len = s_gattc_read_len;
+		*out_len = n;
 	}
 	return 0;
 }
