@@ -36,6 +36,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit-tests:
+    name: unit tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The wire contract lives in alp-sdk and this firmware compiles its
+      # CANONICAL header rather than a mirror (ADR 0031), so the test needs it
+      # too -- otherwise it could pass against a header this repo had drifted
+      # from, which is the exact failure single-sourcing exists to prevent.
+      - uses: actions/checkout@v4
+        with:
+          repository: alplabai/alp-sdk
+          path: alp-sdk
+
+      # This suite links the REAL firmware sources -- transport_spi.c, the nine
+      # protocol_*.c dispatchers, worker.c, event_ring.c -- not mocks, so the
+      # SPI framing and dispatch seams under test are the same code paths the
+      # device runs.  It came from alp-sdk, where it ran under twister; the
+      # firmware moved here and the test moved with it, because a test that
+      # lives in a different repository from its subject is a test nobody runs.
+      #
+      # Host-only, no Zephyr: the code under test is freestanding C and only the
+      # ztest harness was Zephyr-specific.  tests/unit/ztest_shim.h replaces it.
+      # Linux specifically -- the firmware's weak default symbols do not resolve
+      # under MinGW/PE.
+      - name: configure
+        run: cmake -S tests/unit -B build-tests -DALP_SDK_ROOT="$PWD/alp-sdk"
+
+      - name: build
+        run: cmake --build build-tests --parallel
+
+      - name: run
+        run: ctest --test-dir build-tests --output-on-failure
+
   stub-build:
     name: stub build
     runs-on: ubuntu-latest
