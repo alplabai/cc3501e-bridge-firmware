@@ -6,13 +6,15 @@ Copyright 2026 Alp Lab AB
 # CC3501E bridge bring-up status
 
 Status of the Alif Ensemble E8 (M55-HE) <-> CC3501E (CC35X1E) SPI bridge on
-the E1M-AEN801 bench. Updated 2026-07-08.
+the E1M-AEN801 bench. Updated 2026-08-28.
 
 This is the consolidated on-silicon record for the **link / Wi-Fi / BLE**
 pillars. The authoritative topology is the hardware-framed SPI bridge described
 in [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md): Alif `SPI1_SS0_C`
-frames every protocol phase and READY gates reply phases. HOST_IRQ / async
-event delivery remains future work.
+frames every protocol phase and READY gates reply phases. Async events ride an
+attention edge on that same READY wire (#130, alp-sdk#1721) -- shipped and
+silicon-validated, build-time opt-in, and with Wi-Fi connect/disconnect as its
+only producers so far (see § 4).
 
 ## TL;DR - pillar status
 
@@ -123,9 +125,10 @@ The 512 KB DRAM linker fix removed the old false "needs PSRAM" conclusion.
 Wi-Fi + BLE coexist in the CC3501E image, NimBLE enable is validated, and real
 BLE scan records are observed through the bridge.
 
-Remaining BLE work is API completeness, not the bridge link: HOST_IRQ-backed
-async event delivery and full runtime GATT/event parity belong to the v1.0
-workstream.
+Remaining BLE work is API completeness, not the bridge link. The attention
+transport for async events shipped (#130, alp-sdk#1721), but nothing pushes BLE
+events into the ring yet, so BLE async delivery plus full runtime GATT/event
+parity belong to the v1.0 workstream.
 
 ## 4. Bridge / radio coexistence
 
@@ -137,8 +140,20 @@ the SPI slave. The production model is:
 3. Re-open and re-arm the bridge SPI after the radio operation.
 4. Let the host poll/retry across `ALP_ERR_IO` / BUSY until the result is ready.
 
-READY gates per-phase traffic once the SPI slave is armed. It is not a
-replacement for HOST_IRQ async-event push delivery.
+READY gates per-phase traffic once the SPI slave is armed. Since #130 /
+alp-sdk#1721 the same wire also carries the async-event attention edge -- the
+firmware pulses it when it queues an event and the host drains on the edge.
+Sharing one wire for both is why the drain needs a 50 ms empty-drain backoff: a
+transaction end is indistinguishable from an attention pulse, and without the
+backoff 86 events cost 11888 ISRs instead of 220.
+
+Two limits apply before relying on it. The pulse is a **build-time opt-in**
+(`build_ti.ps1 -AttnPulse`, `-DCC3501E_ATTN_PULSE=1`), default OFF because the
+wire is a rev-1 bodge absent on the stock EVK and `package_cc3501e_prod.ps1`
+does not pass it -- a build without the flag links a no-op stub and the host
+falls back to its timer poll. And only `EVT_WIFI_CONNECTED` /
+`EVT_WIFI_DISCONNECTED` call `event_ring_push()`; `EVT_GPIO_INTERRUPT` and the
+BLE events have no producer, so they still never arrive.
 
 ## 5. Cold-boot
 
@@ -350,10 +365,13 @@ rollback, which earlier bench runs misread as a dead secure element.
 
 ## 8. Open items / next
 
-1. **HOST_IRQ / async events** - add the board line and host event-drain path for
-   BLE/Wi-Fi/GPIO unsolicited events.
+1. **Async-event producers** - the transport shipped (#130, alp-sdk#1721); the
+   gap is producers. `EVT_GPIO_INTERRUPT` (`gpio_irq_cb()` only clears the edge)
+   and the BLE events never call `event_ring_push()`. This is a push at the
+   source, not new hardware. Separately, confirm whether the shipped
+   `cc3501e-v0.4.0.bin` was built with `-AttnPulse` -- the flag is default OFF.
 2. **Full runtime GATT/event parity** - finish the v1.0 portable BLE event
-   surface once HOST_IRQ exists.
+   surface; the attention transport it needs already exists.
 3. **Credentialed socket soak** - run against a lab network during production
    validation.
 4. **OTA cold swap-boot** - repeat final swap validation on a correctly
