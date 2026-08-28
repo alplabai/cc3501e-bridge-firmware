@@ -2,6 +2,20 @@
 
 # cc3501e-bridge
 
+> **This repository holds the CC3501E bridge FIRMWARE only.**
+> The wire contract, the host-side driver and all hardware metadata stay in
+> [alplabai/alp-sdk](https://github.com/alplabai/alp-sdk) — the dependency runs
+> firmware -> alp-sdk, never the other way. Extracted from
+> `alp-sdk:firmware/cc3501e` with history intact (alp-sdk#1370).
+>
+> **`prebuilt/` ships signed binaries customers flash** as the
+> `helper_firmware.cc3501e_otp` payload named by the AEN SoM presets
+> (alp-sdk#1733). They are Alp Lab build output of the source here, linked
+> against TI's SimpleLink SDK — which alp-sdk does **not** redistribute; see
+> `vendor/simplelink-cc33xx/README.md` for how to obtain it.
+> The resulting images therefore also carry TI `wifi-uppermac`, lwIP and
+> mbedTLS code; see `NOTICE`.
+
 Firmware that runs on the **TI CC3501E** Wi-Fi 6 + BLE 5.4 coprocessor
 populated on the E1M-AEN module family
 (`E1M-AEN301/401/501/601/701/801`).  It is the SPI-slave (or, on
@@ -11,16 +25,16 @@ Wi-Fi + BLE stacks for the Alif Ensemble host.
 This tree is a **separate compile artifact** with its own toolchain (TI
 `ticlang` for the CC3501E Cortex-M33) and its own flash binary.  It is
 **not** linked into the Zephyr-side alp-sdk library; the matching
-host-side driver lives at [`chips/cc3501e/`](../../chips/cc3501e/) and
+host-side driver lives at [`chips/cc3501e/`](https://github.com/alplabai/alp-sdk/tree/main/chips/cc3501e/) and
 the wire protocol at
-[`include/alp/protocol/cc3501e.h`](../../include/alp/protocol/cc3501e.h).
+[`include/alp/protocol/cc3501e.h`](https://github.com/alplabai/alp-sdk/blob/main/include/alp/protocol/cc3501e.h).
 
 It is **embedded in alp-sdk** -- not split into a separate repo -- for
 the same reasons the [`gd32-bridge`](../gd32-bridge/) is: the wire
 protocol stays single-source (the firmware `#include`s the canonical
 header directly, no mirror to drift), and an opcode change moves the
 host driver, this firmware, and the wire-vector tests in **one commit**.
-See [ADR 0015](../../docs/adr/0015-cc3501e-firmware-embedded.md).
+See [ADR 0015](https://github.com/alplabai/alp-sdk/blob/main/docs/adr/0015-cc3501e-firmware-embedded.md).
 
 ## Tree layout
 
@@ -71,7 +85,7 @@ build the choice is sourced from the customer `board.yaml`.  Both
 transports always compile; the selector only chooses which one `main()`
 starts.
 
-The current E1M-AEN rev (FIB v0.0.207, validated on E1M-AEN801) wires SPI with **hardware SS0 chip-select** (Alif `P14_7` = `SPI1_SS0_C`), per-phase READY gating, and deterministic framing per protocol phase (not fixed-count lockstep). See [`docs/cc3501e-bridge.md` § Current rev](../../docs/cc3501e-bridge.md) for the validated link topology.
+The current E1M-AEN rev (FIB v0.0.207, validated on E1M-AEN801) wires SPI with **hardware SS0 chip-select** (Alif `P14_7` = `SPI1_SS0_C`), per-phase READY gating, and deterministic framing per protocol phase (not fixed-count lockstep). See [`docs/cc3501e-bridge.md` § Current rev](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md) for the validated link topology.
 
 ## Getting firmware onto a CC3501E
 
@@ -157,17 +171,17 @@ GET_VERSION, GET_MAC, RESET -- enough to prove the link is alive and
 version-compatible.  Everything else (Wi-Fi, BLE, GPIO proxy,
 camera-enable, power, diagnostics) is rejected with
 `ALP_CC3501E_RESP_ERR_INVALID` and lands in v0.2+.  The full roadmap is
-in [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md)
+in [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)
 "v0.x roadmap".
 
 ## Source-of-truth contract
 
 | Contract | Defined in |
 |----------|------------|
-| Wire protocol (commands, frames, events) | [`include/alp/protocol/cc3501e.h`](../../include/alp/protocol/cc3501e.h) (included directly -- no mirror) |
-| Bridge architecture + GPIO behaviour contract | [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md) |
-| Inter-chip wiring (SPI1 / SDIO / control lines) | [`metadata/e1m_modules/aen/inter-chip.tsv`](../../metadata/e1m_modules/aen/inter-chip.tsv) |
-| E1M ↔ CC3501E pad routing | [`metadata/e1m_modules/aen/from-cc3501e.tsv`](../../metadata/e1m_modules/aen/from-cc3501e.tsv) |
+| Wire protocol (commands, frames, events) | [`include/alp/protocol/cc3501e.h`](https://github.com/alplabai/alp-sdk/blob/main/include/alp/protocol/cc3501e.h) (included directly -- no mirror) |
+| Bridge architecture + GPIO behaviour contract | [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md) |
+| Inter-chip wiring (SPI1 / SDIO / control lines) | [`metadata/e1m_modules/aen/inter-chip.tsv`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/aen/inter-chip.tsv) |
+| E1M ↔ CC3501E pad routing | [`metadata/e1m_modules/aen/from-cc3501e.tsv`](https://github.com/alplabai/alp-sdk/blob/main/metadata/e1m_modules/aen/from-cc3501e.tsv) |
 | v0.1 scope + wire-reply contract + reconciliation items | `DESIGN.md` |
 
 ## Versioning
@@ -207,9 +221,9 @@ refuses it.
 | Wire-protocol header + host driver | ✅ landed (`include/alp/protocol/`, `chips/cc3501e/`) |
 | Firmware tree (embedded) | ✅ this tree |
 | v0.1 META group (PING / GET_VERSION / GET_MAC / RESET) | ✅ silicon-free + stub backend; native test green |
-| TI backend: SPI-slave + lifecycle (`hal/ti/`) | ✅ implemented against TI Drivers (`SPI_open` SPI_SLAVE callback) + SimpleLink (`sl_Start`/`sl_NetCfgGet`) + CMSIS reset. Hardware SS0 chip-select + per-phase READY framing (this rev wires SCLK/MOSI/MISO + `SPI1_SS0_C`); host `cc3501e_request()` reconciled to match. Compiles on the bench against the SimpleLink CC35xx SDK + a SysConfig board file (`CONFIG_SPI_0`). Bench-validated on E1M-AEN801 (FIB v0.0.207): survives radio ops and concurrent Wi-Fi/BLE scan; see [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md). |
+| TI backend: SPI-slave + lifecycle (`hal/ti/`) | ✅ implemented against TI Drivers (`SPI_open` SPI_SLAVE callback) + SimpleLink (`sl_Start`/`sl_NetCfgGet`) + CMSIS reset. Hardware SS0 chip-select + per-phase READY framing (this rev wires SCLK/MOSI/MISO + `SPI1_SS0_C`); host `cc3501e_request()` reconciled to match. Compiles on the bench against the SimpleLink CC35xx SDK + a SysConfig board file (`CONFIG_SPI_0`). Bench-validated on E1M-AEN801 (FIB v0.0.207): survives radio ops and concurrent Wi-Fi/BLE scan; see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md). |
 | TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the v0.1 critical path — SPI is the default. |
 | Next-rev hardening: HOST_IRQ / async events | 🔮 async-event delivery; command/reply framing already uses hardware SS0 + READY (see DESIGN.md "Next-rev hardening") |
 | `flash.py` real flashing | 🔮 moved to `alp-sdk-internal` (Alp-internal OTA-build tooling); blocked on TI's `cc3501e-flasher` CLI (not public yet); manual SWD/J-Link is the interim bench path |
 | `prebuilt/` populated | ✅ `cc3501e-v0.4.0.bin` signed (full bridge: META + Wi-Fi + BLE + sockets + OTA, proto v5 incl. `OTA_UPDATE_MODE`); see `prebuilt/CHANGELOG.md`. |
-| Wi-Fi / BLE / GPIO-proxy groups | ✅ implemented and silicon-validated (alp-sdk v0.8.0 on E1M-AEN801): Wi-Fi scan with security decode, real BLE scan (ble_gap_disc), GPIO proxy warm-boot, OTA-over-bridge staged (see [`docs/cc3501e-bridge.md`](../../docs/cc3501e-bridge.md)). |
+| Wi-Fi / BLE / GPIO-proxy groups | ✅ implemented and silicon-validated (alp-sdk v0.8.0 on E1M-AEN801): Wi-Fi scan with security decode, real BLE scan (ble_gap_disc), GPIO proxy warm-boot, OTA-over-bridge staged (see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)). |

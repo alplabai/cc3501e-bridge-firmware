@@ -1,0 +1,42 @@
+Alp Lab AB — CC3501E bridge firmware
+Copyright 2026 Alp Lab AB
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Extracted from alplabai/alp-sdk (firmware/cc3501e) — see alp-sdk#1370.
+
+--------------------------------------------------------------------
+Third-party code in the SHIPPED BINARIES (prebuilt/)
+--------------------------------------------------------------------
+
+The source in this repository is Alp Lab's. The signed images under
+`prebuilt/` are Alp Lab build output of that source, but they are LINKED
+against Texas Instruments' SimpleLink CC33xx SDK and therefore contain
+third-party code that is NOT covered by this repository's Apache-2.0
+licence.
+
+Identified by inspecting the shipped image (`strings` on
+prebuilt/cc3501e-v0.4.0.bin):
+
+  * TI wifi-uppermac 3.1.9.5 (library-wcs)   -- Texas Instruments,
+    proprietary. Build paths of the form
+    /home/developer/.conan/data/wifi-uppermac/3.1.9.5/... are TI's own
+    build machine, retained by their toolchain; they are not Alp Lab
+    paths and contain no Alp Lab information.
+  * lwIP                                     -- BSD-3-Clause
+  * Mbed TLS                                 -- Apache-2.0
+
+alp-sdk does NOT redistribute TI's SDK itself; only a thin wrapper is
+committed (`vendor/simplelink-cc33xx/`), and the SDK is obtained from TI
+by whoever builds the `ti` backend.
+
+OPEN ITEM -- redistribution terms of the shipped binaries
+---------------------------------------------------------
+The images embed TI's proprietary wifi-uppermac library, and the image
+itself carries no copyright or licence string. Whether redistributing
+that link result is permitted, and on what attribution terms, is a
+question for TI's SDK licence and has NOT been confirmed here. It is
+recorded rather than assumed.
+
+Note this predates the extraction: the same binaries have shipped in the
+public alplabai/alp-sdk repository, so this is a question about their
+existing publication, not something this repository introduced.
