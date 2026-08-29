@@ -376,6 +376,23 @@ int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint1
 		return -1;
 	}
 	uint32_t used = ring_used();
+	if (used == 0u && rx_ring.peer_closed) {
+		/* CLOSED AND DRAINED -- this is END OF STREAM, and it must be answered
+		 * OK-with-0-bytes, not BUSY.
+		 *
+		 * #32 gave the empty ring a single answer (-2 -> RESP_ERR_BUSY) without
+		 * consulting peer_closed, which made EOF UNREACHABLE: once the peer
+		 * closes, cc3501e_hw_sock_pump() returns early on `peer_closed` (see the
+		 * guard at the top of it), so the ring can never refill.  The host then
+		 * got RESP_ERR_BUSY on every SOCK_RECV forever, and poll_by_repeat --
+		 * which retries precisely on BUSY -- span until its timeout instead of
+		 * seeing the 0-byte close the pre-#32 fall-through used to deliver.
+		 *
+		 * The -2/BUSY answer below is still right for the OTHER empty case: ring
+		 * empty but the connection still open, where more bytes really are
+		 * coming and 0 bytes would make poll_by_repeat give up early. */
+		return 0;
+	}
 	if (used == 0u) {
 		/* Armed but EMPTY.  This is its OWN answer (-2), distinct from "not my
 		 * handle" (-1), because the two need opposite handling and conflating them

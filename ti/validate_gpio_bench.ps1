@@ -66,7 +66,7 @@ param(
     # AUTH_ERROR 0x80), every field <= 255, and monotonic vs the part's last-seen
     # version even when the rollback fuses read 0.  Pass -Version explicitly on a
     # part with flash history.
-    [string]$Version       = "0.1.0.1",
+    [string]$Version       = "",         # MANDATORY -- see the guard below; no safe default exists
     [string]$CcXdsSerial   = "",         # XDS110 serial on the CC3501E (toolbox -param1); blank = single-probe auto
 
     # --- Alif host example build + flash ---
@@ -123,6 +123,24 @@ if (-not (Test-Path $vout)) { throw "missing $vout" }
 Write-Host "`n== [2/5] WARM-flash CC3501E (FIB -> sign[validation key] -> program) =="
 $pkg = "$out\bench"
 New-Item -ItemType Directory -Force $pkg | Out-Null
+
+# GPE stamp guard -- mirrors regen_flashset.sh / deploy_validate.sh.
+#
+# This script FLASHES THE PART (flash-images-builder build vendor_image --version
+# $Version, below).  #37 made the stamp mandatory in the two .sh scripts on the
+# grounds that "a missing argument is a better failure than a bricked link", but
+# left this one defaulting to 0.1.0.1 -- a ROLLBACK stamp on any unit whose last
+# flash was higher, which streams clean and then refuses to boot.  It is the one
+# script of the three that its own body says reaches the part.
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    throw "Set -Version explicitly, e.g. -Version 0.149.66.0. Major must be 0, each field <= 255, and the stamp must be strictly greater than anything ever flashed on that unit -- there is no safe default."
+}
+if ($Version -notmatch '^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+    throw "Version must be 0.b.c.d (a GPE major >= 1 fails BL2 secure boot with AUTH_ERROR 0x80): got $Version"
+}
+foreach ($f in $Version.Split('.')) {
+    if ([int]$f -gt 255) { throw "Version field out of range (each field must be <= 255): got $Version" }
+}
 
 Write-Host "   FIB build vendor_image v$Version"
 & $ToolboxExe flash-images-builder build vendor_image --version $Version `

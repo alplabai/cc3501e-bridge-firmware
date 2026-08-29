@@ -603,20 +603,52 @@ void worker_run_pending(void)
 		 * so every failed arm would leak one level of depth and the line would
 		 * eventually never rise again.  Re-asserting here needs no shared counter
 		 * and no cross-context atomicity.  Issue #5. */
-		/* SKIP for the three ops routed here by #5 as well.  Their HAL bodies
-		 * ALREADY end with bridge_transport_spi_hw_reinit(), so paying the
-		 * drain's re-init too means TWO back-to-back SPI_close/SPI_open cycles,
-		 * each re-rolling the 12-attempt SPI_open that this transport calls the
-		 * roll where "the first roll that loses killed the link permanently".
+		/* SKIP the drain's re-init only where a re-init here would be WRONG.  The
+		 * list below is per-opcode and each entry has a DIFFERENT reason, so it must
+		 * not be read as one rule:
 		 *
-		 * Silicon-measured on E1M-AEN801, same host image, only this branch
-		 * differing.  With the double re-init, `ble scan-stop` wedged the link
-		 * every time -- "scan stopped" then get_version -5 and bench 50/50 fails.
-		 * With the skip it does not.  The control (this change absent) was clean,
-		 * so worker-routing WITHOUT this skip is a regression, not a fix. */
-		const bool body_already_reinit = (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) ||
-		                                 (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT) ||
-		                                 (cmd == ALP_CC3501E_CMD_WIFI_DISCONNECT);
+		 *   BLE_DISCONNECT  -- its HAL body ends with bridge_transport_spi_hw_reinit(),
+		 *      so paying the drain's too means TWO back-to-back SPI_close/SPI_open
+		 *      cycles, each re-rolling the 12-attempt SPI_open this transport calls the
+		 *      roll where "the first roll that loses killed the link permanently".
+		 *      Silicon-measured on E1M-AEN801, same host image, only this branch
+		 *      differing: with the double re-init `ble scan-stop` wedged every time
+		 *      ("scan stopped" then get_version -5); with the skip it did not.
+		 *
+		 *      TREAT THAT MECHANISM AS UNPROVEN (#60).  The same control run had two
+		 *      OTHER worker-routed BLE ops pay the identical double re-init and NOT
+		 *      wedge, and the exemption was applied to 2 of the 11 opcodes with that
+		 *      shape.  So "two back-to-back SPI_close/SPI_open wedges the link" does
+		 *      not follow from the evidence offered for it -- the correlation with
+		 *      scan-stop specifically is what was observed.  #48 later measured the
+		 *      scan-stop re-init itself as the wedge and removed it, which fits the
+		 *      observation better than the double-re-init story does.  The skip is
+		 *      kept for BLE_DISCONNECT because paying a re-init twice is pointless
+		 *      regardless, not because the wedge mechanism is established.
+		 *
+		 *   BLE_SCAN_STOP   -- skipped for the OPPOSITE reason.  #48 REMOVED the
+		 *      re-init from cc3501e_hw_ble_scan_stop() entirely, having measured that
+		 *      the re-init WAS the wedge (3/32 vs 1/104 booted trials).  So this path
+		 *      must have no re-init from the body AND none from the drain.  The comment
+		 *      here used to say "its HAL body ALREADY ends with a re-init", which #48
+		 *      made false -- and a well-meaning cleanup of that stale line would have
+		 *      restored the drain's re-init and silently reverted the fix.
+		 *
+		 * WIFI_DISCONNECT WAS in this list and has been REMOVED: its HAL body
+		 * cc3501e_hw_wifi_disconnect() contains NO re-init at all -- it calls
+		 * Wlan_Disconnect() and returns -- so skipping the drain's left a Wlan_* radio
+		 * op with no SPI re-sync from either side, which is the exact gap the skip was
+		 * introduced to avoid double-paying.  It now takes the drain's re-init. */
+		/* KEEPING THIS LIST IN SYNC IS MANUAL, AND IT HAS ALREADY DRIFTED ONCE (#61).
+		 * The predicate below restates, here, a fact that actually lives in each HAL
+		 * body -- whether that body calls bridge_transport_spi_hw_reinit().  Nothing
+		 * enforces the correspondence: #48 removed the re-init from
+		 * cc3501e_hw_ble_scan_stop() and this list kept asserting the body still had
+		 * one, and WIFI_DISCONNECT sat here for its whole life with no re-init in its
+		 * body at all.  If you add or remove a bridge_transport_spi_hw_reinit() in any
+		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change. */
+		const bool body_already_reinit =
+		    (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) || (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !body_already_reinit) {
 			cc3501e_bridge_busy();
