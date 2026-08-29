@@ -114,6 +114,36 @@ wrong, and following it bricks the link on any unit whose history you do not kno
   everything with `-5`, including `alp companion reset` itself (an in-band reset over
   a wedged link cannot work). A **7-8 s** cold cycle does NOT clear it; **20 s does**,
   immediately. Do not conclude the part is dead before trying that.
+### Wedge rates: use a GATED protocol, and distrust every ungated number (#69)
+
+This part fails to bring the bridge up on **20.1% of cold boots** (37 of 184
+cold cycles, pooled across 11 runs on post-#48 `main`). That is the PY25Q64LB
+Puya behaviour in §5 below, and it is **higher than any wedge rate ever measured
+here**.
+
+Consequence: a protocol that cold-cycles and then runs the operation under test,
+without first checking the bridge is alive, cannot tell a part that never booted
+from a part the operation killed. At 20.1%, an ungated 12-trial arm expects
+**2.4 dead-on-arrival parts** — the same magnitude as the wedge counts such arms
+report. Every historical figure of that shape in this repo (`2/12` and its `2/6`
+baseline, the `6/6 -> 2/6 -> 2/12 -> 1/12` trend, `3 wedges in 36 (~8%), flat`)
+is therefore **uninterpretable**, not merely imprecise: each is consistent with
+zero wedges plus the boot-failure floor.
+
+The gated protocol gates on `alp companion ver` **before** touching the operation
+under test and counts boot failures in their own column. Against it, post-#48
+`main` measures:
+
+```
+cold cycles attempted : 184
+boot failures         : 37/184 = 20.1%
+booted (denominator)  : 147
+scan-stop failures    : 1/147  =  0.7%   (95% upper bound 2.0%, rule of three)
+```
+
+Quote that denominator, or re-measure. Do not compare a new number against any
+of the ungated historical ones.
+
 - **The wedge does not reproduce under control.** 6/6 connect->status->disconnect
   cycles and 6/6 with a `sock tcp-get` interleaved both ran clean from a cold boot.
   Treat "wedges after N connects" as unproven.
