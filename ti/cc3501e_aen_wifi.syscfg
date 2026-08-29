@@ -174,6 +174,36 @@ spi0.spi.dmaTxChannel.$assign = "DMA_CH13";
  * Required only by the Wi-Fi host integration's uart_term.c/syslog.c so the
  * link resolves; unused at runtime on the headless bridge.  Pins GPIO5/GPIO6
  * (XDS110 default) are clear of the SPI pads. */
+/* ======== ADC: internal temperature sensor (errata RADIO_01, #18) ========
+ *
+ * Advisory RADIO_01 (SWRZ167) says the RF core does not limit radio activity at
+ * 105C > TA > 85C, and the workaround is to limit TX or disable the radios above
+ * 85C.  Neither half is implemented, and the reason is that nothing in this
+ * firmware could read the die temperature at all.  This instantiates the channel
+ * so raw codes can be captured; it does NOT implement a trip.
+ *
+ * `internalSignal = "Temperature Channel"` is the supported pinless path:
+ * ADCWFF3Channel.syscfg.js's pinmuxRequirements() returns [] whenever
+ * internalSignal != "None", so this consumes NO pad and cannot collide with the
+ * inter-chip SPI pads (GPIO16/27/28/29) or the camera LDO enables on
+ * GPIO_0/GPIO_1.
+ *
+ * DELIBERATELY NO TRIP THRESHOLD.  TI has not published a transfer function,
+ * gain/offset trim or OTP location for internal channel 11 in SWRU626, SWRS343A,
+ * SLUUDH6 or SDAA244A, so a raw code cannot be converted to degrees C.  A
+ * threshold guessed from an uncalibrated code fails in BOTH directions: set too
+ * high it does not protect against a documented device-damage condition, set too
+ * low it silently disables Wi-Fi and BLE on a healthy unit in an enclosure.  The
+ * raw code is exposed to the bench probe only, to characterise the channel and
+ * to give TI a concrete anchor for the transfer-function question.
+ */
+var ADC   = scripting.addModule("/ti/drivers/ADC");
+var adc0  = ADC.addInstance();
+adc0.$name                        = "CONFIG_ADC_TEMP";
+adc0.adcChannel.$name             = "CONFIG_ADC_TEMP_CHANNEL";
+adc0.adcChannel.internalSignal    = "Temperature Channel";
+adc0.adcChannel.referenceSource   = "ADCWFF3_INTERNAL_REFERENCE";
+
 var UART2 = scripting.addModule("/ti/drivers/UART2");
 var uart0 = UART2.addInstance();
 uart0.$name = "CONFIG_UART2_0";

@@ -135,7 +135,8 @@
 #include <ti/devices/cc35xx/inc/hw_host_dma.h>    /* CH12/13 STA+TSTA -- wedge probe only */
 #include <ti/devices/cc35xx/inc/hw_soc_aon.h>     /* ERRSRIS -- SoC raw error status */
 #include <ti/devices/cc35xx/inc/hw_hostmcu_aon.h> /* CFGWDT / ELPTMREN -- watchdog read-only probe */
-#include <ti/devices/cc35xx/inc/hw_memmap.h>      /* HOST_DMA_TGT_BASE */
+#include <ti/drivers/ADC.h> /* internal temperature channel -- errata RADIO_01 probe (#18) */
+#include <ti/devices/cc35xx/inc/hw_memmap.h> /* HOST_DMA_TGT_BASE */
 #endif
 #include <ti/devices/cc35xx/inc/hw_types.h>
 
@@ -203,6 +204,15 @@ volatile uint32_t g_arm_fail_count;
 /* Sticky SPI RX-overrun events observed at a polled frame boundary (#21).
  * Counted, never acted on -- see spi_fifo_reset() for why. */
 volatile uint32_t g_rx_overrun_count;
+
+/* ADC internal-temperature probe status (#18).  In .bss on purpose: the first
+ * attempt stored the raw code in g_persist (.TI.noinit) only, so when
+ * ADC_convert() never succeeded the field was never written and the read-back
+ * returned UNINITIALISED RAM -- which changed on every boot and looked exactly
+ * like a live counter.  Explicit status, zero-initialised, removes that trap:
+ *   bit31 open attempted   bit30 handle non-NULL   bit29 a convert SUCCEEDED
+ *   bits[15:0] successful-convert count */
+volatile uint32_t g_adc_probe_stat;
 
 /* ---------------- persisted OTA-update-mode boot flag ------------------ */
 
@@ -303,6 +313,10 @@ static struct {
 	 * ERRSRIS/ERRSMIS, and ERRSRIS is the one worth sampling.  (SECGSERR at offset
 	 * 0x2908 is a separate security-gasket error register, not sampled here.) */
 	uint32_t probe_err_ris;
+	/* Internal ADC temperature channel: low 16 bits = last raw code, high 16 =
+	 * successful-sample count, so a stuck channel is distinguishable from a
+	 * channel that never converted (#18). */
+	uint32_t probe_adc_temp;
 	uint32_t probe_spi_ris;
 	uint32_t probe_ch12sta;
 	uint32_t probe_ch12tsta;
@@ -1103,6 +1117,59 @@ void bridge_transport_spi_probe_tick(void)
 	 * GET_DIAG_INFO when read from a handler.  Confining a possibly-wrong
 	 * base to a bench-only build is the mitigation. */
 	g_persist.probe_err_ris = HWREG(SOC_AON_BASE + SOC_AON_O_ERRSRIS);
+	/* Internal temperature channel (#18), sampled HERE because probe_tick() runs on
+	 * the task.  It must NOT be read from the diag selector: handlers on this part
+	 * dispatch from the SPI callback, and ADC_convert() is a blocking driver call.
+	 *
+	 * RAW CODE ONLY -- no conversion, and no trip.  TI has published no transfer
+	 * function, gain/offset trim or OTP location for channel 11, so this number has
+	 * no unit.  It is here to characterise the channel and to anchor the question to
+	 * TI, not to gate the radio. */
+	{
+		static ADC_Handle adc;
+		static bool       adc_tried;
+		static uint16_t   adc_ok_count; /* .bss -> starts at 0, unlike g_persist */
+		static uint16_t   adc_div;      /* sample every Nth tick, not every tick */
+		if (!adc_tried) {
+			ADC_Params ap;
+			/* ADC_init() FIRST.  ADC_open() is gated on a file-static `isInitialized`
+			 * that ONLY ADC_init() sets (ti/drivers/ADC.c), and the generated
+			 * Board_init() does not call it -- it inits Power, GPIO and DMA only.  So
+			 * ADC_open() returned NULL immediately and nothing ever wrote the sample
+			 * field, which left the read-back showing uninitialised .TI.noinit RAM that
+			 * changed every boot and looked exactly like live data.  ADC_init() is
+			 * idempotent (guarded by that same flag), so calling it here is safe. */
+			ADC_init();
+			ADC_Params_init(&ap);
+			adc = ADC_open(CONFIG_ADC_TEMP, &ap);
+			g_adc_probe_stat |= 0x80000000u;
+			if (adc != NULL) {
+				g_adc_probe_stat |= 0x40000000u;
+			}
+			adc_tried = true;
+		}
+		/* Sample every 128th tick, NOT every tick.  ADC_convert() is a BLOCKING
+		 * driver call and probe_tick() runs on the housekeeping task: converting
+		 * on every tick stalled that task badly enough that the sample counter
+		 * appeared frozen across a 5 s window, which is indistinguishable from an
+		 * ADC that never converted.  Die temperature does not move on a 10 ms
+		 * scale, so a ~1.3 s cadence loses nothing and keeps the tick responsive. */
+		adc_div++;
+		if (adc != NULL && (adc_div & 0x7Fu) == 0u) {
+			uint16_t raw = 0u;
+			if (ADC_convert(adc, &raw) == ADC_STATUS_SUCCESS) {
+				/* Count in a .bss static, NOT in the .TI.noinit word: that section is
+				 * uninitialised by design, so seeding a counter from it reports garbage as
+				 * a sample count.  The first version did that AND incremented the low half
+				 * before masking to the high half, so the count moved only on carry -- it
+				 * read 44536 from cold boot and never advanced, which is indistinguishable
+				 * from an ADC that never converted. */
+				g_adc_probe_stat = (g_adc_probe_stat | 0x20000000u) + 1u;
+				adc_ok_count++;
+				g_persist.probe_adc_temp = ((uint32_t)adc_ok_count << 16) | (uint32_t)raw;
+			}
+		}
+	}
 	g_persist.probe_spi_ris =
 	    (spi != NULL) ? HWREG(((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr + SPI_O_RIS)
 	                  : 0u;
@@ -1161,6 +1228,8 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag log-level 5  -> boots (retention witness)
  *   alp companion diag log-level 6  -> HOSTMCU_AON.CFGWDT   (watchdog config)
  *   alp companion diag log-level 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
+ *   alp companion diag log-level 8  -> ADC internal temp: [15:0] raw, [31:16] count
+ *   alp companion diag log-level 9  -> ADC probe status (open/convert bits)
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1207,6 +1276,13 @@ uint32_t bridge_transport_spi_probe_read(void)
 		 * ELPTMRLD reload, [2] ELPTMRSET start).  Its current value says whether
 		 * the low-power timer this watchdog depends on is running at all. */
 		return HWREG(HOSTMCU_AON_BASE + HOSTMCU_AON_O_ELPTMREN);
+	case 8u:
+		/* low 16 = raw channel-11 code, high 16 = sample count. NO UNIT. */
+		return g_persist.probe_adc_temp;
+	case 9u:
+		/* ADC probe status: bit31 tried, bit30 open-ok, bit29 convert-ok,
+		 * low 16 = successful converts.  Zero-initialised (.bss). */
+		return g_adc_probe_stat;
 	default:
 		break;
 	}
