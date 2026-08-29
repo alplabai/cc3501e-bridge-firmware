@@ -87,6 +87,45 @@ static void gpio_irq_cb(uint_least8_t index)
 	GPIO_clearInt(index);
 }
 
+/* ---- Open-drain emulation state (#21) -------------------------------------- *
+ * The CC35xx GPIOWFF3 controller has no true open-drain output
+ * (GPIO_CFG_OUTPUT_OPEN_DRAIN_INTERNAL is NOT_SUPPORTED), so it is emulated.
+ * This USED to be emulated as a push-pull output idling HIGH, which is not
+ * open-drain at all: it actively drives the line high, so on any net with a
+ * second driver pulling low the two fight and the pad sources current into it.
+ * The old comment said as much -- "NOT safe on a line with another active
+ * driver" -- which is an accurate description of a latent short, not a
+ * mitigation.  A host that asks for OPEN_DRAIN is asking for the safe behaviour
+ * precisely BECAUSE it expects other drivers on the net.
+ *
+ * The pad has the mechanism to do it properly: its output can be disabled
+ * (GPIOnCFG.OUTDIS), which is exactly what the READY pad's reset state relies on
+ * below.  So emulate the real thing: assert = drive LOW, release = Hi-Z and let
+ * the net's pull-up decide.  Never drive high.
+ *
+ * Tracked per pad because cc3501e_hw_gpio_write() has to know whether a 1 means
+ * "drive high" (push-pull) or "let go" (open-drain).  GPIO_pinUpperBound is well
+ * under 32 on this part; the bit index is bounds-checked before every use. */
+static uint32_t od_pads;  /* bit N set: pad N configured OPEN_DRAIN */
+static uint32_t od_pulls; /* bit N set: that pad wants the internal pull-up */
+
+static bool pad_is_open_drain(uint8_t pad)
+{
+	return (pad < 32u) && ((od_pads & ((uint32_t)1u << pad)) != 0u);
+}
+
+/* Release an open-drain pad: output disabled, so the net floats to whatever the
+ * external pull-up (or another driver) decides. */
+static int od_release(uint8_t pad)
+{
+	const GPIO_PinConfig pull = ((od_pulls & ((uint32_t)1u << pad)) != 0u)
+	                                ? GPIO_CFG_PULL_UP_INTERNAL
+	                                : GPIO_CFG_PULL_NONE_INTERNAL;
+	return (GPIO_setConfig(pad, GPIO_CFG_INPUT_INTERNAL | pull | GPIO_CFG_IN_INT_NONE) == 0)
+	           ? CC3501E_HW_OK
+	           : CC3501E_HW_ERR_IO;
+}
+
 int cc3501e_hw_gpio_configure(uint8_t pad, uint8_t dir, uint8_t pull)
 {
 	if (!gpio_pad_ok(pad)) {
@@ -100,19 +139,27 @@ int cc3501e_hw_gpio_configure(uint8_t pad, uint8_t dir, uint8_t pull)
 	case ALP_CC3501E_GPIO_DIR_OUTPUT:
 		/* push-pull, start low; host sets the level with GPIO_WRITE. */
 		cfg = GPIO_CFG_OUTPUT_INTERNAL | pull_cfg | GPIO_CFG_OUT_LOW;
+		od_pads &= ~((uint32_t)1u << (pad & 31u));
 		break;
 	case ALP_CC3501E_GPIO_DIR_OPEN_DRAIN:
-		/* The CC35xx GPIOWFF3 controller has NO true open-drain output
-		 * (GPIO_CFG_OUTPUT_OPEN_DRAIN_INTERNAL is NOT_SUPPORTED).  Emulate
-		 * with a push-pull output idling HIGH: on a single-driver line --
-		 * the M.2 W_DISABLE contract (host drives low to assert; the board
-		 * pull-up holds high when released) -- this is electrically
-		 * equivalent.  NOT safe on a line with another active driver. */
-		cfg = GPIO_CFG_OUTPUT_INTERNAL | pull_cfg | GPIO_CFG_OUT_HIGH;
-		break;
+		/* Emulated -- see the od_pads note above.  Register the pad and leave
+		 * it RELEASED (Hi-Z), the deasserted state of an open-drain line.
+		 * cc3501e_hw_gpio_write() drives low to assert and returns to Hi-Z to
+		 * release; it never drives the line high. */
+		if (pad >= 32u) {
+			return CC3501E_HW_ERR_INVAL; /* od_pads is a 32-bit mask */
+		}
+		od_pads |= ((uint32_t)1u << pad);
+		if (pull == ALP_CC3501E_GPIO_PULL_UP) {
+			od_pulls |= ((uint32_t)1u << pad);
+		} else {
+			od_pulls &= ~((uint32_t)1u << pad);
+		}
+		return od_release(pad);
 	case ALP_CC3501E_GPIO_DIR_INPUT:
 	default:
 		cfg = GPIO_CFG_INPUT_INTERNAL | pull_cfg | GPIO_CFG_IN_INT_NONE;
+		od_pads &= ~((uint32_t)1u << (pad & 31u));
 		break;
 	}
 	return (GPIO_setConfig(pad, cfg) == 0) ? CC3501E_HW_OK : CC3501E_HW_ERR_IO;
@@ -122,6 +169,21 @@ int cc3501e_hw_gpio_write(uint8_t pad, uint8_t level)
 {
 	if (!gpio_pad_ok(pad)) {
 		return CC3501E_HW_ERR_INVAL;
+	}
+	if (pad_is_open_drain(pad)) {
+		/* Open-drain: a 1 RELEASES the line (Hi-Z, the net's pull-up wins); a
+		 * 0 asserts by driving low.  Driving high here is precisely the
+		 * contention this emulation exists to avoid. */
+		if (level != 0u) {
+			return od_release(pad);
+		}
+		if (GPIO_setConfig(pad,
+		                   GPIO_CFG_OUTPUT_INTERNAL | GPIO_CFG_PULL_NONE_INTERNAL |
+		                       GPIO_CFG_OUT_LOW) != 0) {
+			return CC3501E_HW_ERR_IO;
+		}
+		GPIO_write(pad, 0u);
+		return CC3501E_HW_OK;
 	}
 	GPIO_write(pad, (level != 0u) ? 1u : 0u);
 	return CC3501E_HW_OK;
