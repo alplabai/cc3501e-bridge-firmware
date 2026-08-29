@@ -218,6 +218,38 @@ unit. The validated host-side workaround is to hard-reset the CC3501E after each
 power-cycle: drive WIFI_EN, let the first boot settle, then pulse nRESET. This
 is implemented in `cc3501e_hard_reset` / `cc3501e_reset`.
 
+**Quantified 2026-08-29 (`v0.149.66.4`, XDS110 `L50015YR`, DPS-150 CH2 20 s off).**
+The workaround above is not optional and the cost of skipping it is now measured.
+16 trials, each a plain PSU cold cycle with **no** host hard-reset, probing
+`alp companion ver` before anything else ran:
+
+```
+first-boot failures        : 3/16      (~19%)
+recovered on 2nd cold cycle: 3/3       (100%)
+still dead after 2nd cycle : 0
+reset causes seen          : power-on (1)  x16
+```
+
+Three things follow, and the third is the one that bites:
+
+1. **Roughly one cold boot in five does not bring the bridge up** without the
+   host hard-reset. It is not a slow boot — a 25 s retry on the same boot never
+   helped (0/16) — it simply does not come up.
+2. **A second cold cycle always recovered it**, 3 of 3, with no other
+   intervention. That is the double-boot signature the Puya workaround exists
+   for, seen from the other side.
+3. **There is no fault indication.** Every boot, including the ones that came up
+   after a failure, reports `reset: power-on (1)` (the cause field became real in
+   #44). Nothing distinguishes a first-boot mis-read from a clean POR, so a test
+   harness that omits the hard-reset sees an intermittent, causeless failure.
+
+**Consequence for anyone measuring on this bench:** a protocol that cold-cycles
+the PSU and then talks to the bridge, without the `cc3501e_hard_reset` sequence,
+mixes ~19% of first-boot failures into whatever it is trying to measure. That is
+exactly what happened while chasing #5 — the "1 in 12 scan-stop wedge" quoted
+there was a mixture of this and a genuine scan-stop failure, and only separated
+once a `ver` liveness gate was placed before the BLE steps. See #46.
+
 **Activation state — CORRECTED 2026-07-09 (`e1m-aen-evk-01`, XDS110 `L50015YR`):**
 the bench unit is **already activated**. The `boot_sector_programmed = 0`
 figure that an earlier read reported is from a **stale, pre-activation
