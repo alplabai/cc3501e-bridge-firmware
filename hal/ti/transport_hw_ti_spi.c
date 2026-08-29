@@ -132,9 +132,10 @@
 #include <ti/devices/DeviceFamily.h>
 #include <ti/devices/cc35xx/inc/hw_spi.h>
 #ifdef CC3501E_WEDGE_PROBE
-#include <ti/devices/cc35xx/inc/hw_host_dma.h> /* CH12/13 STA+TSTA -- wedge probe only */
-#include <ti/devices/cc35xx/inc/hw_soc_aon.h>  /* ERRSRIS -- SoC raw error status */
-#include <ti/devices/cc35xx/inc/hw_memmap.h>   /* HOST_DMA_TGT_BASE */
+#include <ti/devices/cc35xx/inc/hw_host_dma.h>    /* CH12/13 STA+TSTA -- wedge probe only */
+#include <ti/devices/cc35xx/inc/hw_soc_aon.h>     /* ERRSRIS -- SoC raw error status */
+#include <ti/devices/cc35xx/inc/hw_hostmcu_aon.h> /* CFGWDT / ELPTMREN -- watchdog read-only probe */
+#include <ti/devices/cc35xx/inc/hw_memmap.h>      /* HOST_DMA_TGT_BASE */
 #endif
 #include <ti/devices/cc35xx/inc/hw_types.h>
 
@@ -1158,6 +1159,8 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag log-level 3  -> raw CH13STA
  *   alp companion diag log-level 4  -> raw SOC_AON ERRSRIS
  *   alp companion diag log-level 5  -> boots (retention witness)
+ *   alp companion diag log-level 6  -> HOSTMCU_AON.CFGWDT   (watchdog config)
+ *   alp companion diag log-level 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1187,6 +1190,23 @@ uint32_t bridge_transport_spi_probe_read(void)
 		 * indistinguishable from a fresh one, and the whole probe is unreadable
 		 * on a bench with no SWD memory-read tool. */
 		return g_persist.boots;
+	case 6u:
+		/* HOSTMCU_AON.CFGWDT -- READ ONLY.  #21 asks whether the watchdog is
+		 * already armed by its reset value with a ~29 s threshold, in which case
+		 * nothing in this firmware services it.  That was answered indirectly by
+		 * uptime passing 104 s untouched; this answers it from the register:
+		 * bit31 EN, bits[30:8] THR.  Reading it changes nothing.
+		 *
+		 * Read BEFORE any attempt to arm it, deliberately: a watchdog whose
+		 * threshold or service point is wrong turns one fault into a reset loop,
+		 * and recovery is an XDS110 reflash. */
+		return HWREG(HOSTMCU_AON_BASE + HOSTMCU_AON_O_CFGWDT);
+	case 7u:
+		/* HOSTMCU_AON.ELPTMREN -- READ ONLY.  The enable/sequencing register the
+		 * WDT arming procedure drives ([3] ELPTMRRST halt, [0] VAL, [16]
+		 * ELPTMRLD reload, [2] ELPTMRSET start).  Its current value says whether
+		 * the low-power timer this watchdog depends on is running at all. */
+		return HWREG(HOSTMCU_AON_BASE + HOSTMCU_AON_O_ELPTMREN);
 	default:
 		break;
 	}
