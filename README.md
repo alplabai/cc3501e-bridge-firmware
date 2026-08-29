@@ -124,10 +124,10 @@ built and signed:
 > **`cc3501e-v0.5.0.bin` is built from this tree's v0.5.0 release commit.**  It
 > supersedes `cc3501e-v0.4.1.bin`, which had fallen 32 commits behind `main`;
 > the older blobs are kept only for traceability.  The `prebuilt freshness` CI
-> job now goes red the moment a change lands in `src/`, `hal/` or `ti/` without
-> a new signed release, so this is a checked claim rather than an asserted one
-> -- that gap is what let 0.4.1 go stale under a green `prebuilt integrity`
-> (#75).
+> job goes red when a change lands in `src/`, `hal/` or `ti/` that is neither
+> released nor attested byte-identical in `prebuilt/BUILT_FROM`, so this is a
+> checked claim rather than an asserted one -- that gap is what let 0.4.1 go
+> stale under a green `prebuilt integrity` (#75).
 >
 > **One caveat, carried from the release notes.**  The socket-EOF repair (#32)
 > is 0.5.0's headline fix and is **not yet exercised on silicon**: the host-side
