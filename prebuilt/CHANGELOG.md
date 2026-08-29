@@ -7,14 +7,7 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.5.0] — PREPARED, NOT YET RELEASED
-
-> **The signed artifacts are NOT in this directory yet.** The binary is built
-> and bench-verified, its SHA-256 is below, but the detached `.sig` requires the
-> private signing key, which is not in this repository. Until
-> `cc3501e-v0.5.0.bin`, `.sha256` and `.sig` are all present, the newest
-> flashable release remains **0.4.1** — and `README.md` records that 0.4.1 does
-> **not** match current `main`.
+## [0.5.0] — 2026-08-29
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
@@ -24,6 +17,26 @@ size    : 1092384 bytes
 sha256  : 980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109
 marker  : fw_version 0.5.0 -> 0x0500
 ```
+
+- `cc3501e-v0.5.0.bin`         -- signed firmware image (full shipped stack)
+- `cc3501e-v0.5.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
+  (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
+  verify with `openssl dgst -sha256 -verify <pub> -signature
+  cc3501e-v0.5.0.bin.sig cc3501e-v0.5.0.bin`)
+- `cc3501e-v0.5.0.bin.sha256`  -- integrity manifest (`980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109`)
+
+| Number | Value | What it gates |
+|---|---|---|
+| App SemVer (`firmware-version.txt`) | **0.5.0** | the `fw_version` marker the bridge reports in `DIAG` (`0x0500`) |
+| Wire protocol (`ALP_CC3501E_PROTOCOL_VERSION`) | **5** | `GET_VERSION`; unchanged from 0.4.x, so a 0.4.x host talks to this image |
+| GPE image `--version` (this artifact's stamp) | **0.5.0.0** | the version the SBL compares against the part's last-seen version |
+
+> **Anti-rollback still applies to this artifact.** The `0.5.0.0` stamp is far
+> BELOW what a bench or OTA-iteration unit has already seen -- the bench part
+> behind these results sits at `0.149.66.35`. Flashing `0.5.0.0` onto such a unit
+> streams clean and then refuses to boot. Re-wrap the same image at a legal stamp
+> (`VERSION=0.149.67.0 ti/regen_flashset.sh`, major MUST be `0`, every field
+> <= 255). `README.md` and `BRINGUP_STATUS.md` carry the full rule.
 
 **Bench-verified on an E1M-AEN801** (flashset `01496637`): 6/6 cold-cycle trials,
 7/7 functional surfaces, **0 boot failures, 0 failures** — `ver`, `wifi scan`,
