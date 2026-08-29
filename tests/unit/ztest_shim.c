@@ -108,15 +108,31 @@ int main(void)
 
 		ztest_current = c->name;
 		total++;
-		if (s->before != NULL) {
-			s->before(s->fixture);
-		}
+		/* BOTH hooks must run INSIDE a live setjmp scope.  zassert_* aborts by
+		 * longjmp(ztest_jmp), so a hook that runs outside one jumps through a
+		 * jmp_buf that is stale or -- on the very first case -- never
+		 * initialised at all.
+		 *
+		 * `before` used to run ABOVE the setjmp: a failing assert in it was
+		 * undefined behaviour on case 1 and jumped into a dead frame after.
+		 * It is now inside the same setjmp as the case body, so a failed
+		 * precondition aborts the case exactly as ztest does.
+		 *
+		 * `after` needs its OWN setjmp rather than sharing the one above: it
+		 * runs after that setjmp has already returned, so a failure in it
+		 * longjmp'd back to a setjmp that then returned 1, skipped the case
+		 * body, and re-entered `after` -- an infinite loop. */
 		if (setjmp(ztest_jmp) == 0) {
+			if (s->before != NULL) {
+				s->before(s->fixture);
+			}
 			c->fn();
 		}
 		/* after runs even when the case aborted, mirroring ztest. */
 		if (s->after != NULL) {
-			s->after(s->fixture);
+			if (setjmp(ztest_jmp) == 0) {
+				s->after(s->fixture);
+			}
 		}
 
 		if (ztest_failures > before) {
