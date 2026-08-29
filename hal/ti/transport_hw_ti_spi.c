@@ -481,9 +481,28 @@ static void dispatch_frame(size_t frame_len)
  * signature: the host in-band marker reads [02 00 00 00] once then
  * [00 00 00 00] forever, and a 256 kB read dies 61-212 kB in.
  *
- * Only REPLY phases are watched: PH_REQ_HEADER legitimately waits forever for
- * the next request, so watching it would fire on every idle gap.  A reply is
- * only ever armed immediately after a request arrived.
+ * PH_REQ_HEADER is the ONLY phase that may legitimately wait forever -- it is
+ * the idle state, waiting for the host's next request, so watching it would
+ * fire on every quiet gap.  Every OTHER armed phase is armed in direct
+ * response to something the host just clocked, and must not wait forever.
+ *
+ * That includes PH_REQ_PAYLOAD, which this watchdog used to skip (#5).  The
+ * gap was reachable and unrecoverable: the host clocks a 4-byte header
+ * declaring payload_len=512, the slave arms a 512-byte RX and raises READY,
+ * and the host then aborts before or during the payload -- its own DMA error,
+ * a -3/-5 timeout, or a re-init tearing the link down mid-frame.  Nothing
+ * recovered: reply_armed was false so this predicate returned false;
+ * g_resync_count did not move (no header is being misframed); g_arm_fail_count
+ * did not move (the arm succeeded); bridge_transport_spi_is_dead() was false
+ * (the handle is fine).  The host's retry then clocks a fresh 4-byte header
+ * which is absorbed as payload bytes, and after 128 such retries the slave
+ * finally dispatches a frame whose cmd byte is the ORIGINAL opcode with 512
+ * bytes of concatenated retry headers as its payload -- a re-execution of a
+ * host command with garbage arguments.  Until then the link is dead and the
+ * only escape is a WIFI_EN/nRESET cold cycle.
+ *
+ * A request payload always follows its header immediately, so the same
+ * CC3501E_REPLY_STALL_MS deadline applies unchanged.
  *
  * The armed flag is a SEPARATE bool, not a sentinel packed into the timestamp.
  * A previous attempt stamped `uptime | 1u` to mean "armed", which for any EVEN
@@ -495,7 +514,7 @@ static void dispatch_frame(size_t frame_len)
 static volatile bool     reply_armed;
 static volatile uint32_t reply_armed_ms;
 
-bool bridge_transport_spi_reply_stalled(void)
+bool bridge_transport_spi_phase_stalled(void)
 {
 	if (!reply_armed) {
 		return false;
@@ -584,7 +603,12 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 			/* dummy_tx_zero (all-0x00) on MISO during payload (0xA5 marks the
 			 * header boundary only) -- see dummy_tx_zero's comment: SPIWFF3DMA
 			 * needs a real txBuf to arm, a literal NULL is not safe here. */
-			arm_transfer(&frame_buf[ALP_CC3501E_HEADER_BYTES], dummy_tx_zero, plen);
+			if (arm_transfer(&frame_buf[ALP_CC3501E_HEADER_BYTES], dummy_tx_zero, plen)) {
+				/* Watched: a host that abandons the transaction between header
+				 * and payload would otherwise leave this armed forever (#5). */
+				reply_armed_ms = cc3501e_hw_uptime_ms();
+				reply_armed    = true;
+			}
 		}
 		break;
 	}

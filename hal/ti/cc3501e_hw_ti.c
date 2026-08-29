@@ -472,7 +472,7 @@ void cc3501e_hw_tick(void)
 	 * A transaction abandoned AFTER the slave armed its reply leaves that
 	 * transfer armed forever, and both self-heals above are blind to it (no
 	 * misframing, no failed arm).  Same reinit recovery. */
-	if (bridge_transport_spi_reply_stalled()) {
+	if (bridge_transport_spi_phase_stalled()) {
 		bridge_transport_spi_hw_reinit();
 	}
 
