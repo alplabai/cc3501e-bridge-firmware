@@ -138,7 +138,7 @@ built and signed:
 
 ```sh
 # 1. Verify what you are about to flash (never skip this).
-openssl dgst -sha256 -verify <VALIDATION_public.pem> \
+openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
     -signature prebuilt/cc3501e-v0.5.0.bin.sig prebuilt/cc3501e-v0.5.0.bin
 sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.0.bin.sha256)  prebuilt/cc3501e-v0.5.0.bin"
 

@@ -21,7 +21,7 @@ marker  : fw_version 0.5.0 -> 0x0500
 - `cc3501e-v0.5.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.5.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
   (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
-  verify with `openssl dgst -sha256 -verify <pub> -signature
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature
   cc3501e-v0.5.0.bin.sig cc3501e-v0.5.0.bin`)
 - `cc3501e-v0.5.0.bin.sha256`  -- integrity manifest (`980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109`)
 
@@ -91,7 +91,7 @@ Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 - `cc3501e-v0.4.1.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.4.1.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
   (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
-  verify with `openssl dgst -sha256 -verify <pub> -signature
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature
   cc3501e-v0.4.1.bin.sig cc3501e-v0.4.1.bin`)
 - `cc3501e-v0.4.1.bin.sha256`  -- integrity manifest (`7f550c79502f6b001f1e651d1229f61a0878cd29b78d33dae6621021148f324f`)
 
@@ -159,7 +159,7 @@ Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 - `cc3501e-v0.4.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.4.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
   (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
-  verify with `openssl dgst -sha256 -verify <pub> -signature
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature
   cc3501e-v0.4.0.bin.sig cc3501e-v0.4.0.bin`)
 - `cc3501e-v0.4.0.bin.sha256`  -- integrity manifest (`a73e0555841e90522eaa4c007445a4f08331092842267be200fd0c895ed4881a`)
 
@@ -229,7 +229,7 @@ SimpleLink Wi-Fi SDK 10.10.01.08 + SysConfig 1.28 + Wi-Fi toolbox
 - `cc3501e-v0.3.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.3.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
   (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
-  verify with `openssl dgst -sha256 -verify <pub> -signature
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature
   cc3501e-v0.3.0.bin.sig cc3501e-v0.3.0.bin`)
 - `cc3501e-v0.3.0.bin.sha256`  -- integrity manifest
 
@@ -286,7 +286,7 @@ Wi-Fi toolbox 4.2.4) via `ti/build_ti.sh --wifi --ble`.
 - `cc3501e-v0.2.0.bin`         -- signed firmware image (full shipped stack)
 - `cc3501e-v0.2.0.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
   (the VALIDATION vendor key; verify with
-  `openssl dgst -sha256 -verify <pub> -signature cc3501e-v0.2.0.bin.sig
+  `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature cc3501e-v0.2.0.bin.sig
   cc3501e-v0.2.0.bin`)
 - `cc3501e-v0.2.0.bin.sha256`  -- integrity manifest
   (`1dffbc30a306c5227578640d0a60b044edff1be38747ae9e57776d6b0989e9f4`)
