@@ -258,6 +258,46 @@ jobs:
           fi
           echo "clean"
 
+  prebuilt-freshness:
+    name: prebuilt freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # commit dates are the whole check; a shallow clone cannot do it
+      # `prebuilt integrity` verifies each blob against its OWN .sha256.  That is
+      # self-consistency, NOT currency: a prebuilt arbitrarily older than src/
+      # passes it green, and that is exactly how cc3501e-v0.4.1.bin came to sit
+      # 32 commits behind main while CI stayed clean (#75).  README tells
+      # customers to flash that blob, so the property that matters to them is
+      # whether it still corresponds to the source -- which nothing checked.
+      #
+      # This job is deliberately NOT in the branch ruleset's required contexts.
+      # It should go RED the moment a firmware change lands without a release,
+      # because that is true and worth seeing; it must not block every unrelated
+      # PR until someone can sign a new blob (the signing key is not in CI).
+      - name: newest prebuilt must not predate the newest firmware commit
+        run: |
+          set -euo pipefail
+          newest_bin=$(ls -1 prebuilt/cc3501e-*.bin 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$newest_bin" ]; then
+            echo "::error::no prebuilt/cc3501e-*.bin found"; exit 1
+          fi
+          bin_ts=$(git log -1 --format=%ct -- "$newest_bin")
+          src_ts=$(git log -1 --format=%ct -- src hal ti)
+          bin_sha=$(git log -1 --format=%h -- "$newest_bin")
+          src_sha=$(git log -1 --format=%h -- src hal ti)
+          echo "newest prebuilt : $newest_bin  ($bin_sha, $(git log -1 --format=%ad --date=short -- "$newest_bin"))"
+          echo "newest firmware : $src_sha      ($(git log -1 --format=%ad --date=short -- src hal ti))"
+          if [ "$src_ts" -gt "$bin_ts" ]; then
+            behind=$(git rev-list --count "$bin_sha"..HEAD -- src hal ti)
+            echo "::error::$newest_bin is $behind firmware commit(s) behind HEAD."
+            echo "::error::README tells customers to flash this blob; it no longer matches src/."
+            echo "::error::Cut a signed release (bump firmware-version.txt, rebuild, .sha256, .sig, CHANGELOG) -- see #75."
+            exit 1
+          fi
+          echo "ok  prebuilt is not older than the newest firmware commit"
+
   prebuilt-integrity:
     name: prebuilt integrity
     runs-on: ubuntu-latest
