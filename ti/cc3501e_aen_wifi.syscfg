@@ -38,6 +38,21 @@
  * the "Class Application/User UART" is unavailable here; and the UART cannot
  * serve as an out-of-band read-back channel for the wedge probe.  All three
  * need a free E1M pad muxed as UART, or a board rev.
+ *
+ * THE DEDICATED LOGGER PIN IS ALSO UNROUTED (measured 2026-08-29).  CC35 pin
+ * 38 / GPIO9 is TI's radio-firmware tracer output, and it sits next to SWDIO
+ * (pin 40 / GPIO7) and SWCLK (pin 39 / GPIO8), which ARE wired to the XDS110 --
+ * so it was worth checking whether the tracer reaches the probe even though the
+ * application UART does not.  It does not: with BOTH XDS110 COM ports open
+ * (Class Auxiliary Data Port and Class Application/User UART) across sustained
+ * Wi-Fi and BLE activity -- two `wifi scan` runs returning APs at -45 dBm and a
+ * `ble scan` returning devices, so the NWP was demonstrably busy -- both ports
+ * received ZERO bytes.
+ *
+ * That closes the last host-side observability route on this SoM: no CC35
+ * console (UART2 on GPIO5/GPIO6), no radio tracer (LOGGER on GPIO9), and no SWD
+ * memory access (the DAP answers but exposes no MEM-AP on an activated part).
+ * Radio observability stays at the one diagnostic byte the bridge reports.
  */
 
 /* ======== Kernel ======== */
