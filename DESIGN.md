@@ -101,7 +101,7 @@ different thing and they must not be conflated:
 |---|---|---|---|
 | **App SemVer** | `firmware-version.txt` (e.g. `0.2.0`) | `GET_DIAG_INFO.fw_version` (u16) | firmware release identity — human-facing "what's running" |
 | **Wire protocol version** | `ALP_CC3501E_PROTOCOL_VERSION` in `<alp/protocol/cc3501e.h>` (currently `5`) | `GET_VERSION` (0x01) | host↔firmware wire compatibility (host refuses a mismatch — enforced by `cc3501e_reset()` in `chips/cc3501e/cc3501e_core.c`, which reads `GET_VERSION` once the cold boot completes and returns `ALP_ERR_VERSION` if the reply differs from the host's compile-time value; #1371) |
-| **GPE flash/image version** | `--version` in `ti/deploy_validate.sh` (date-derived) | — (programmer only) | CC35 vendor-RoT anti-rollback (unit rejects `<=` the programmed value) |
+| **GPE flash/image version** | `--version`, supplied EXPLICITLY to `ti/deploy_validate.sh` / `ti/regen_flashset.sh` / `ti/validate_gpio_bench.ps1` (no default) | — (programmer only) | CC35 vendor-RoT anti-rollback (unit rejects `<=` the programmed value) |
 
 **App SemVer → `fw_version` marker.** The runtime u16 is *derived* from
 `firmware-version.txt`, never hand-typed, so it cannot drift. Both build
@@ -128,9 +128,14 @@ Two hard rules, both bench-proven, both easy to get wrong:
   `1.<yy>.<mmdd>.<hhmm>` is INVALID: `mmdd = 0705` and `hhmm = 1531`
   overflow a byte and silently corrupt the version.
 
-`deploy_validate.sh:50` therefore derives it as major `0` plus the low
-three bytes of the epoch:
-`0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))`.
+`deploy_validate.sh` USED to derive it as major `0` plus the low three bytes
+of the epoch, `0.$(((_e>>16)&255)).$(((_e>>8)&255)).$((_e&255))`.  **That default
+is gone** (#37, and #56 for the PowerShell script that kept one): an epoch-derived
+stamp is a rollback stamp on any unit whose last flash was higher, which streams
+clean and then refuses to boot, so all three scripts now REQUIRE the stamp and
+refuse to run without it.  Pass a value strictly greater than anything ever
+flashed on that unit, with major `0` and every field `<= 255`.  This paragraph
+described the removed default as current behaviour in a normative recipe (#66).
 
 > An earlier revision of this section prescribed exactly the two schemes
 > above as REQUIREMENTS -- `major >= 1` and `major.<yy>.<mmdd>.<hhmm>`.

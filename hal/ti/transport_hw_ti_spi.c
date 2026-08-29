@@ -266,7 +266,18 @@ static struct {
 	 * distinction the residual wedge turns on, and it was the one thing the
 	 * snapshot never captured (#21). */
 	/* Raw SPI interrupt status at the last tick.  RIS is PRE-MASK, so a bit sets
-	 * here whether or not the interrupt is enabled -- which is the whole point:
+	 * here whether or not the interrupt is MASKED.
+	 *
+	 * SCOPE CORRECTION (#67): #53's commit message claimed this makes RXOVF
+	 * observable "whether or not the interrupt is enabled".  That is wrong for
+	 * RXOVF and the same file says why -- the driver DOES enable the RX-overrun
+	 * interrupt on the DMA branch (SPI_INT_SUBSET includes SPI_INT_RXOF), and its
+	 * ISR clears the latch, so an overrun is gone long before this ~10 ms tick
+	 * samples RIS.  A cleared RXOVF bit here is NOT evidence that no overrun
+	 * occurred.  g_rx_overrun_count in spi_fifo_reset() is the RXOVF counter;
+	 * this sample is not.
+	 *
+	 * The claim holds for RTOUT, which is the bit this was actually added for:
 	 * the SPIWFF3DMA driver never enables RTOUT (SPI_MIS_RTOUT_SET appears only
 	 * inside SPI_INT_ALL, and SPI_INT_ALL is passed ONLY to disableInterrupt() and
 	 * clearInterrupt(), never enableInterrupt(); the driver's working set is

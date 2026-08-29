@@ -159,7 +159,17 @@ void cc3501e_hw_init(void)
 	 * P2_6 net, so the firmware cannot rely on one.  Issue #17.
 	 *
 	 * cc3501e_bridge_busy() is the strong override in cc3501e_hw_ti_gpio.c; its
-	 * ready_ensure_init() is idempotent, so the later lazy path still works. */
+	 * ready_ensure_init() is idempotent, so the later lazy path still works.
+	 *
+	 * WHAT ACTUALLY CLOSES THE BOOT WINDOW (#59): not this call.  The generated
+	 * board file already drives the pad low --
+	 *   ti_drivers_config.c: GPIO_CFG_OUTPUT_INTERNAL | GPIO_CFG_OUT_STR_LOW |
+	 *                        GPIO_CFG_OUT_LOW, \* GPIO17 = bridge READY *	 * -- so GPIO_init(), inside the Board_init() on the line above, has already
+	 * configured GPIO17 as a push-pull output at LOW by the time control reaches
+	 * here.  #28 presented this call as closing a window that GPIO_init() had
+	 * closed one line earlier.  It is kept as an explicit, idempotent guard that
+	 * states the intent in firmware rather than relying on a generated file, but
+	 * it is belt-and-braces, not the mechanism. */
 	cc3501e_bridge_busy();
 
 	SPI_init();
