@@ -7,6 +7,68 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] — PREPARED, NOT YET RELEASED
+
+> **The signed artifacts are NOT in this directory yet.** The binary is built
+> and bench-verified, its SHA-256 is below, but the detached `.sig` requires the
+> private signing key, which is not in this repository. Until
+> `cc3501e-v0.5.0.bin`, `.sha256` and `.sig` are all present, the newest
+> flashable release remains **0.4.1** — and `README.md` records that 0.4.1 does
+> **not** match current `main`.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
+
+```
+size    : 1092384 bytes
+sha256  : 980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109
+marker  : fw_version 0.5.0 -> 0x0500
+```
+
+**Bench-verified on an E1M-AEN801** (flashset `01496637`): 6/6 cold-cycle trials,
+7/7 functional surfaces, **0 boot failures, 0 failures** — `ver`, `wifi scan`,
+`ble enable`, `ble scan`, `ble scan-stop`, `ver` after the radio op, and the
+GPIO proxy.
+
+Minor bump rather than patch: this changes observable behaviour, not only
+defects.
+
+### Fixed
+
+- **Socket EOF was unreachable.** `SOCK_RECV` answered `RESP_ERR_BUSY` forever
+  after a peer close: the pump returns early on `peer_closed`, so the ring could
+  never refill, and the empty-ring answer never consulted it. `poll_by_repeat`
+  retries precisely on `BUSY`, so it span to timeout instead of seeing the
+  0-byte close.
+- **`WIFI_DISCONNECT` had no SPI re-sync at all.** It sat in the
+  `body_already_reinit` skip list while `cc3501e_hw_wifi_disconnect()` contained
+  no re-init — a `Wlan_Disconnect()` with no re-sync from either side.
+- **`OPEN_DRAIN` was push-pull.** It drove the net HIGH, contending with any
+  other driver pulling low. Now uses the pad's output-disable: assert LOW,
+  release Hi-Z. A later fix corrected a pad-mask that aliased pads 32..37 onto
+  0..5 (`GPIO_pinUpperBound` is 37, not "well under 32").
+- **BLE `scan-stop` wedge.** Removed a `bridge_transport_spi_hw_reinit()` that
+  entered the tree as a Wi-Fi `HIFInit` fix and was pattern-copied onto the BLE
+  path. Bench: 3/32 scan-stop failures with it, 1/104 without.
+- **A rollback GPE stamp default** in `ti/validate_gpio_bench.ps1`, the one
+  script that reaches the part.
+- **`DIAG_LOG_LEVEL` (0x71) discarded its argument** while answering `RESP_OK`.
+- **Real reset cause** reported instead of a hardcoded `RESET_UNKNOWN`.
+- **Both AP-role waits bounded** instead of `WLAN_WAIT_FOREVER`.
+
+### Added
+
+- ADC internal temperature channel instantiated (pinless) and converting;
+  **raw code only, no unit** — the trip awaits TI's transfer function.
+- Bench-probe capture of host-DMA channel state, raw SPI `RIS`, SoC `ERRSRIS`,
+  and the watchdog registers.
+
+### Known limitations
+
+- The residual `scan-stop` wedge is ~1% (1/147 booted trials), not zero.
+- Cold-boot failures run ~20% on this part (PY25Q64LB Puya); the host
+  hard-reset workaround is in `alp-sdk`'s `cc3501e_reset()`.
+
 ## [0.4.1]
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
