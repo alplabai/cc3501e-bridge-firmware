@@ -53,7 +53,11 @@ int cc3501e_hw_wifi_lazy_start(void);
 /* True when a REPLY phase has been armed and un-completed past the stall
  * budget -- the host abandoned a transaction after the slave armed its reply,
  * which no other self-heal detects.  Polled by cc3501e_hw_tick(). */
-bool bridge_transport_spi_reply_stalled(void);
+/* True when an armed NON-IDLE phase has waited past CC3501E_REPLY_STALL_MS.
+ * Covers the reply phases AND PH_REQ_PAYLOAD; PH_REQ_HEADER is the idle state
+ * and is deliberately never watched.  Renamed from _reply_stalled when
+ * PH_REQ_PAYLOAD joined, because the old name said less than it did (#5). */
+bool bridge_transport_spi_phase_stalled(void);
 
 /* Re-apply the latched radio power-save policy after Wlan_RoleUp(STA) succeeds.
  * Wlan_Set() is rejected while the radio is down, so a POWER_POLICY the host set
