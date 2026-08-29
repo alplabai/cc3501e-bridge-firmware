@@ -133,6 +133,7 @@
 #include <ti/devices/cc35xx/inc/hw_spi.h>
 #ifdef CC3501E_WEDGE_PROBE
 #include <ti/devices/cc35xx/inc/hw_host_dma.h> /* CH12/13 STA+TSTA -- wedge probe only */
+#include <ti/devices/cc35xx/inc/hw_soc_aon.h>  /* ERRSRIS -- SoC raw error status */
 #include <ti/devices/cc35xx/inc/hw_memmap.h>   /* HOST_DMA_TGT_BASE */
 #endif
 #include <ti/devices/cc35xx/inc/hw_types.h>
@@ -279,6 +280,17 @@ static struct {
 	 * well be right, but arming either is a behaviour change on the wedge path,
 	 * and #5 established what that costs: five fixes, five bench cycles, three of
 	 * which moved nothing.  Measure first. */
+	/* SoC-level raw error status, SOC_AON.ERRSRIS[8:0] -- nine error sources the
+	 * firmware has never looked at.  Raw, so a source latches here whether or not
+	 * ERRSIMASK enables its interrupt: observable with no behaviour change, the
+	 * same reason SPI RIS above is read rather than armed.
+	 *
+	 * NOTE for #21: that finding names 'ERRSIMASK/ERRSTS1/ERRSTS2'.  ERRSTS1 and
+	 * ERRSTS2 DO NOT EXIST on this part.  hw_soc_aon.h defines ERRSIMASK, ERRSISET,
+	 * ERRSICLR, ERRSIMSET, ERRSIMCLR, ERRSRIS and ERRSMIS -- the raw/masked pair is
+	 * ERRSRIS/ERRSMIS, and ERRSRIS is the one worth sampling.  (SECGSERR at offset
+	 * 0x2908 is a separate security-gasket error register, not sampled here.) */
+	uint32_t probe_err_ris;
 	uint32_t probe_spi_ris;
 	uint32_t probe_ch12sta;
 	uint32_t probe_ch12tsta;
@@ -1078,6 +1090,7 @@ void bridge_transport_spi_probe_tick(void)
 	 * turned out not to be the address the silicon answers on and broke
 	 * GET_DIAG_INFO when read from a handler.  Confining a possibly-wrong
 	 * base to a bench-only build is the mitigation. */
+	g_persist.probe_err_ris = HWREG(SOC_AON_BASE + SOC_AON_O_ERRSRIS);
 	g_persist.probe_spi_ris =
 	    (spi != NULL) ? HWREG(((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr + SPI_O_RIS)
 	                  : 0u;
@@ -1132,6 +1145,7 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag log-level 1  -> raw SPI RIS
  *   alp companion diag log-level 2  -> raw CH12STA
  *   alp companion diag log-level 3  -> raw CH13STA
+ *   alp companion diag log-level 4  -> raw SOC_AON ERRSRIS
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1150,6 +1164,8 @@ uint32_t bridge_transport_spi_probe_read(void)
 		return g_persist.probe_ch12sta;
 	case 3u:
 		return g_persist.probe_ch13sta;
+	case 4u:
+		return g_persist.probe_err_ris;
 	default:
 		break;
 	}
