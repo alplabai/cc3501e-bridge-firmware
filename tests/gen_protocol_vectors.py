@@ -44,10 +44,20 @@ import sys
 # script would silently source a FOREIGN protocol version and pass (#11).
 #
 # ALP_SDK_ROOT is the supported way to point at a checkout.  The fallback keeps
-# a pre-extraction tree working (two levels up = alp-sdk root when this repo
-# still sat at alp-sdk/firmware/cc3501e).
+# a pre-extraction tree working (two levels above the REPO ROOT = alp-sdk root
+# when this repo still sat at alp-sdk/firmware/cc3501e).
+#
+# The variable below is the REPO ROOT and must be parents[1]: this file is
+# <repo>/tests/gen_protocol_vectors.py, so parents[0] is tests/ and parents[1] is
+# the repo.  It was parents[2] -- the repo's PARENT -- which made the name a lie
+# and pushed the fallback one level too far out: parents[2].parent.parent
+# resolved ABOVE alp-sdk, i.e. one level further out than the parents[3] it
+# replaced, so the pre-extraction fallback it exists to serve could never hit.
+# Verified on both layouts:
+#   alp-sdk/firmware/cc3501e/tests/... -> parents[1].parent.parent == alp-sdk  (right)
+#                                      -> parents[2].parent.parent == above it (wrong)
 _ENV_SDK_ROOT = os.environ.get("ALP_SDK_ROOT")
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HEADER = (
     pathlib.Path(_ENV_SDK_ROOT).expanduser() / "include" / "alp" / "protocol" / "cc3501e.h"
     if _ENV_SDK_ROOT
