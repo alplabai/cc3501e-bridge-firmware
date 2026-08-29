@@ -22,6 +22,22 @@
  * glue LINKS; the bridge firmware never calls InitTerm()/Report().  The UART
  * sits on free pins (GPIO5/GPIO6, the LaunchPad XDS110 default) that do NOT
  * collide with the inter-chip SPI pads (GPIO16/27/28/29).
+ *
+ * MEASURED 2026-08-29: those pins are NOT routed to the debug probe on the
+ * E1M-AEN801, so the "LaunchPad XDS110 default" does not carry over to this
+ * SoM.  A probe build was made to open UART2_0 and write every housekeeping
+ * tick; the firmware reported UART2_open() handle non-NULL, UART2_write()
+ * returning UART2_STATUS_SUCCESS, and 188988 bytes accepted -- while BOTH
+ * XDS110 COM ports (Class Auxiliary Data Port and Class Application/User
+ * UART) received ZERO bytes across a full cold boot.  The UART works; the
+ * wiring is absent.
+ *
+ * Consequences, so nobody re-runs this: there is no CC35 console on this SoM
+ * (confirming metadata/e1m_modules/aen/inter-chip.tsv, which wires only SPI +
+ * E_WIFI_NRST + WIFI_EN); the SDAA443 Network-Terminal/Calibrator path over
+ * the "Class Application/User UART" is unavailable here; and the UART cannot
+ * serve as an out-of-band read-back channel for the wedge probe.  All three
+ * need a free E1M pad muxed as UART, or a board rev.
  */
 
 /* ======== Kernel ======== */
