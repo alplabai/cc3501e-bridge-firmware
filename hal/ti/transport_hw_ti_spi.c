@@ -264,6 +264,22 @@ static struct {
 	 * RUNning, mid-transfer, or had fallen out of its FSM.  That is the exact
 	 * distinction the residual wedge turns on, and it was the one thing the
 	 * snapshot never captured (#21). */
+	/* Raw SPI interrupt status at the last tick.  RIS is PRE-MASK, so a bit sets
+	 * here whether or not the interrupt is enabled -- which is the whole point:
+	 * the SPIWFF3DMA driver never enables RTOUT (SPI_MIS_RTOUT_SET appears only
+	 * inside SPI_INT_ALL, and SPI_INT_ALL is passed ONLY to disableInterrupt() and
+	 * clearInterrupt(), never enableInterrupt(); the driver's working set is
+	 * SPI_INT_SUBSET = TXFF|RXFF|RXOF|IDLE).  So the receive-timeout condition can
+	 * be OBSERVED here without enabling anything and without changing the SPI
+	 * behaviour on a path that cannot be triggered on demand.
+	 *
+	 * That ordering is deliberate.  #21 proposes RTOUT as a replacement for the
+	 * 250 ms stall poll, and CTL0[12] CSCLR as slave-recovery from a truncated
+	 * CS-framed transfer -- CSCLR is never written by the driver either.  Both may
+	 * well be right, but arming either is a behaviour change on the wedge path,
+	 * and #5 established what that costs: five fixes, five bench cycles, three of
+	 * which moved nothing.  Measure first. */
+	uint32_t probe_spi_ris;
 	uint32_t probe_ch12sta;
 	uint32_t probe_ch12tsta;
 	uint32_t probe_ch13sta;
@@ -1062,6 +1078,9 @@ void bridge_transport_spi_probe_tick(void)
 	 * turned out not to be the address the silicon answers on and broke
 	 * GET_DIAG_INFO when read from a handler.  Confining a possibly-wrong
 	 * base to a bench-only build is the mitigation. */
+	g_persist.probe_spi_ris =
+	    (spi != NULL) ? HWREG(((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr + SPI_O_RIS)
+	                  : 0u;
 	g_persist.probe_ch12sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12STA);
 	g_persist.probe_ch12tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12TSTA);
 	g_persist.probe_ch13sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13STA);
@@ -1103,11 +1122,38 @@ void bridge_transport_spi_probe_tick(void)
  * Survives the warm reset that recovers the wedge.  The full 32-bit CH12/CH13
  * STA+TSTA words are in g_persist and readable over SWD when the nibble is not
  * enough. */
+/* BENCH ONLY: which word the probe reports in the free_heap slot.
+ *
+ * The packed word below is full -- all 32 bits carry something -- and the raw
+ * CH12/CH13 and SPI RIS registers do not fit.  Rather than widen
+ * GET_DIAG_INFO's fixed payload, the recorded log level doubles as a selector:
+ *
+ *   alp companion diag log-level 0  -> the packed summary (default)
+ *   alp companion diag log-level 1  -> raw SPI RIS
+ *   alp companion diag log-level 2  -> raw CH12STA
+ *   alp companion diag log-level 3  -> raw CH13STA
+ *
+ * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
+ * use in a bench-only build costs nothing and makes these registers readable
+ * without a debugger.  Never compiled into a shipping image. */
+extern volatile uint8_t g_cc3501e_log_level;
+
 uint32_t bridge_transport_spi_probe_read(void)
 {
 	if (!persist_writable()) {
 		return 0u;
 	}
+	switch (g_cc3501e_log_level) {
+	case 1u:
+		return g_persist.probe_spi_ris;
+	case 2u:
+		return g_persist.probe_ch12sta;
+	case 3u:
+		return g_persist.probe_ch13sta;
+	default:
+		break;
+	}
+
 	const uint32_t dma =
 	    (((g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u) ? 0x80u : 0u) |
 	    (((g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u) ? 0x40u : 0u) |
