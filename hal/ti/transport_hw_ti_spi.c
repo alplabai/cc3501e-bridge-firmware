@@ -194,6 +194,10 @@ volatile uint32_t g_spi_reopen_count;
  * already relies on. */
 volatile uint32_t g_arm_fail_count;
 
+/* Sticky SPI RX-overrun events observed at a polled frame boundary (#21).
+ * Counted, never acted on -- see spi_fifo_reset() for why. */
+volatile uint32_t g_rx_overrun_count;
+
 /* ---------------- persisted OTA-update-mode boot flag ------------------ */
 
 /* Magic armed by ALP_CC3501E_CMD_OTA_UPDATE_MODE (0x47) and consumed on the
@@ -689,11 +693,24 @@ static void spi_fifo_reset(void)
 	HWREG(base + SPI_O_CTL0) |= SPI_CTL0_FIFORST_RST_TRIG;
 	while ((HWREG(base + SPI_O_CTL0) & SPI_CTL0_FIFORST) == SPI_CTL0_FIFORST_RST_TRIG) {
 	}
-	/* Clear the sticky RX-overrun latch the blackout almost certainly set.  The
-	 * driver only ever clears it from its RX-overrun ISR, which the polling branch
-	 * never arms (SPIWFF3DMA.c:800-806 enables SPI_MIS_RXOVF_SET in the DMA branch
-	 * only), so without this it stays set for the rest of the boot and any future
-	 * unmask would fire on stale history. */
+	/* READ the sticky RX-overrun latch BEFORE clearing it, and count it.
+	 *
+	 * The latch still has to be cleared: the driver only ever clears it from its
+	 * RX-overrun ISR, which the polling branch never arms (SPIWFF3DMA.c:800-806
+	 * enables SPI_MIS_RXOVF_SET in the DMA branch only), so without this it stays
+	 * set for the rest of the boot and any future unmask fires on stale history.
+	 *
+	 * But clearing it BLIND -- which is what this did -- destroyed the only
+	 * evidence that an overrun ever happened.  The overrun is not hypothetical:
+	 * the blackout described above is expected to set it, and 'expected to' is
+	 * exactly the kind of claim that should be counted rather than assumed.
+	 * g_rx_overrun_count is deliberately only a COUNTER, read over SWD or folded
+	 * into a future DIAG field -- it drives no self-heal.  Wiring a recovery to a
+	 * signal nobody has yet observed firing would be the same mistake as the
+	 * re-init this transport just had removed from the BLE path (#5). */
+	if ((HWREG(base + SPI_O_RIS) & SPI_RIS_RXOVF_SET) != 0u) {
+		g_rx_overrun_count++;
+	}
 	HWREG(base + SPI_O_ICLR) = SPI_MIS_RXOVF_SET;
 }
 

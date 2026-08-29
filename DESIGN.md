@@ -206,9 +206,53 @@ came up is dropped.
   - `transport_hw_ti_spi.c`: the four-phase hardware-SS0 SPI-slave
     transport above (`SPI_open(..., SPI_PERIPHERAL, SPI_MODE_CALLBACK)`)
     with READY gating between phases.
-  - `transport_hw_ti_sdio.c`: frame glue complete; SDIO-device register
-    bring-up is the one SWRU626 §21 bench item (no public SDK SDIO-device
-    driver) — off the critical path, since SPI is the default.
+  - `transport_hw_ti_sdio.c`: frame glue complete; the SDIO-device
+    register bring-up remains to be written — off the critical path,
+    since SPI is the default.
+
+    The blocker here USED to be recorded as "needs SWRU626 §21 (no
+    public SDK SDIO-device driver)".  Half of that is wrong and the
+    correction matters, because it was being read as "the part may not
+    do device mode at all".  It does, and §21 is precisely where TI
+    documents it — §21.1: *"The SDIO module in the CC35xx acts as a SDIO
+    card peripheral to an external SDIO host."*  The device-mode blocks
+    are `SDIO_CARD_FN1` at `0x41B00000` (function 1 data path, §21.5)
+    and `SDIO_CORE` at `0x41B05000` (function 0 / CIA, §21.4), with
+    interrupt `SDIO CARD_IRQ` and uDMA peripheral indices 14 (RX) and
+    15 (TX).  That is a distinct peripheral from the SDMMC *host*
+    controller at `0x41912000`, which uses uDMA 12/13.  What is
+    genuinely absent is a public SDK SDIO-**device** driver, so the
+    register bring-up is ours to write; the documentation is not
+    missing.
+
+    Two requirements for whoever writes it, both from §21 and neither
+    obvious from the SPI transport:
+
+    - **The reply path needs an acknowledgement gate, not a
+      block-sent event.**  §21.3.7.2: *"packet N+1 is handled (i.e.
+      copied from internal memory) only after packet N is ACKED ...
+      CC35xx SDIO interface is a card with necessary read
+      acknowledgement."*  `IRQSTA` bit 6 is `HCIACK`, bit 7 `HCINACK`,
+      bit 8 `HCIWRRET`.  This is not cosmetic: the deferred `CMD_RESET`
+      reboot and the OTA `FINISH` swap-reboot are both armed by
+      `cc3501e_hw_notify_reply_sent()`, so wiring that to "block sent"
+      rather than to `HCIACK` lets either reboot fire on a packet the
+      host NACKed.
+    - **SDIO carries its own attention channel**, which the SPI link
+      has to fake.  §21.3.1 gives in-band or out-of-band host
+      interrupt, the OOB pin being `sdio_oob_irq` (`IOSEL 11h` on
+      `GPIO17PCFG` — the pad the bridge already uses for READY — and on
+      `GPIO_2`).  Better, `C2HMSG` (offset `30h`) carries bit 16
+      `C2HIRQ` plus a 16-bit event bitmap in `C2HSTS[15:0]`, cleared by
+      the host via `CLINTERD`, with `H2CMSG` (offset `34h`) for the
+      reverse.  An async event would then carry its own identity
+      instead of a bare edge, removing the 50 ms empty-drain backoff and
+      the attention-suppressed-while-busy limitation.
+
+    Note that on the E1M-AEN801 this transport is not merely optional,
+    it is unavailable: the Alif has a single SDIO controller and this
+    SoM commits it to the micro-SD card (see the transport table above).
+    SDIO therefore needs a board that makes the opposite choice.
 
 ## SimpleLink command structs: a zero-init is NOT a set of defaults
 
