@@ -28,9 +28,31 @@
 
 #include "../cc3501e_hw.h"
 
+/* Requested firmware log verbosity.  RECORDED, not yet consumed.
+ *
+ * This used to be `(void)level;` -- the level was discarded outright, so 0x71
+ * answered RESP_OK to a request it did not act on in any way, and a host had no
+ * way to tell that apart from a setting that took effect (#21).
+ *
+ * Being honest about it does NOT mean returning an error: the wire defines 0x71
+ * as an opaque level byte with no enum and no reply payload, and the host driver
+ * (chips/cc3501e/cc3501e_diag.c) treats a non-OK status as a failed command.
+ * Failing a call that the host has every right to make would be a worse lie than
+ * the one being fixed.
+ *
+ * So the level is recorded.  It is `volatile` and file-scope so it is readable
+ * over SWD, which makes "did the host's setting arrive" answerable on the bench
+ * -- the thing that was impossible before.  There is currently NO log sink in
+ * this firmware for it to gate: the three UARTs are idle and diagnostics ride
+ * the bridge, which is the separate finding in that cluster.  When a sink
+ * exists, this is the value it reads.  Until then RESP_OK means ACCEPTED AND
+ * RECORDED, not APPLIED -- the same semantic CMD_POWER_POLICY already documents
+ * for its deferred radio half. */
+volatile uint8_t g_cc3501e_log_level;
+
 int cc3501e_hw_set_log_level(uint8_t level)
 {
-	(void)level;
+	g_cc3501e_log_level = level;
 	return CC3501E_HW_OK;
 }
 
