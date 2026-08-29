@@ -615,6 +615,17 @@ void worker_run_pending(void)
 		 *      differing: with the double re-init `ble scan-stop` wedged every time
 		 *      ("scan stopped" then get_version -5); with the skip it did not.
 		 *
+		 *      TREAT THAT MECHANISM AS UNPROVEN (#60).  The same control run had two
+		 *      OTHER worker-routed BLE ops pay the identical double re-init and NOT
+		 *      wedge, and the exemption was applied to 2 of the 11 opcodes with that
+		 *      shape.  So "two back-to-back SPI_close/SPI_open wedges the link" does
+		 *      not follow from the evidence offered for it -- the correlation with
+		 *      scan-stop specifically is what was observed.  #48 later measured the
+		 *      scan-stop re-init itself as the wedge and removed it, which fits the
+		 *      observation better than the double-re-init story does.  The skip is
+		 *      kept for BLE_DISCONNECT because paying a re-init twice is pointless
+		 *      regardless, not because the wedge mechanism is established.
+		 *
 		 *   BLE_SCAN_STOP   -- skipped for the OPPOSITE reason.  #48 REMOVED the
 		 *      re-init from cc3501e_hw_ble_scan_stop() entirely, having measured that
 		 *      the re-init WAS the wedge (3/32 vs 1/104 booted trials).  So this path
@@ -628,6 +639,14 @@ void worker_run_pending(void)
 		 * Wlan_Disconnect() and returns -- so skipping the drain's left a Wlan_* radio
 		 * op with no SPI re-sync from either side, which is the exact gap the skip was
 		 * introduced to avoid double-paying.  It now takes the drain's re-init. */
+		/* KEEPING THIS LIST IN SYNC IS MANUAL, AND IT HAS ALREADY DRIFTED ONCE (#61).
+		 * The predicate below restates, here, a fact that actually lives in each HAL
+		 * body -- whether that body calls bridge_transport_spi_hw_reinit().  Nothing
+		 * enforces the correspondence: #48 removed the re-init from
+		 * cc3501e_hw_ble_scan_stop() and this list kept asserting the body still had
+		 * one, and WIFI_DISCONNECT sat here for its whole life with no re-init in its
+		 * body at all.  If you add or remove a bridge_transport_spi_hw_reinit() in any
+		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change. */
 		const bool body_already_reinit =
 		    (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) || (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
