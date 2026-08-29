@@ -131,6 +131,10 @@
  * macro as a division and reformats it into a broken header name. */
 #include <ti/devices/DeviceFamily.h>
 #include <ti/devices/cc35xx/inc/hw_spi.h>
+#ifdef CC3501E_WEDGE_PROBE
+#include <ti/devices/cc35xx/inc/hw_host_dma.h> /* CH12/13 STA+TSTA -- wedge probe only */
+#include <ti/devices/cc35xx/inc/hw_memmap.h>   /* HOST_DMA_TGT_BASE */
+#endif
 #include <ti/devices/cc35xx/inc/hw_types.h>
 
 #include "../../src/protocol.h"
@@ -246,8 +250,20 @@ static struct {
 	                         * ~0 => the task stopped when the link did. */
 	uint32_t probe_resync;  /* g_resync_count at the last tick */
 	uint32_t probe_armfail; /* g_arm_fail_count at the last tick */
-	uint8_t  probe_phase;   /* enum spi_phase the slave was parked in */
-	uint8_t  probe_flags;   /* bit0 reply_armed, bit1 is_dead, bit2 polled */
+	/* The DMA channels this transport actually runs on (12 = RX, 13 = TX; the
+	 * FREE host-DMA channels, radio uses 0-11).  CHnSTA names the channel state
+	 * DIRECTLY -- HWEVENT[2:0], FSMSTATE[11:8], RUN[16] -- and CHnTSTA[0] STA is
+	 * the transfer-active bit.  Without these the probe could say the task was
+	 * alive and the phase was parked, but not whether the DMA engine was still
+	 * RUNning, mid-transfer, or had fallen out of its FSM.  That is the exact
+	 * distinction the residual wedge turns on, and it was the one thing the
+	 * snapshot never captured (#21). */
+	uint32_t probe_ch12sta;
+	uint32_t probe_ch12tsta;
+	uint32_t probe_ch13sta;
+	uint32_t probe_ch13tsta;
+	uint8_t  probe_phase; /* enum spi_phase the slave was parked in */
+	uint8_t  probe_flags; /* bit0 reply_armed, bit1 is_dead, bit2 polled */
 #endif
 } g_persist __attribute__((section(".TI.noinit")));
 
@@ -1033,6 +1049,17 @@ void bridge_transport_spi_probe_tick(void)
 	g_persist.probe_resync  = g_resync_count;
 	g_persist.probe_armfail = g_arm_fail_count;
 	g_persist.probe_phase   = (uint8_t)phase;
+	/* Host-DMA channel state.  HOST_DMA_TGT_BASE is the ONLY DMA base in
+	 * hw_memmap.h.  Read here and nowhere else: this whole block is
+	 * CC3501E_WEDGE_PROBE-only and never in a shipping image, which matters
+	 * because a base constant from this same header (PRCM_SCRATCHPAD_BASE)
+	 * turned out not to be the address the silicon answers on and broke
+	 * GET_DIAG_INFO when read from a handler.  Confining a possibly-wrong
+	 * base to a bench-only build is the mitigation. */
+	g_persist.probe_ch12sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12STA);
+	g_persist.probe_ch12tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12TSTA);
+	g_persist.probe_ch13sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13STA);
+	g_persist.probe_ch13tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13TSTA);
 #ifndef CC3501E_READY_GPIO
 #define CC3501E_READY_GPIO 17u /* mirrors cc3501e_hw_ti_gpio.c -- CC35 GPIO17 -> Alif P2_6 */
 #endif
@@ -1047,17 +1074,45 @@ void bridge_transport_spi_probe_tick(void)
 	              (g_polled ? 4u : 0u) | (GPIO_read(CC3501E_READY_GPIO) ? 8u : 0u));
 }
 
-/* Packed read-back for GET_DIAG_INFO: phase(4) | flags(4) | resync(8) | armfail(8)
- * | ticks(8, low byte).  Survives the warm reset that recovers the wedge. */
+/* Packed read-back for GET_DIAG_INFO, riding the free_heap slot.  Layout:
+ *
+ *   [31:28] phase    enum spi_phase the slave was parked in
+ *   [27:24] flags    bit0 reply_armed, bit1 is_dead, bit2 polled, bit3 READY level
+ *   [23:16] dma      the DMA state this probe existed to capture and never did:
+ *                      bit23 CH12STA.RUN      (RX channel running)
+ *                      bit22 CH12TSTA.STA     (RX transfer active)
+ *                      bit21 CH13STA.RUN      (TX channel running)
+ *                      bit20 CH13TSTA.STA     (TX transfer active)
+ *                      [19:16] CH12STA.FSMSTATE
+ *   [15:12] resync   g_resync_count, saturating (burst detection, not a total)
+ *   [11:8]  armfail  g_arm_fail_count, saturating (likewise)
+ *   [7:0]   quiet    ticks since the last completed transfer, saturating
+ *
+ * resync/armfail were 8 bits each.  They are burst INDICATORS -- the tick
+ * self-heal keys off "did this move", not off the magnitude -- so 4 bits each is
+ * ample and it buys the byte the DMA state needs without touching the wire
+ * format.  That matters: this rides free_heap precisely so GET_DIAG_INFO's fixed
+ * payload does not change (#21).
+ *
+ * Survives the warm reset that recovers the wedge.  The full 32-bit CH12/CH13
+ * STA+TSTA words are in g_persist and readable over SWD when the nibble is not
+ * enough. */
 uint32_t bridge_transport_spi_probe_read(void)
 {
 	if (!persist_writable()) {
 		return 0u;
 	}
+	const uint32_t dma =
+	    (((g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u) ? 0x80u : 0u) |
+	    (((g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u) ? 0x40u : 0u) |
+	    (((g_persist.probe_ch13sta & HOST_DMA_CH13STA_RUN) != 0u) ? 0x20u : 0u) |
+	    (((g_persist.probe_ch13tsta & HOST_DMA_CH13TSTA_STA) != 0u) ? 0x10u : 0u) |
+	    ((g_persist.probe_ch12sta & HOST_DMA_CH12STA_FSMSTATE_M) >> HOST_DMA_CH12STA_FSMSTATE_S);
+
 	return ((uint32_t)(g_persist.probe_phase & 0x0Fu) << 28) |
-	       ((uint32_t)(g_persist.probe_flags & 0x0Fu) << 24) |
-	       ((uint32_t)(g_persist.probe_resync & 0xFFu) << 16) |
-	       ((uint32_t)(g_persist.probe_armfail & 0xFFu) << 8) |
+	       ((uint32_t)(g_persist.probe_flags & 0x0Fu) << 24) | ((dma & 0xFFu) << 16) |
+	       ((uint32_t)(g_persist.probe_resync > 0x0Fu ? 0x0Fu : g_persist.probe_resync) << 12) |
+	       ((uint32_t)(g_persist.probe_armfail > 0x0Fu ? 0x0Fu : g_persist.probe_armfail) << 8) |
 	       (uint32_t)(g_persist.probe_quiet > 0xFFu ? 0xFFu : g_persist.probe_quiet);
 }
 #endif
