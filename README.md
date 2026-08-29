@@ -118,8 +118,25 @@ The current E1M-AEN rev (FIB v0.0.207, validated on E1M-AEN801) wires SPI with *
 **Use the prebuilt blob.**  Building from source needs TI ticlang 5.1.1, the
 SimpleLink Wi-Fi SDK 10.10.01.08, SysConfig 1.28.0 and the Wi-Fi toolbox 4.2.4
 installed and on the right paths -- a long toolchain to require of anyone who
-just wants a working companion.  The signed blob in `prebuilt/` is the same
-image, already built and signed:
+just wants a working companion.  The signed blob in `prebuilt/` is already
+built and signed:
+
+> **The newest prebuilt is NOT current `main`.**  `cc3501e-v0.4.1.bin` was last
+> updated in `9b15f7f` (2026-08-28); **32 commits have landed in `src/`, `hal/`
+> and `ti/` since**, including the socket-EOF repair (#32), the
+> `WIFI_DISCONNECT` SPI re-sync (#35), the open-drain pad-mask fix (#50) and the
+> BLE `scan-stop` re-init removal that took the #5 wedge from ~9% to ~1%.  This
+> section used to say the blob "is the same image" as a source build; that is no
+> longer true, and it is the claim customers rely on when they flash it.
+>
+> The `prebuilt integrity` CI gate does **not** catch this -- it verifies each
+> blob against its own `.sha256` only, so an arbitrarily stale prebuilt passes
+> green.  Tracked in #75, which also proposes the gate change.
+>
+> Until a new signed release is cut, build from source if you need the fixes
+> above.  Do **not** flash an unsigned locally-built blob in place of the
+> prebuilt: step 1 below is a signature check that only the released artifact
+> can pass.
 
 ```sh
 # 1. Verify what you are about to flash (never skip this).
