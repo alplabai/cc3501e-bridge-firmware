@@ -1,0 +1,38 @@
+# Which commit the newest prebuilt blob was built from, and which later
+# firmware commits have been VERIFIED to leave that blob byte-identical.
+#
+# Why this file exists.  The `prebuilt freshness` CI job used to compare commit
+# DATES: it failed when any commit touching src/, hal/ or ti/ was newer than the
+# prebuilt.  That is right about the property it protects -- a stale blob shipped
+# for 32 commits under a green `prebuilt integrity` (#75) -- but it cannot tell a
+# real firmware change from one that provably does not alter the image.  #79 was
+# the second kind: it guarded a global the linker was already dead-stripping, the
+# rebuilt .out was byte-identical, and the gate went red anyway and STAYED red on
+# every later PR.  A permanently red gate is how a real staleness gets waved
+# through, which is the exact failure #75 was about.
+#
+# So the check is now an ATTESTATION, not a date heuristic.  Every commit
+# touching src/, hal/ or ti/ after `built-from` must be listed under `inert:`,
+# with evidence, or the gate fails.  Nothing is auto-forgiven: adding a line here
+# is a deliberate claim that the shipped binary still corresponds to the source.
+#
+# CI cannot verify an `inert:` claim itself -- rebuilding needs license-gated TI
+# ticlang, which is not in CI -- so the claim is only as good as the evidence
+# quoted beside it.  Rebuild and compare before adding a line; do not add one to
+# get a PR green.
+#
+# When cutting a real release: bump `built-from` to the release commit, update
+# `image-sha256`, and DELETE every `inert:` line (they described the old blob).
+
+built-from:   4e5bfd665e9cf7e5ed76d979769ce65e7f34f6aa
+image-sha256: 980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109
+
+# Later src/hal/ti commits verified not to change the image.
+#   8ddfff2  fix(ti): guard g_adc_probe_stat behind CC3501E_WEDGE_PROBE (#79)
+#            Guards a definition that was already dead-stripped because nothing
+#            outside CC3501E_WEDGE_PROBE referenced it.  Rebuilt with the guard:
+#            build/ti/cc3501e-bridge.out sha256
+#            de4b6c4b6d2d0244e4c3b97d24e12358fb9babe01d01abf6d2afb22293720faf,
+#            byte-identical to the pre-change build, and the resulting .bin
+#            matched image-sha256 above exactly.
+inert: 8ddfff2773343a6f90f2193676c64f29a95d3760
