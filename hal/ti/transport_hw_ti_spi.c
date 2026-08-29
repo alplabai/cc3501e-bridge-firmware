@@ -1146,6 +1146,7 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag log-level 2  -> raw CH12STA
  *   alp companion diag log-level 3  -> raw CH13STA
  *   alp companion diag log-level 4  -> raw SOC_AON ERRSRIS
+ *   alp companion diag log-level 5  -> boots (retention witness)
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1166,6 +1167,15 @@ uint32_t bridge_transport_spi_probe_read(void)
 		return g_persist.probe_ch13sta;
 	case 4u:
 		return g_persist.probe_err_ris;
+	case 5u:
+		/* boots -- the RETENTION WITNESS.  g_persist lives in .TI.noinit and
+		 * boots increments once per boot only when the magic pair already
+		 * validates.  So scrubbed RAM reads 1 on every boot while retained RAM
+		 * counts up.  That is what makes a warm reset usable as the probe
+		 * read-back path: without it, an idle snapshot taken after a reset is
+		 * indistinguishable from a fresh one, and the whole probe is unreadable
+		 * on a bench with no SWD memory-read tool. */
+		return g_persist.boots;
 	default:
 		break;
 	}
