@@ -239,9 +239,41 @@ int cc3501e_hw_ble_scan_stop(void)
 	if (!cc3501e_nimble_host_is_enabled()) {
 		return CC3501E_HW_ERR_NOTIMPL; /* BLE not enabled yet -> NOT_READY */
 	}
-	cc3501e_bridge_busy(); /* fence the host off across the radio op + reinit (#1691) */
+	/* NO bridge_transport_spi_hw_reinit() HERE -- IT WAS THE WEDGE (#5).
+	 *
+	 * The re-init on this path was never justified for BLE.  It entered the tree
+	 * in 6f6679c as a WI-FI fix with a specific, named mechanism: Wlan_Start's
+	 * HIFInit re-points the shared host-DMA and the NWP IRQ to bring up the
+	 * host<->NWP link, which really does tear the bridge slave down (the host then
+	 * reads 0x00000000 from a dead link).  ble_gap_disc_cancel() calls nothing of
+	 * the kind -- it is a NimBLE GAP call to the controller.  The re-init was
+	 * pattern-copied onto the BLE bodies, the BLE paths then started wedging, and
+	 * #1691 added a cc3501e_bridge_busy()/_ready() fence to PROTECT the copied
+	 * re-init rather than asking whether it belonged here at all.
+	 *
+	 * That fence cannot work on this board rev: READY (GPIO17 -> Alif P2_6) is an
+	 * OPEN CONNECTION -- 0 edges in 20000 samples -- so the host never sees busy
+	 * and clocks straight through the SPI_close/SPI_open.  Every re-init here was
+	 * therefore an unfenced teardown, i.e. a coin flip against the host.  worker.c
+	 * had already reached the same conclusion for the socket path, where the fix
+	 * was to SKIP the re-init rather than to fence it harder.
+	 *
+	 * Bench-measured on the E1M-AEN801, same protocol both arms, `ver` gating the
+	 * boot so a dead-on-arrival part is not counted as a scan-stop failure:
+	 *
+	 *     with this re-init : 3 scan-stop failures /  32 booted trials  (9.4%)
+	 *     without it        : 1 scan-stop failure  / 104 booted trials  (1.0%)
+	 *     Fisher exact, one-sided: p = 0.0405
+	 *
+	 * NOT zero -- one failure survives in 104.  Removing this re-init takes the
+	 * scan-stop wedge from ~9% to ~1%; it does not eliminate it.  Whatever is
+	 * left is a separate, rarer mechanism and needs its own measurement rather
+	 * than another guess at this line.
+	 *
+	 * The busy()/ready() bracket is KEPT.  It is inert on this board rev, but it
+	 * is correct on a rev that wires READY, and it costs nothing. */
+	cc3501e_bridge_busy();
 	const int rc = cc3501e_nimble_scan_stop();
-	bridge_transport_spi_hw_reinit();
 	cc3501e_bridge_ready();
 	return (rc == 0) ? CC3501E_HW_OK : CC3501E_HW_ERR_IO;
 }
