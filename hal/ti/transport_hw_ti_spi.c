@@ -215,7 +215,13 @@ volatile uint32_t g_rx_overrun_count;
  * mode, and update mode has no other recovery (see the file header).
  *
  * WARNING: RAM retention across SYSRESETREQ is an ASSUMPTION on this silicon,
- * not a code-proven fact.  ResetISR (ti/startup_ticlang_local.c) does not scrub
+ * not a code-proven fact.  (This argument used to cite ResetISR in
+ * ti/startup_ticlang_local.c.  That file is NOT COMPILED BY ANY BUILD -- see
+ * build_ti.ps1's "Do NOT link a separate startup file" note -- so the evidence
+ * was worthless even though the conclusion happens to hold.  The REAL reset
+ * path is resetISR in the SDK's kernel/freertos/startup/startup_cc35xx_ticlang.c,
+ * reached via ti_freertos_config.c's #include; it only sets SP and branches to
+ * _c_int00.)  That resetISR does not scrub
  * RAM and --rom_model auto-init only touches sections listed in the .cinit
  * table, but the CC35xx SES/boot ROM runs BEFORE ResetISR and its source is not
  * in this repo.  Hence the magic + complement pair -- anything short of an exact

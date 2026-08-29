@@ -382,7 +382,10 @@ int cc3501e_hw_set_power_policy(uint8_t policy, uint8_t wake_events, uint32_t id
  * with no radio return true. */
 bool cc3501e_hw_power_radio_ok(void);
 
-/* Set firmware log verbosity (0 = off).  Firmware-side config -> OK. */
+/* Set firmware log verbosity (0 = off).  OK means ACCEPTED AND RECORDED, not
+ * APPLIED: the ti backend stores the level but no log sink consumes it yet
+ * (the UARTs are idle and diagnostics ride the bridge).  Same semantic as
+ * cc3501e_hw_power_policy()'s deferred radio half. */
 int cc3501e_hw_set_log_level(uint8_t level);
 
 /* Diagnostics sources for GET_DIAG_INFO (best-effort; 0 / UNKNOWN when the
