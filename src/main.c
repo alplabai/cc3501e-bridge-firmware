@@ -142,8 +142,11 @@ static void bringup_task(void *arg)
 		 * yields -- FlashWFF3's uDMA waits and XMEMWFF3's deadline polls are bare
 		 * spins -- so a SECOND, lower-priority task parked in SPI_transfer would be
 		 * off-CPU for the whole op just the same, and TI caps what an armed-but-
-		 * unserviced slave can absorb at 8 frames of RX FIFO before it silently
-		 * overruns (SPIWFF3DMA.h:84-86, :97).  A HIGHER-priority poll task cannot
+		 * unserviced slave can absorb at 32 BYTES of RX FIFO before it silently
+		 * overruns (SWRU626 ch.18 gives 32 LOCATIONS and this transport configures
+		 * an 8-bit data size; SPIWFF3DMA.h:84-86, :97).  #41 corrected this figure
+		 * from "8 frames" in transport_hw_ti_spi.c and left the identical claim
+		 * here, where it is load-bearing for the single-task OTA loop below (#65).  A HIGHER-priority poll task cannot
 		 * exist either: spiPollingTransfer is a busy-spin with SPI_WAIT_FOREVER (a
 		 * peripheral only gets the polling branch when transferTimeout IS
 		 * SPI_WAIT_FOREVER, SPIWFF3DMA.c:774-777) and configUSE_TIME_SLICING is 0, so
