@@ -211,8 +211,18 @@ volatile uint32_t g_rx_overrun_count;
  * returned UNINITIALISED RAM -- which changed on every boot and looked exactly
  * like a live counter.  Explicit status, zero-initialised, removes that trap:
  *   bit31 open attempted   bit30 handle non-NULL   bit29 a convert SUCCEEDED
- *   bits[15:0] successful-convert count */
+ *   bits[15:0] successful-convert count
+ *
+ * Guarded, unlike g_arm_fail_count and g_rx_overrun_count above.  Those two are
+ * written and read by the shipping tick path, so they belong in every build;
+ * this one is touched ONLY inside the CC3501E_WEDGE_PROBE region below.  Left
+ * unguarded it was a bench-diagnostic global sitting in shipping source, absent
+ * from the image only because the linker dead-strips an unreferenced definition
+ * -- which is luck, not intent, and stops being true the moment anything reads
+ * it. */
+#ifdef CC3501E_WEDGE_PROBE
 volatile uint32_t g_adc_probe_stat;
+#endif
 
 /* ---------------- persisted OTA-update-mode boot flag ------------------ */
 
