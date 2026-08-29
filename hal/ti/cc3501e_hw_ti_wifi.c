@@ -79,6 +79,10 @@ static bool wifi_started;
  * worker / the bridge SPI re-open).  Shared by scan + connect so RoleUp runs once. */
 static bool wifi_sta_role_up;
 
+/* Role-up/down budget, shared by the STA and AP paths so they cannot drift.
+ * 10000 ms is the value the STA path has used since bring-up. */
+#define CC3501E_WIFI_ROLE_TIMEOUT_MS 10000u
+
 /* AP role-up latch, mirroring wifi_sta_role_up.  Set on a successful
  * Wlan_RoleUp(AP), cleared on a successful Wlan_RoleDown(AP), and reported via
  * cc3501e_hw_radio_role() -> GET_DIAG_INFO's `role` field.  This is firmware
@@ -469,7 +473,7 @@ static int cc3501e_hw_wifi_ensure_sta_role(void)
 	 * LOCK_TCPIP_CORE deadlocks the worker.  Wlan_RoleUp(STA) binds the already-
 	 * registered netif, which is what the connect EAPOL/SAE handshake flows over. */
 	RoleUpStaCmd_t staParams = { 0 };
-	if (Wlan_RoleUp(WLAN_ROLE_STA, &staParams, 10000u) < 0) {
+	if (Wlan_RoleUp(WLAN_ROLE_STA, &staParams, CC3501E_WIFI_ROLE_TIMEOUT_MS) < 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_sta_role_up = true;
@@ -882,7 +886,20 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	ap.secParams.Type             = (uint8_t)cc3501e_wifi_sec(security);
 	ap.secParams.Key              = (int8_t *)psk;
 	ap.secParams.KeyLen           = psk_len;
-	if (Wlan_RoleUp(WLAN_ROLE_AP, &ap, WLAN_WAIT_FOREVER) != 0) {
+	/* Bounded, like the STA role-up above and for the same reason this file
+	 * already states at the wifi_sta_role_up latch: "a stuck role-up must
+	 * never hang the worker / the bridge SPI re-open".  This call was the
+	 * one place that ignored that rule.
+	 *
+	 * WIFI_AP_START is worker-routed, and worker_run_pending() holds
+	 * cc3501e_bridge_busy() (READY LOW) across worker_execute().  An AP
+	 * RoleUp the NWP never command-completes therefore blocks the drain
+	 * FOREVER: the post-op bridge_transport_spi_hw_reinit() and the READY
+	 * raise are never reached, the SPI slave is never re-armed, and every
+	 * later host command fails until a power cycle.  Same 10000 ms budget as
+	 * the STA path; a timeout maps to ERR_IO so the drain always returns and
+	 * re-arms the bridge.  Issue #5. */
+	if (Wlan_RoleUp(WLAN_ROLE_AP, &ap, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_ap_role_up = true;
@@ -895,7 +912,12 @@ int cc3501e_hw_wifi_ap_stop(void)
 	if (!wifi_started) {
 		return CC3501E_HW_OK;
 	}
-	if (Wlan_RoleDown(WLAN_ROLE_AP, WLAN_WAIT_FOREVER) != 0) {
+	/* Bounded for the same reason as the role-up.  This one is the more
+	 * dangerous of the two in practice: BRINGUP_STATUS.md warns "do NOT use
+	 * `ap-stop` to reset, it wedges the bridge (alp-sdk#1564)", and an
+	 * unbounded RoleDown inside the worker drain is exactly a mechanism that
+	 * produces that.  Issue #5. */
+	if (Wlan_RoleDown(WLAN_ROLE_AP, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_ap_role_up = false;
