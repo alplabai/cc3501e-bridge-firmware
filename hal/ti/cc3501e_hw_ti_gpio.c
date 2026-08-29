@@ -104,21 +104,29 @@ static void gpio_irq_cb(uint_least8_t index)
  * the net's pull-up decide.  Never drive high.
  *
  * Tracked per pad because cc3501e_hw_gpio_write() has to know whether a 1 means
- * "drive high" (push-pull) or "let go" (open-drain).  GPIO_pinUpperBound is well
- * under 32 on this part; the bit index is bounds-checked before every use. */
-static uint32_t od_pads;  /* bit N set: pad N configured OPEN_DRAIN */
-static uint32_t od_pulls; /* bit N set: that pad wants the internal pull-up */
+ * "drive high" (push-pull) or "let go" (open-drain).
+ *
+ * 64-bit, and that width is load-bearing.  This started as a uint32_t on the
+ * claim that "GPIO_pinUpperBound is well under 32 on this part".  It is 37 --
+ * ti_drivers_config.c: `const uint_least8_t GPIO_pinUpperBound = 37;` -- so that
+ * claim was simply false, and it cost two defects: configuring pad 32..37 as
+ * OUTPUT/INPUT masked its index with `& 31u` and silently cleared the open-drain
+ * registration of pad 0..5, after which releasing THAT pad drove its net HIGH
+ * push-pull; and OPEN_DRAIN on pad 32..37 hard-failed ERR_INVAL where it had
+ * previously been accepted.  A 64-bit mask covers 0..63 and removes both. */
+static uint64_t od_pads;  /* bit N set: pad N configured OPEN_DRAIN */
+static uint64_t od_pulls; /* bit N set: that pad wants the internal pull-up */
 
 static bool pad_is_open_drain(uint8_t pad)
 {
-	return (pad < 32u) && ((od_pads & ((uint32_t)1u << pad)) != 0u);
+	return (pad < 64u) && ((od_pads & ((uint64_t)1u << pad)) != 0u);
 }
 
 /* Release an open-drain pad: output disabled, so the net floats to whatever the
  * external pull-up (or another driver) decides. */
 static int od_release(uint8_t pad)
 {
-	const GPIO_PinConfig pull = ((od_pulls & ((uint32_t)1u << pad)) != 0u)
+	const GPIO_PinConfig pull = ((od_pulls & ((uint64_t)1u << pad)) != 0u)
 	                                ? GPIO_CFG_PULL_UP_INTERNAL
 	                                : GPIO_CFG_PULL_NONE_INTERNAL;
 	return (GPIO_setConfig(pad, GPIO_CFG_INPUT_INTERNAL | pull | GPIO_CFG_IN_INT_NONE) == 0)
@@ -139,27 +147,27 @@ int cc3501e_hw_gpio_configure(uint8_t pad, uint8_t dir, uint8_t pull)
 	case ALP_CC3501E_GPIO_DIR_OUTPUT:
 		/* push-pull, start low; host sets the level with GPIO_WRITE. */
 		cfg = GPIO_CFG_OUTPUT_INTERNAL | pull_cfg | GPIO_CFG_OUT_LOW;
-		od_pads &= ~((uint32_t)1u << (pad & 31u));
+		od_pads &= ~((uint64_t)1u << pad);
 		break;
 	case ALP_CC3501E_GPIO_DIR_OPEN_DRAIN:
 		/* Emulated -- see the od_pads note above.  Register the pad and leave
 		 * it RELEASED (Hi-Z), the deasserted state of an open-drain line.
 		 * cc3501e_hw_gpio_write() drives low to assert and returns to Hi-Z to
 		 * release; it never drives the line high. */
-		if (pad >= 32u) {
-			return CC3501E_HW_ERR_INVAL; /* od_pads is a 32-bit mask */
+		if (pad >= 64u) {
+			return CC3501E_HW_ERR_INVAL; /* od_pads is a 64-bit mask */
 		}
-		od_pads |= ((uint32_t)1u << pad);
+		od_pads |= ((uint64_t)1u << pad);
 		if (pull == ALP_CC3501E_GPIO_PULL_UP) {
-			od_pulls |= ((uint32_t)1u << pad);
+			od_pulls |= ((uint64_t)1u << pad);
 		} else {
-			od_pulls &= ~((uint32_t)1u << pad);
+			od_pulls &= ~((uint64_t)1u << pad);
 		}
 		return od_release(pad);
 	case ALP_CC3501E_GPIO_DIR_INPUT:
 	default:
 		cfg = GPIO_CFG_INPUT_INTERNAL | pull_cfg | GPIO_CFG_IN_INT_NONE;
-		od_pads &= ~((uint32_t)1u << (pad & 31u));
+		od_pads &= ~((uint64_t)1u << pad);
 		break;
 	}
 	return (GPIO_setConfig(pad, cfg) == 0) ? CC3501E_HW_OK : CC3501E_HW_ERR_IO;
@@ -314,6 +322,16 @@ int cc3501e_hw_gpio_set_interrupt(uint8_t pad, uint8_t edge, uint8_t enabled)
 {
 	if (!gpio_pad_ok(pad)) {
 		return CC3501E_HW_ERR_INVAL;
+	}
+	/* Both paths below reconfigure the pad as an INPUT, so it is no longer an
+	 * open-drain output and must not stay registered as one.  Missing this let a
+	 * pad that was OPEN_DRAIN and is now an interrupt input keep its od_pads bit:
+	 * a later GPIO_WRITE would then take the open-drain path and silently replace
+	 * the interrupt configuration with an output.  #50 claimed "the OUTPUT and
+	 * INPUT cases clear the bit so a re-configure cannot leave a pad
+	 * half-registered" -- true of cc3501e_hw_gpio_configure(), false here. */
+	if (pad < 64u) {
+		od_pads &= ~((uint64_t)1u << pad);
 	}
 	if (enabled == 0u || edge == ALP_CC3501E_GPIO_EDGE_NONE) {
 		/* Disable: back to a plain interrupt-free input. */
