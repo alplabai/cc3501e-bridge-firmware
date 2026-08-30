@@ -16,8 +16,8 @@ ping_request                       = 00000000
 ping_reply_ok                      = 000008000000000000000000
 # cmd=GET_VERSION | flags=0 | len=0
 get_version_request                = 01000000
-# cmd=GET_VERSION | len=3 | status=OK | version=5 (LE16)
-get_version_reply_proto5           = 010008000005000000000000
+# cmd=GET_VERSION | len=3 | status=OK | version=6 (LE16)
+get_version_reply_proto6           = 010008000006000000000000
 # cmd=GET_MAC | flags=0 | len=0
 get_mac_request                    = 03000000
 # cmd=GET_MAC | len=1 | status=BUSY -- job submitted, host re-issues
@@ -46,5 +46,9 @@ get_pending_events_request         = 05000000
 get_pending_events_reply_empty     = 050008000000000000000000
 # cmd=GET_PENDING_EVENTS | status=OK | [WIFI_CONNECTED len0][WIFI_DISCONNECTED len0]
 get_pending_events_reply_wifi_conn_disc = 050008000019001A00000000
+# cmd=SPI1_TRANSFER | len=4 flags=0 seq=1 tx_fill=0 | tx=DEADBEEF packed inline, no padding
+spi1_transfer_request              = 56000C000400000100000000DEADBEEF
+# cmd=SPI1_TRANSFER | status=OK | rx_len=4 flags=0 seq=1 | rx=DEADBEEF, self-delimiting before the REPLY_PAD padding
+spi1_transfer_reply_ok             = 560010000004000001DEADBEEF00000000000000
 # reply to a frame whose payload_len mismatches the byte count -> PROTOCOL error
 ping_bad_len_reply_protocol        = 000008000700000000000000

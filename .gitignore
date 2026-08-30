@@ -9,9 +9,10 @@ build/
 build-tests/
 build-linux/
 # CONTRIBUTING.md documents the stub build as build/stub (covered by build/
-# above), but this hyphenated spelling is an easy slip and  swept
-# one into a commit while writing THIS rule set.  Cover it too.
-build-stub/
+# above), but any hyphenated build-<name>/ dir (build-stub/, build-spi/,
+# build-sdio/, ...) is the same easy slip -- a literal build-stub/ rule
+# already missed build-spi/ and build-sdio/ once.  Cover the whole family.
+build*/
 
 # Binary firmware images.  prebuilt/.gitignore re-includes `cc3501e-*.bin`
 # because the signed prebuilt images shipped there ARE committed -- but that

@@ -14,8 +14,9 @@
  *
  * The surface below is grouped by command family and now covers the
  * whole bridge: chip init, the idle housekeeping tick, the factory MAC
- * read and a deferred self-reset, plus the GPIO proxy, camera enables,
- * Wi-Fi, sockets, BLE, OTA, power policy and diagnostics.  Each group
+ * read and a deferred self-reset, plus the GPIO proxy, camera enables, the
+ * SPI1 host passthrough, Wi-Fi, sockets, BLE, OTA, power policy and
+ * diagnostics.  Each group
  * sits beside the protocol handlers that call it.
  */
 
@@ -121,6 +122,100 @@ int cc3501e_hw_gpio_set_interrupt(uint8_t pad, uint8_t edge, uint8_t enabled);
  * CAM_EN_LDO0 = GPIO_1 (pin54), 1 -> CAM_EN_LDO1 = GPIO_0 (pin55); @p on != 0
  * asserts the enable.  Default OFF at boot. */
 int cc3501e_hw_cam_enable(uint8_t which, uint8_t on);
+
+/* --------------------------------------------------------------- */
+/* SPI1 host passthrough (v0.6)                                      */
+/* --------------------------------------------------------------- */
+
+/* The E1M connector's SPI1 lands on the CC3501E, NOT on the Alif
+ * (E1M-AEN-2626-R2 netlist: AG10 SPI1_SCLK -> CC35 GPIO_32, AG9
+ * SPI1_MOSI -> GPIO_33, AG8 SPI1_MISO -> GPIO_34, AH9 SPI1_CS0 ->
+ * GPIO_31, AH8 SPI1_CS1 -> GPIO_15).  The host therefore cannot reach a
+ * device on that bus directly; it reaches it by RELAY -- the CC3501E is
+ * the SPI CONTROLLER and the host supplies the bytes, over
+ * CMD_SPI1_CONFIGURE / _TRANSFER / _RELEASE (0x55..0x57).
+ *
+ * NOT the inter-chip bridge.  That is CC35 SPI0 (SCK GPIO_27, MISO
+ * GPIO_28, MOSI GPIO_29, CSN GPIO_16), configured as a SLAVE, and it is
+ * the link these very commands arrive over -- re-muxing one of those
+ * pads bricks it.  Pads 15/31/32/33/34 belong to SPI1 for the same
+ * reason 16/27/28/29 belong to SPI0: a GPIO-proxy write to one of them
+ * re-muxes SCK out from under an in-flight controller transfer, so they
+ * belong in the ti backend's gpio_pad_reserved() list.
+ *
+ * ALL THREE ARE WORKER-ROUTED at the protocol layer, and that is not a
+ * style preference: a polled 4088-byte controller transfer is ~800 us of
+ * bus time at 10 MHz.  Run from the SPI0 dispatch callback it would stall
+ * the slave's re-arm for that whole window -- the desync/wedge signature
+ * this firmware spent months chasing.  SPI_open() can block on a power
+ * domain, so CONFIGURE goes off-ISR too.  Do not call any of these from
+ * dispatch context. */
+
+/* Acquire the SPI1 controller and pin the bus parameters until the next
+ * configure or release.  Idempotent: re-issuing it re-opens with the new
+ * parameters.  @p mode is (CPOL << 1) | CPHA (0..3); @p bits_per_word is 8
+ * (the only width this rev accepts); @p cs picks the SOFTWARE-driven select,
+ * 0 = GPIO_31 (E1 AH9), 1 = GPIO_15 (E1 AH8).  The wire layer range-checks
+ * all three before calling, so a backend need not re-validate them.
+ *
+ * Both selects are software-driven because the SPIWFF3DMA driver carries
+ * exactly ONE hardware csnSel per SPI_Config entry, so one instance cannot
+ * hardware-frame two selects.  Consequence for callers: CS edges are
+ * scheduler-timed, not clock-edge-exact.
+ *
+ * @p actual_freq_hz_out (may be NULL) receives the rate the divider actually
+ * produced -- the reply carries it precisely because a real clock divides and
+ * the host must not assume it got what it asked for.
+ *
+ * CC3501E_HW_ERR_IO here means SPI_open() failed.  The wire layer maps it to
+ * RESP_ERR_RADIO, which on this family means BUS-level open failure, NOT an RF
+ * problem, and the host RETRIES it -- correct, because a handle not yet closed
+ * can free up on its own. */
+int cc3501e_hw_spi1_configure(uint32_t  freq_hz,
+                              uint8_t   mode,
+                              uint8_t   bits_per_word,
+                              uint8_t   cs,
+                              uint32_t *actual_freq_hz_out);
+
+/* Clock one full-duplex chunk of @p len bytes.  The NULL-buffer convention is
+ * TI's own SPI_Transaction convention, so the wire flags collapse into the
+ * pointers and no direction enum is needed:
+ *
+ *   @p tx == NULL  -> NO_TX: clock @p len copies of @p tx_fill instead.
+ *   @p rx == NULL  -> NO_RX: clock the transfer and discard MISO.
+ *
+ * Both NULL is legal (clock fill, discard the answer).  @p len == 0 with
+ * @p cs_hold false is a pure CS DEASSERT, which is why this family needs no
+ * separate chip-select opcode.  @p cs_hold leaves CS asserted so the next call
+ * continues the SAME device transaction (command + response, page program +
+ * status poll); clear it on the last chunk.
+ *
+ * @p len is authoritative for both buffers -- the caller owns them and has
+ * already bounded @p len by ALP_CC3501E_SPI1_MAX_XFER, so there is no cap
+ * argument.
+ *
+ * A refused or SHORT transfer returns CC3501E_HW_ERR_STATE, NOT
+ * CC3501E_HW_ERR_IO, and the difference is load-bearing: ERR_IO becomes
+ * RESP_ERR_RADIO -> ALP_ERR_IO, which the host's poll_by_repeat RETRIES.  A
+ * local controller refusing a transfer is deterministic, so retrying just
+ * re-burns the poll budget to reach the same answer and surfaces as a
+ * misleading ALP_ERR_TIMEOUT.  ERR_STATE is the terminal-reject code the worker
+ * path already maps to RESP_ERR_STATE.
+ *
+ * Returns CC3501E_HW_ERR_NOTIMPL when no instance is open (or the backend has
+ * no SPI1 at all); the wire layer maps that to RESP_ERR_NOT_READY, which is the
+ * contract's answer for a TRANSFER issued before a successful CONFIGURE. */
+int cc3501e_hw_spi1_transfer(const uint8_t *tx,
+                             uint8_t       *rx,
+                             uint16_t       len,
+                             uint8_t        tx_fill,
+                             bool           cs_hold);
+
+/* Deassert CS unconditionally, close the instance and free the bus.  This is
+ * the escape hatch, so it MUST NOT fail on state: calling it with nothing open
+ * is a no-op that still returns CC3501E_HW_OK, which is what gives a host that
+ * lost track of a CS_HOLD chain a guaranteed way back to a clean bus. */
+int cc3501e_hw_spi1_release(void);
 
 /* --------------------------------------------------------------- */
 /* Wi-Fi (v0.2)                                                      */

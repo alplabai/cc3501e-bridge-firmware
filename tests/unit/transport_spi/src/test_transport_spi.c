@@ -895,6 +895,331 @@ ZTEST(cc3501e_bridge_transport, test_ota_status_not_ready)
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "OTA_STATUS on stub -> NOT_READY");
 }
 
+/* ------------------------------------------------------------------ */
+/* SPI1 host passthrough (0x55..0x57)                                   */
+/*                                                                      */
+/* CI links the stub HAL, whose SPI1 body is a WIRE LOOP (MOSI tied to  */
+/* MISO), so these cover the halves CI can actually check: request      */
+/* validation, the inline-TX / self-delimiting-RX framing, the seq      */
+/* duplicate suppression and the CS_HOLD state gate.  Clock rate, CS    */
+/* timing and bus errors are silicon-only -- nothing here is evidence   */
+/* for those.                                                           */
+/*                                                                      */
+/* Every opcode in the family is worker-routed, and on the stub the job */
+/* runs SYNCHRONOUSLY inside worker_submit(), so a host needs exactly   */
+/* two transactions: submit -> BUSY, re-issue -> the result.            */
+/* ------------------------------------------------------------------ */
+
+/* CONFIGURE at 10 MHz (0x00989680), mode 0, 8 bits/word, CS0. */
+static const uint8_t spi1_configure_req[] = {
+	ALP_CC3501E_CMD_SPI1_CONFIGURE,
+	0x00u,
+	0x08u, /* payload_len 8           */
+	0x00u,
+	0x80u,
+	0x96u,
+	0x98u,
+	0x00u, /* freq_hz LE32            */
+	0x00u, /* mode 0 = CPOL 0, CPHA 0 */
+	0x08u, /* bits_per_word           */
+	(uint8_t)ALP_CC3501E_SPI1_CS0,
+	0x00u, /* reserved                */
+};
+
+/* Send @p req twice: once to submit (asserting the BUSY ack) and once to
+ * collect.  Returns the collected status; the reply bytes stay in @p reply. */
+static uint8_t spi1_collect(const uint8_t *req, size_t req_len, uint8_t *reply, size_t cap)
+{
+	transaction(req, req_len);
+	(void)drain(reply, cap);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "worker-routed submit acks BUSY");
+	transaction(req, req_len);
+	(void)drain(reply, cap);
+	return reply[4];
+}
+
+/* Put the bus back in the closed state EVERY SPI1 test starts from -- call
+ * this first, before anything else in the test body.  The handler's
+ * g_configured/g_cs_held and the stub's open flag are file statics that
+ * OUTLIVE the per-test worker_init(), so "nothing is open" has to be
+ * asserted at the top of each test rather than inherited from whatever the
+ * previous test (or ztest's execution order) happened to leave behind. */
+static void spi1_release(uint8_t *reply, size_t cap)
+{
+	const uint8_t rel[] = { ALP_CC3501E_CMD_SPI1_RELEASE, 0x00u, 0x00u, 0x00u };
+	zassert_equal(spi1_collect(rel, sizeof rel, reply, cap),
+	              ALP_CC3501E_RESP_OK,
+	              "RELEASE is the escape hatch: releasing nothing still succeeds");
+}
+
+ZTEST(cc3501e_bridge_transport, test_spi1_transfer_before_configure_is_not_ready)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* guarantee no instance is open */
+
+	const uint8_t xfer[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x09u,
+		0x00u,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0xA5u,
+	};
+	transaction(xfer, sizeof xfer);
+	(void)drain(reply, sizeof reply);
+	/* Rejected in the handler, so it never reaches the worker: no BUSY first. */
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_NOT_READY,
+	              "TRANSFER before a successful CONFIGURE -> NOT_READY");
+}
+
+ZTEST(cc3501e_bridge_transport, test_spi1_configure_then_transfer_loops_back)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* known state, independent of test order */
+
+	zassert_equal(spi1_collect(spi1_configure_req, sizeof spi1_configure_req, reply, sizeof reply),
+	              ALP_CC3501E_RESP_OK,
+	              "CONFIGURE -> OK");
+	zassert_equal((uint32_t)reply[5] | ((uint32_t)reply[6] << 8) | ((uint32_t)reply[7] << 16) |
+	                  ((uint32_t)reply[8] << 24),
+	              10000000u,
+	              "the reply reports the ACTUAL rate (the stub has no divider, so it matches)");
+	zassert_equal((uint16_t)reply[9] | ((uint16_t)reply[10] << 8),
+	              (uint16_t)ALP_CC3501E_SPI1_MAX_XFER,
+	              "CONFIGURE hands the host this firmware's chunk size");
+	zassert_equal(reply[11], 0x08u, "the accepted bits_per_word echoes back");
+
+	/* len 4, flags 0 (single-shot), seq 1, then the TX bytes inline. */
+	const uint8_t xfer[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x0Cu,
+		0x00u,
+		0x04u,
+		0x00u,
+		0x00u,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0xDEu,
+		0xADu,
+		0xBEu,
+		0xEFu,
+	};
+	zassert_equal(spi1_collect(xfer, sizeof xfer, reply, sizeof reply),
+	              ALP_CC3501E_RESP_OK,
+	              "TRANSFER -> OK");
+	zassert_equal((uint16_t)reply[5] | ((uint16_t)reply[6] << 8),
+	              4u,
+	              "the reply carries its own RX count, so the host stops before the pad");
+	zassert_equal(reply[7], 0x00u, "flags 0 -> the CS readback bit is clear");
+	zassert_equal(reply[8], 0x01u, "the reply echoes the request seq");
+	zassert_mem_equal(&reply[9], &xfer[12], 4u, "the stub loops MOSI straight back on MISO");
+}
+
+ZTEST(cc3501e_bridge_transport, test_spi1_repeated_seq_serves_the_cached_result)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* known state, independent of test order */
+	(void)spi1_collect(spi1_configure_req, sizeof spi1_configure_req, reply, sizeof reply);
+
+	const uint8_t xfer[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x0Cu,
+		0x00u,
+		0x04u,
+		0x00u,
+		0x00u,
+		0x07u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x11u,
+		0x22u,
+		0x33u,
+		0x44u,
+	};
+	zassert_equal(spi1_collect(xfer, sizeof xfer, reply, sizeof reply),
+	              ALP_CC3501E_RESP_OK,
+	              "the first issue of seq 7 clocks the bus");
+
+	/* Re-issue the IDENTICAL frame, which is what the host's ALP_ERR_IO retry
+	 * does.  A fresh submit would answer BUSY first; answering OK on the very
+	 * first transaction is the observable proof that the CACHED result came back
+	 * and the device was not clocked a second time -- the difference between a
+	 * repeated read and a double flash page program. */
+	transaction(xfer, sizeof xfer);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "the same seq serves the cache, no re-clock");
+	zassert_equal(reply[8], 0x07u, "the cached reply still echoes seq 7");
+	zassert_mem_equal(&reply[9], &xfer[12], 4u, "the cached RX bytes come back intact");
+
+	/* A DIFFERENT seq is a new logical transfer: the cache is dropped and the job
+	 * resubmitted, so this one goes back to the BUSY/collect pair. */
+	uint8_t next[sizeof xfer];
+	memcpy(next, xfer, sizeof xfer);
+	next[7] = 0x08u;
+	zassert_equal(spi1_collect(next, sizeof next, reply, sizeof reply),
+	              ALP_CC3501E_RESP_OK,
+	              "a new seq starts a new transfer");
+	zassert_equal(reply[8], 0x08u, "and its reply echoes the NEW seq");
+}
+
+ZTEST(cc3501e_bridge_transport, test_spi1_configure_refused_while_cs_is_held)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* known state, independent of test order */
+	(void)spi1_collect(spi1_configure_req, sizeof spi1_configure_req, reply, sizeof reply);
+
+	/* CS_HOLD leaves the chain open. */
+	const uint8_t held[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x0Au,
+		0x00u,
+		0x02u,
+		0x00u,
+		ALP_CC3501E_SPI1_XFER_CS_HOLD,
+		0x02u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x5Au,
+		0xA5u,
+	};
+	zassert_equal(spi1_collect(held, sizeof held, reply, sizeof reply),
+	              ALP_CC3501E_RESP_OK,
+	              "a CS_HOLD chunk -> OK");
+	zassert_equal(reply[7],
+	              (uint8_t)ALP_CC3501E_SPI1_XFER_CS_HOLD,
+	              "the reply flags byte reads CS back as still asserted");
+
+	/* Re-opening the instance underneath the chain would drop CS mid-transaction.
+	 * ERR_STATE is the TERMINAL reject (0x09) the host does not re-poll. */
+	transaction(spi1_configure_req, sizeof spi1_configure_req);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_STATE,
+	              "CONFIGURE during an unfinished CS_HOLD chain -> ERR_STATE");
+
+	/* And the escape hatch still works, which is the whole point of RELEASE. */
+	spi1_release(reply, sizeof reply);
+}
+
+ZTEST(cc3501e_bridge_transport, test_spi1_request_validation)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* known state, independent of test order */
+	(void)spi1_collect(spi1_configure_req, sizeof spi1_configure_req, reply, sizeof reply);
+
+	/* An undefined flag bit is REJECTED, not ignored: a host that sets a later
+	 * firmware's flag must learn this peer cannot honour it. */
+	const uint8_t bad_flag[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x09u,
+		0x00u,
+		0x01u,
+		0x00u,
+		0x08u,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0xFFu,
+	};
+	transaction(bad_flag, sizeof bad_flag);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "an undefined flag bit -> INVALID");
+
+	/* The declared len must match the inline TX byte count EXACTLY -- a short
+	 * frame would otherwise clock whatever sits past the payload. */
+	const uint8_t short_tx[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x0Au,
+		0x00u,
+		0x04u,
+		0x00u,
+		0x00u,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0xAAu,
+		0xBBu,
+	};
+	transaction(short_tx, sizeof short_tx);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "len 4 with 2 inline bytes -> INVALID");
+
+	/* NO_TX carries NO inline bytes; sending some is the same disagreement. */
+	const uint8_t no_tx_with_bytes[] = {
+		ALP_CC3501E_CMD_SPI1_TRANSFER,
+		0x00u,
+		0x09u,
+		0x00u,
+		0x01u,
+		0x00u,
+		ALP_CC3501E_SPI1_XFER_NO_TX,
+		0x01u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0x00u,
+		0xCCu,
+	};
+	transaction(no_tx_with_bytes, sizeof no_tx_with_bytes);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "NO_TX with inline TX bytes -> INVALID");
+
+	/* CONFIGURE: v6 accepts 8 bits/word only, mode 0..3, CS0/CS1. */
+	uint8_t cfg[sizeof spi1_configure_req];
+	memcpy(cfg, spi1_configure_req, sizeof cfg);
+	cfg[9] = 16u; /* bits_per_word */
+	transaction(cfg, sizeof cfg);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "bits_per_word != 8 -> INVALID");
+
+	memcpy(cfg, spi1_configure_req, sizeof cfg);
+	cfg[8] = 4u; /* mode */
+	transaction(cfg, sizeof cfg);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "mode > 3 -> INVALID");
+
+	memcpy(cfg, spi1_configure_req, sizeof cfg);
+	cfg[10] = 2u; /* cs */
+	transaction(cfg, sizeof cfg);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "cs > 1 -> INVALID");
+
+	/* RELEASE takes no payload, and a malformed one must NOT tear the bus down. */
+	const uint8_t rel_with_payload[] = { ALP_CC3501E_CMD_SPI1_RELEASE, 0x00u, 0x01u, 0x00u, 0x00u };
+	transaction(rel_with_payload, sizeof rel_with_payload);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "RELEASE with a payload -> INVALID");
+}
+
 /* The worker's `job` is a file-static singleton shared across the whole TU, so a
  * worker-routed test that submits but never collects its result (the body runs
  * synchronously on the stub and caches ERR) would leave the worker non-IDLE and

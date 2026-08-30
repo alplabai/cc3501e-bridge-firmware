@@ -113,6 +113,7 @@ EVT_WIFI_CONNECTED = 0x19
 EVT_WIFI_DISCONNECTED = 0x1A
 CMD_SOCK_OPEN = 0x20
 CMD_SOCK_CLOSE = 0x24
+CMD_SPI1_TRANSFER = 0x56  # SPI1 host passthrough (0x55..0x57); only TRANSFER is pinned here
 
 FLAG_SOLICITED = 0x00
 
@@ -243,6 +244,28 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
         reply(CMD_GET_PENDING_EVENTS, RESP_OK,
               bytes([EVT_WIFI_CONNECTED, 0x00, EVT_WIFI_DISCONNECTED, 0x00])).hex().upper(),
         "cmd=GET_PENDING_EVENTS | status=OK | [WIFI_CONNECTED len0][WIFI_DISCONNECTED len0]",
+    ))
+
+    # SPI1 host passthrough (0x55..0x57): the only vector here is TRANSFER, and it
+    # is the only executable check of the inline-TX request framing (the TX bytes
+    # are packed straight after the 8-byte header, no padding) and the
+    # self-delimiting RX reply framing (the reply's own len field is what lets a
+    # reader stop at the real RX bytes instead of reading into the REPLY_PAD
+    # padding).  len=4, flags=0 (single-shot), seq=1; tx=DEADBEEF looped back on
+    # rx to match the stub HAL's wire-loop SPI1 body (tests/unit/transport_spi).
+    spi1_xfer_tx = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    out.append((
+        "spi1_transfer_request",
+        frame(CMD_SPI1_TRANSFER, 0,
+              bytes([0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]) + spi1_xfer_tx).hex().upper(),
+        "cmd=SPI1_TRANSFER | len=4 flags=0 seq=1 tx_fill=0 | tx=DEADBEEF packed inline, no padding",
+    ))
+    out.append((
+        "spi1_transfer_reply_ok",
+        reply(CMD_SPI1_TRANSFER, RESP_OK,
+              bytes([0x04, 0x00, 0x00, 0x01]) + spi1_xfer_tx).hex().upper(),
+        "cmd=SPI1_TRANSFER | status=OK | rx_len=4 flags=0 seq=1 | rx=DEADBEEF, self-delimiting "
+        "before the REPLY_PAD padding",
     ))
 
     # Framing error: declared payload_len doesn't match the captured bytes.

@@ -97,10 +97,26 @@ static void wk_put_le16(uint8_t *p, uint16_t v)
 	p[1] = (uint8_t)((v >> 8) & 0xFFu);
 }
 
+/* Little-endian store helper for the SPI1 config reply (actual SCK in Hz). */
+static void wk_put_le32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v & 0xFFu);
+	p[1] = (uint8_t)((v >> 8) & 0xFFu);
+	p[2] = (uint8_t)((v >> 16) & 0xFFu);
+	p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
 /* Read a 16-bit LE field out of the (volatile) request buffer byte-by-byte. */
 static uint16_t wk_get_le16(const volatile uint8_t *p, size_t off)
 {
 	return (uint16_t)p[off] | ((uint16_t)p[off + 1u] << 8);
+}
+
+/* Same, 32-bit (SPI1 freq_hz). */
+static uint32_t wk_get_le32(const volatile uint8_t *p, size_t off)
+{
+	return (uint32_t)p[off] | ((uint32_t)p[off + 1u] << 8) | ((uint32_t)p[off + 2u] << 16) |
+	       ((uint32_t)p[off + 3u] << 24);
 }
 
 /* recv reply header = alp_cc3501e_sock_recv_resp_t: from(sock_addr 20) |
@@ -368,6 +384,64 @@ static void worker_execute(uint8_t cmd)
 		rv = cc3501e_hw_sock_close(wk_get_le16(job.req, 0u));
 		break;
 	}
+	case ALP_CC3501E_CMD_SPI1_CONFIGURE: {
+		/* job.req = alp_cc3501e_spi1_configure_t: freq_hz(LE32 @0) | mode(@4) |
+		 * bits_per_word(@5) | cs(@6) | reserved(@7); protocol_spi.c validated it.
+		 * SPI_open() can block on a power domain, which is why this is here and
+		 * not inline in the SPI0 slave callback.  Reply DATA =
+		 * alp_cc3501e_spi1_config_resp_t: the ACTUAL divider output, this
+		 * firmware's max chunk, and the accepted word size. */
+		uint32_t actual_freq_hz = 0u;
+		rv                      = cc3501e_hw_spi1_configure(
+		    wk_get_le32(job.req, 0u), job.req[4], job.req[5], job.req[6], &actual_freq_hz);
+		if (rv == CC3501E_HW_OK) {
+			wk_put_le32(buf, actual_freq_hz);
+			wk_put_le16(&buf[4], (uint16_t)ALP_CC3501E_SPI1_MAX_XFER);
+			buf[6] = job.req[5];
+			buf[7] = 0u;
+			len    = 8u;
+		}
+		break;
+	}
+	case ALP_CC3501E_CMD_SPI1_TRANSFER: {
+		/* job.req = alp_cc3501e_spi1_transfer_t: len(LE16 @0) | flags(@2) |
+		 * seq(@3) | tx_fill(@4) | reserved(@5..7), then the TX bytes inline at 8
+		 * (absent when NO_TX).  protocol_spi.c already checked the payload length
+		 * EXACTLY, so the bytes past the header are this request's, not a longer
+		 * previous job's leftovers in job.req.
+		 *
+		 * NO_TX / NO_RX collapse into NULL pointers, the same convention TI's
+		 * SPI_Transaction already uses -- no separate HAL flag argument.  The RX
+		 * bytes land straight at buf[4], i.e. immediately after the reply header,
+		 * so a 4 KB chunk is never copied twice. */
+		const uint16_t xfer_len = wk_get_le16(job.req, 0u);
+		const uint8_t  flags    = job.req[2];
+		const bool     no_rx    = (flags & ALP_CC3501E_SPI1_XFER_NO_RX) != 0u;
+		const bool     no_tx    = (flags & ALP_CC3501E_SPI1_XFER_NO_TX) != 0u;
+		const bool     cs_hold  = (flags & ALP_CC3501E_SPI1_XFER_CS_HOLD) != 0u;
+
+		rv = cc3501e_hw_spi1_transfer(no_tx ? NULL : (const uint8_t *)&job.req[8],
+		                              no_rx ? NULL : &buf[4],
+		                              xfer_len,
+		                              job.req[4],
+		                              cs_hold);
+		if (rv == CC3501E_HW_OK) {
+			/* Self-delimiting reply: the declared payload_len includes
+			 * protocol_build_reply's zero pad, so the RX count has to ride in the
+			 * data itself or the host walks pad bytes as data (alp-sdk#1740). */
+			wk_put_le16(buf, no_rx ? 0u : xfer_len);
+			buf[2] = (uint8_t)(cs_hold ? ALP_CC3501E_SPI1_XFER_CS_HOLD : 0u); /* echoes CS_HOLD */
+			buf[3] = job.req[3];                                              /* echo seq    */
+			len    = 4u + (no_rx ? 0u : (size_t)xfer_len);
+		}
+		break;
+	}
+	case ALP_CC3501E_CMD_SPI1_RELEASE:
+		/* Deassert CS, SPI_close() the instance, free the bus.  Argless, and OK
+		 * with nothing open -- it is the escape hatch out of a lost CS_HOLD
+		 * chain, so it must never fail on state. */
+		rv = cc3501e_hw_spi1_release();
+		break;
 	default:
 		rv = CC3501E_HW_ERR_NOTIMPL;
 		break;
@@ -649,8 +723,23 @@ void worker_run_pending(void)
 		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change. */
 		const bool body_already_reinit =
 		    (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) || (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT);
+		/* SPI1 host passthrough is exempt for the SAME reason as the two socket
+		 * data ops above, and it is the cleanest case in the list: these opcodes
+		 * drive a SEPARATE MASTER instance (GPIO_31/32/33/34 + GPIO_15) and make
+		 * no Wlan_* call at all, so the SPI0 slave's DMA was never killed and
+		 * there is nothing to re-establish.  Paying the re-init anyway would
+		 * close and re-open a perfectly live slave behind a busy/ready bracket
+		 * that only works when the READY pad's input-enable pinctrl group is
+		 * populated (alp-sdk chips/cc3501e/cc3501e_sockets.c, silicon-measured
+		 * 2026-08-24) -- on a board without it READY reads stuck low, i.e.
+		 * exactly the destructive no-op measured on the socket path.  It would
+		 * also re-roll the 12-attempt SPI_open on every 4 KB chunk of a flash
+		 * write, which is the hot loop this family exists for. */
+		const bool spi1_passthrough = (cmd == ALP_CC3501E_CMD_SPI1_CONFIGURE) ||
+		                              (cmd == ALP_CC3501E_CMD_SPI1_TRANSFER) ||
+		                              (cmd == ALP_CC3501E_CMD_SPI1_RELEASE);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
-		    !body_already_reinit) {
+		    !spi1_passthrough && !body_already_reinit) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}

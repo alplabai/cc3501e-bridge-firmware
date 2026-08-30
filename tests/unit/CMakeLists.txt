@@ -77,6 +77,7 @@ add_executable(test_transport_spi
     ${FW}/src/protocol.c
     ${FW}/src/protocol_meta.c
     ${FW}/src/protocol_gpio.c
+    ${FW}/src/protocol_spi.c
     ${FW}/src/protocol_camera.c
     ${FW}/src/protocol_wifi.c
     ${FW}/src/protocol_sockets.c

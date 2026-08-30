@@ -56,6 +56,21 @@ static bool gpio_pad_reserved(uint8_t pad)
 	/* CONFIG_UART2_0 console glue: TX=5, RX=6. */
 	case 5u:
 	case 6u:
+	/* CONFIG_SPI_1 host passthrough (proto v6, cc3501e_hw_ti_spi_master.c): the
+	 * connector's SPI1 bus -- SCK=32, and the two data pads 33/34 -- plus its two
+	 * SOFTWARE chip-selects, CS0=31 (E1 AH9) and CS1=15 (E1 AH8).  Reserved for
+	 * exactly the reason 16/27/28/29 are: a host CMD_GPIO_CONFIGURE or
+	 * CMD_GPIO_WRITE on one of these pads re-muxes it out from under an in-flight
+	 * controller transfer, or drops a chip-select mid-transaction on a device the
+	 * host is page-programming.  The SPI1 opcodes are the way to drive this bus;
+	 * the GPIO proxy is not.  (GPIO17 above is also an SPI1_CS3 candidate at mux
+	 * 16 -- if a future rev reshuffles the selects, it must not land there: it is
+	 * the bridge READY line.) */
+	case 15u:
+	case 31u:
+	case 32u:
+	case 33u:
+	case 34u:
 	/* 7/8/9 are NOT "not bonded" -- TI documents them as SWDIO (pin 40), SWCLK
 	 * (pin 39) and LOGGER (pin 38).  They are unavailable to the GPIO proxy
 	 * because the debug/logging functions own them, which is a different and
