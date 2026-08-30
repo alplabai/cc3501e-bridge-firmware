@@ -78,7 +78,6 @@
 #error \
     "cc3501e_hw_ti_spi_master.c requires CC3501E_WIFI (the deferred worker): the synchronous stub path would run a 4088-byte transfer in the SPI0 ISR"
 #endif
-#endif
 
 /* Software chip-selects.  BOTH are GPIOs driven by this file, not by the SPI
  * IP: SPIWFF3DMA carries exactly ONE hardware csnSel per SPI_Config entry, so a
