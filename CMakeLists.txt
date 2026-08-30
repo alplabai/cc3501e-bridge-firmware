@@ -68,6 +68,7 @@ set(CC3501E_BRIDGE_SOURCES
     src/protocol.c
     src/protocol_meta.c
     src/protocol_gpio.c
+    src/protocol_spi.c
     src/protocol_camera.c
     src/protocol_wifi.c
     src/protocol_sockets.c

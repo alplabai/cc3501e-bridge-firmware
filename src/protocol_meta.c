@@ -69,7 +69,7 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  *
  * Bumping the protocol means changing BOTH this literal and the header, in the
  * same change. */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL 5
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL 6
 
 _Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
                "<alp/protocol/cc3501e.h> is not the protocol version this firmware "

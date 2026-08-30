@@ -11,8 +11,12 @@
  * The SPI-peripheral (CONFIG_SPI_0) + kernel blocks below are a VERBATIM copy
  * of that file -- cc3501e_aen.syscfg remains the source of truth for the
  * inter-chip SPI pinout + the bench HW notes; keep this block in sync if it
- * changes there.  The ONLY delta is the added UART2 instance (CONFIG_UART2_0),
- * which the CC35xx Wi-Fi host integration's console/log glue requires:
+ * changes there.  The deltas are ADDITIONS only, in declaration order below:
+ * the SPI1 host-passthrough CONTROLLER (CONFIG_SPI_1, protocol v6 -- absent
+ * from the default board file, so that image has SPI_count 1 and no
+ * CONFIG_SPI_1 symbol), the internal-temperature ADC channel, and the UART2
+ * instance (CONFIG_UART2_0), which the CC35xx Wi-Fi host integration's
+ * console/log glue requires:
  * adaptation/uart_term.c opens UART2_open(CONFIG_UART2_0,...) and the wifi
  * libs reference Report(); without a UART2 instance UART2_config[]/UART2_count
  * are absent and the link fails.  A SEPARATE variant (not editing the default
@@ -169,6 +173,159 @@ spi0.spi.csnPin.$assign  = "GPIO16";  /* CS -> GPIO16 (only silicon-legal CS; pu
  * boot flag), not a build switch -- these DMA channel pins serve the NORMAL mode. */
 spi0.spi.dmaRxChannel.$assign = "DMA_CH12";
 spi0.spi.dmaTxChannel.$assign = "DMA_CH13";
+
+/* ======== SPI controller (master) -> CONFIG_SPI_1 ========
+ * SPI1 HOST PASSTHROUGH (protocol v6: CMD_SPI1_CONFIGURE/TRANSFER/RELEASE,
+ * 0x55/0x56/0x57).  This is NOT a second bridge transport.  It is the E1M
+ * CONNECTOR's SPI1 bus, which on E1M-AEN-2626-R2 lands on the CC3501E (U4) and
+ * NOT on the Alif -- so the only way the host can drive that bus at all is by
+ * relay: the CC35 is the SPI CONTROLLER and the host supplies the bytes.
+ *
+ *   connector E1     net              CC3501E pad  SPI1 function (mux)
+ *   --------------   --------------   -----------  ----------------------
+ *   AG10 SPI1_SCLK   WIFI_SPI1.SCK    GPIO_32      SPI1_CLK  (4)
+ *   AG9  SPI1_MOSI   WIFI_SPI1.MOSI   GPIO_33      SPI1_MISO (4)  <- crossed
+ *   AG8  SPI1_MISO   WIFI_SPI1.MISO   GPIO_34      SPI1_MOSI (4)  <- crossed
+ *   AH9  SPI1_CS0    WIFI_SPI1.CS0    GPIO_31      SPI1_CS1  (4), GPIO-driven
+ *   AH8  SPI1_CS1    WIFI_SPI1.CS1    GPIO_15      SPI1_CS2  (16), GPIO-driven
+ *
+ * The inter-chip bridge is a DIFFERENT bus -- CONFIG_SPI_0 above (GPIO16/27/
+ * 28/29) plus the GPIO17 READY line.  Nothing in this block may touch those
+ * five pads; re-muxing one kills the very link the host issues commands over.
+ *
+ * ============================ HARDWARE NOTE ============================
+ * *** The SPI1 DATA LINES ARE CROSSED -- the same defect class as the SPI0
+ * crossed-data note in cc3501e_aen.syscfg, on a different bus. ***  The CC35xx
+ * silicon fixes which pad may carry which SPI1 data role (CC3551E.json
+ * reverseMuxes, SysConfig 1.28.0 deviceData):
+ *     SPI1_MOSI: GPIO13 / GPIO34 / GPIO6  (mux 4)  -- GPIO33 is NOT legal
+ *     SPI1_MISO: GPIO15 / GPIO33 / GPIO5  (mux 4)  -- GPIO34 is NOT legal
+ * but the netlist wires connector MOSI (AG9) to GPIO_33 and connector MISO
+ * (AG8) to GPIO_34: exactly backwards.  The ONLY assignment SysConfig can
+ * solve is the one below -- picoPin = GPIO34, pociPin = GPIO33 -- which means
+ * the CC35 DRIVES the net labelled WIFI_SPI1.MISO and LISTENS on the net
+ * labelled WIFI_SPI1.MOSI.  Both the CC35 pad roles and the connector pins are
+ * silicon/PCB-fixed, so neither end can correct this in firmware, exactly as
+ * on SPI0.
+ *
+ * Settle this against the netlist BEFORE trusting a bench capture: the bus
+ * works as configured here only if the far-end device is wired to the swap
+ * (its MOSI on AG8, its MISO on AG9).  Wired to the connector LABELS instead,
+ * two push-pull outputs share one net and nothing drives the other -- RX reads
+ * a constant idle level while the two drivers fight.  That contention is a
+ * sustained short between two outputs: do not leave it clocking while you
+ * debug it; the fix is an AG9<->AG8 cross or a carrier rev.
+ * ======================================================================
+ *
+ * DECLARATION ORDER IS LOAD-BEARING.  SysConfig indexes SPI_config[] by
+ * instance order, so CONFIG_SPI_0 == 0 holds only while spi0 is declared
+ * FIRST.  Move this instance above it and the inter-chip transport's
+ * SPI_open(CONFIG_SPI_0, ...) opens THIS controller instead: the bridge goes
+ * silently dead, with no build error and no wrong pin in the generated file.
+ *
+ * Nothing here says "master".  Role and bit rate are RUNTIME choices in the
+ * HAL -- SPI_open(CONFIG_SPI_1, SPI_CONTROLLER, SPI_MODE_BLOCKING) with
+ * SPI_Params.bitRate taken from CMD_SPI1_CONFIGURE's freq_hz.  The divider
+ * rounds, which is why the CONFIGURE reply reports the ACTUAL rate instead of
+ * echoing the request.
+ *
+ * The instance is not pinned to a peripheral either, and does not need to be:
+ * SPI0_CLK is legal only on GPIO17/GPIO27, so assigning sclkPin = GPIO32 --
+ * an SPI1_CLK-only pad -- leaves the solver exactly one peripheral to pick.
+ *
+ * This instance exists in the Wi-Fi variant ONLY.  cc3501e_aen.syscfg (the
+ * default/radio-free image) still has SPI_count == 1 and defines no
+ * CONFIG_SPI_1 symbol at all, so HAL code naming it must be guarded or that
+ * image stops compiling. */
+var spi1 = SPI.addInstance();
+spi1.$name = "CONFIG_SPI_1";
+
+/* THREE PIN -- both chip-selects are driven by the HAL as plain GPIOs, and the
+ * silicon forces that, it is not a preference.  SPIWFF3DMA carries ONE
+ * csnPin/csnPinMux/csnSel per SPI_Config entry, and the two selects need
+ * DIFFERENT muxes: GPIO31 is SPI1_CS1 at mux 4, GPIO15 is SPI1_CS2 at mux 16
+ * (CC3551E.json).  One instance cannot hardware-frame both.  Nor can it switch
+ * at runtime: SPIWFF3DMA_CMD_SET_CSN_PIN re-muxes the NEW pad with the OLD
+ * csnPinMux, so a CS0->CS1 switch would apply mux 4 to GPIO15 -- which is
+ * SPI1_MISO -- and hang a second data receiver on the bus.
+ *
+ * Two consequences, both bench-visible:
+ *  - CS-to-first-clock setup is SCHEDULER-timed, not clock-edge-exact, because
+ *    the HAL toggles the pad around the transfer.  A peripheral demanding
+ *    sub-microsecond CS setup will not work here, and no protocol change fixes
+ *    it; that ceiling is documented at the opcodes in the canonical header.
+ *  - Three Pin also asks SysConfig for NO CS pin resource, which keeps the pin
+ *    solver away from two pads that are already spoken for on this SoM but
+ *    INVISIBLE to it, because neither has a SysConfig instance claiming it:
+ *    GPIO17 (SPI1_CS3, mux 16) is the bridge READY line, and GPIO26
+ *    (SPI1_CS2, mux 16) is the connector's IO20 (E1 pin K3 --
+ *    metadata/e1m_modules/aen/from-cc3501e.tsv in alp-sdk), a general-purpose
+ *    connector pin with no fixed function of its own.  A Four Pin instance
+ *    with an unpinned CS could legally take either one.
+ *
+ * BENCH CHECK on the first SysConfig run -- nothing in CI runs SysConfig, so a
+ * PR cannot catch this: read the CONFIG_SPI_1 entry of the generated
+ * ti_drivers_config.c and confirm its .csnPin did not default onto GPIO17,
+ * GPIO26, or any of GPIO15/31/32/33/34.  The SPI0 Three Pin experiment
+ * (cc3501e_aen.syscfg) showed the driver falling back to a default CS0 pad
+ * even with no CS requested. */
+spi1.mode   = "Three Pin";
+spi1.duplex = "Full";       /* the wire is always full-duplex; the protocol's
+                             * NO_RX/NO_TX flags only drop a direction from the
+                             * BRIDGE frame, they do not change the pins. */
+
+/* Clocked out only if the HAL ever submits a transaction with txBuf == NULL.
+ * 0xFF, not 0x00: on a SPI NOR flash 0xFF is the benign no-op byte while 0x00
+ * is a valid opcode.  NOTE for the HAL: this is a BUILD constant, so the
+ * protocol's per-transfer tx_fill CANNOT be honoured by passing txBuf = NULL --
+ * the HAL has to fill a scratch buffer with tx_fill.  A bench capture showing
+ * 0xFF on MOSI where the host asked for another fill is exactly that bug. */
+spi1.defaultTxBufferValue = "0xFF";
+
+/* The only silicon-legal mapping (see HARDWARE NOTE).  pico = what the
+ * CONTROLLER drives, poci = what it samples. */
+spi1.spi.sclkPin.$assign = "GPIO32";  /* <- connector AG10 SPI1_SCLK */
+spi1.spi.picoPin.$assign = "GPIO34";  /* controller data OUT -- lands on the net
+                                       * LABELLED WIFI_SPI1.MISO (AG8) */
+spi1.spi.pociPin.$assign = "GPIO33";  /* controller data IN  -- lands on the net
+                                       * LABELLED WIFI_SPI1.MOSI (AG9) */
+
+/* CS0 (GPIO31) and CS1 (GPIO15) deliberately get NO pin resource here -- the
+ * HAL owns them via GPIO_setConfig()/GPIO_write(), the same way the camera LDO
+ * enables on GPIO_0/GPIO_1 are driven (both are GPIOWFF3_DO_NOT_CONFIG in the
+ * generated table, and both are bench-PASS).  They must be configured as
+ * outputs idling HIGH before the first transfer, and gpio_pad_reserved() in
+ * hal/ti/cc3501e_hw_ti_gpio.c must refuse pads 15/31/32/33/34 -- otherwise a
+ * host CMD_GPIO_CONFIGURE/WRITE re-muxes SCK or a data line out from under an
+ * in-flight transfer, which is exactly why 16/27/28/29 are refused already.
+ *
+ * Host-facing cs=0 is device SPI1_CS1 and cs=1 is device SPI1_CS2: TI numbers
+ * the device SIGNALS from 1 while the driver numbers SELECTS from 0 (spi0's
+ * csnPin GPIO16 is SPI0_CS1 and generates .csnSel = SPI_CSSEL_CS0).  Keep the
+ * host-facing names 0/1 -- they follow the CONNECTOR nets WIFI_SPI1.CS0/CS1. */
+
+/* DMA channels, pinned for the same reason spi0 pins 12/13: on this SDK an
+ * AUTO-assigned channel was observed being re-pointed by the radio (ch11, then
+ * ch8/ch6, all died mid-transfer) while an explicitly pinned pair never was.
+ * Both SPI instances may use DMA_CH0..DMA_CH13 (CC3551E.json DMA_SPI_1_RX/TX),
+ * so this pair is the highest two that are neither the bridge's own 12/13 nor
+ * any channel the radio was seen to steal.  Sharing a channel with
+ * CONFIG_SPI_0 would BE the wedge, so never "simplify" these back to 12/13.
+ *
+ * ASSUMPTION, NOT A BENCH RESULT: the 12/13 observation does not transfer to
+ * 9/10.  Scope it under radio load (a wifi scan concurrent with a 4088-byte
+ * transfer) before trusting it.  If the radio does steal them the failure is
+ * loud and contained: SPI_transfer() returns false, the passthrough maps that
+ * to RESP_ERR_STATE (a terminal reject, not a retry), and the inter-chip
+ * bridge on 12/13 is untouched.  The fallback is the polling path --
+ * build_ti.ps1 rewrites .minDmaTransferSize to 1024 for EVERY instance in the
+ * generated file, so a SPI_MODE_BLOCKING controller transfer shorter than 1024
+ * bytes skips DMA entirely; a smaller host chunk therefore trades throughput
+ * for independence from the DMA mux.  (Side note for whoever next touches that
+ * script: its post-condition greps for a single ".minDmaTransferSize = 1024,",
+ * so with two instances it no longer proves full coverage.) */
+spi1.spi.dmaRxChannel.$assign = "DMA_CH9";
+spi1.spi.dmaTxChannel.$assign = "DMA_CH10";
 
 /* ======== UART2 (console glue) -> CONFIG_UART2_0 ========
  * Required only by the Wi-Fi host integration's uart_term.c/syslog.c so the

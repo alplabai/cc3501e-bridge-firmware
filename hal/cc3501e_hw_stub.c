@@ -13,6 +13,7 @@
  */
 
 #include <stdint.h>
+#include <string.h> /* memcpy/memset: the SPI1 loopback moves up to 4088 bytes */
 
 #include "alp/protocol/cc3501e.h"
 #include "cc3501e_hw.h"
@@ -108,6 +109,74 @@ int cc3501e_hw_cam_enable(uint8_t which, uint8_t on)
 {
 	if (which > 1u) return CC3501E_HW_ERR_INVAL;
 	stub_cam[which] = on ? 1u : 0u;
+	return CC3501E_HW_OK;
+}
+
+/* --------------------------------------------------------------- */
+/* SPI1 host passthrough (v0.6) -- LOOPBACK fake.                    */
+/*                                                                   */
+/* Unlike Wi-Fi / BLE / OTA above, this family does NOT report        */
+/* NOTIMPL here, and the reason is CI coverage rather than ambition:  */
+/* CI builds this backend and never runs SysConfig, so the stub is    */
+/* the ONLY SPI1 body CI ever links.  A NOTIMPL stub would make every */
+/* test assert RESP_ERR_NOT_READY and prove nothing about the one     */
+/* half of this family CI can actually check -- the inline-TX /       */
+/* self-delimiting-RX framing.  So the stub behaves like a trivial    */
+/* real device: a wire loop with MOSI tied to MISO.  A test that      */
+/* clocks bytes out gets those same bytes back, and dropping the      */
+/* payload on the floor fails instead of passing vacuously.           */
+/*                                                                   */
+/* What it does NOT model, so nobody reads a green CI run as bench    */
+/* evidence: no clock divider, no CS timing, no bus errors.           */
+/* --------------------------------------------------------------- */
+static bool stub_spi1_open;
+
+int cc3501e_hw_spi1_configure(uint32_t  freq_hz,
+                              uint8_t   mode,
+                              uint8_t   bits_per_word,
+                              uint8_t   cs,
+                              uint32_t *actual_freq_hz_out)
+{
+	(void)mode;
+	(void)bits_per_word;
+	(void)cs;
+	/* No clock tree here, so the request IS the actual rate.  Do NOT read a
+	 * matching value back as proof the host copes with a divided rate -- only
+	 * silicon exercises that path, and inventing a plausible-looking divider
+	 * ratio here would be a fabricated hardware fact. */
+	if (actual_freq_hz_out != 0) *actual_freq_hz_out = freq_hz;
+	stub_spi1_open = true;
+	return CC3501E_HW_OK;
+}
+
+int cc3501e_hw_spi1_transfer(const uint8_t *tx,
+                             uint8_t       *rx,
+                             uint16_t       len,
+                             uint8_t        tx_fill,
+                             bool           cs_hold)
+{
+	(void)cs_hold; /* the loop has no chip select to hold */
+
+	/* Enforced HERE and not only at the wire layer: this is the state the
+	 * BACKEND owns (there is no open instance), so a TRANSFER that skipped
+	 * CONFIGURE answers RESP_ERR_NOT_READY even if a handler forgets to
+	 * check.  NOTIMPL is the only HAL code hw_to_resp() maps to NOT_READY. */
+	if (!stub_spi1_open) return CC3501E_HW_ERR_NOTIMPL;
+
+	if (rx != 0 && len != 0u) {
+		if (tx != 0)
+			memcpy(rx, tx, len); /* MOSI looped to MISO */
+		else
+			memset(rx, tx_fill, len); /* NO_TX: the fill byte is what went out */
+	}
+	return CC3501E_HW_OK;
+}
+
+int cc3501e_hw_spi1_release(void)
+{
+	/* Never fails on state -- it is the host's escape hatch out of a lost
+	 * CS_HOLD chain, so releasing nothing is a successful release. */
+	stub_spi1_open = false;
 	return CC3501E_HW_OK;
 }
 

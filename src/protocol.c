@@ -10,8 +10,9 @@
  * protocol_dispatch() here -- one command set, one set of reply codes,
  * transport-agnostic (the gd32-bridge SPI + I2C model).
  *
- * The per-command-family handlers (META, stream-write, GPIO proxy,
- * camera enables, Wi-Fi, sockets, BLE, power policy, diagnostics, OTA)
+ * The per-command-family handlers (META, stream-write, GPIO proxy, SPI1
+ * passthrough, camera enables, Wi-Fi, sockets, BLE, power policy,
+ * diagnostics, OTA)
  * live in the sibling protocol_<family>.c TUs (split out of this file,
  * issue #461); this file keeps only:
  *
@@ -28,9 +29,10 @@
  *     GET_DIAG_INFO / DIAG_GET_STATS handlers in protocol_diag.c read
  *     them via protocol_internal.h's extern declarations.
  *
- * Scope: protocol_dispatch() below routes 49 opcodes -- META, Wi-Fi,
- * BLE, sockets, GPIO proxy, camera enables, power policy, diagnostics
- * (including GET_PENDING_EVENTS) and OTA -- onto the per-family handlers,
+ * Scope: protocol_dispatch() below routes 52 opcodes -- META, Wi-Fi,
+ * BLE, sockets, GPIO proxy, SPI1 host passthrough, camera enables, power
+ * policy, diagnostics (including GET_PENDING_EVENTS) and OTA -- onto the
+ * per-family handlers,
  * which reach TI's CC35xx Wi-Fi / NimBLE / lwIP / psa_fwu APIs through
  * the HAL backend.  Routed is not proven: BRINGUP_STATUS.md records what
  * is silicon-validated, and sockets do NOT connect (alp-sdk#1746).
@@ -290,6 +292,18 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 		break;
 	case ALP_CC3501E_CMD_GPIO_SET_INTERRUPT:
 		h = handle_gpio_set_interrupt;
+		break;
+	/* SPI1 host passthrough (v0.6).  The E1M connector's SPI1 lands on the
+	 * CC3501E, not the Alif, so these relay the host's master transfers.
+	 * NOT the inter-chip bridge -- that is SPI0. */
+	case ALP_CC3501E_CMD_SPI1_CONFIGURE:
+		h = handle_spi1_configure;
+		break;
+	case ALP_CC3501E_CMD_SPI1_TRANSFER:
+		h = handle_spi1_transfer;
+		break;
+	case ALP_CC3501E_CMD_SPI1_RELEASE:
+		h = handle_spi1_release;
 		break;
 	case ALP_CC3501E_CMD_CAM_ENABLE:
 		h = handle_cam_enable;

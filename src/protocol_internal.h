@@ -199,6 +199,24 @@ alp_cc3501e_resp_t handle_gpio_set_interrupt(const uint8_t *req,
                                              size_t         reply_cap,
                                              size_t        *reply_data_len);
 
+/* protocol_spi.c: SPI1 host passthrough (0x55..0x57).  NOT the inter-chip
+ * bridge -- that is SPI0, a slave instance these opcodes never touch. */
+alp_cc3501e_resp_t handle_spi1_configure(const uint8_t *req,
+                                         size_t         req_len,
+                                         uint8_t       *reply_data,
+                                         size_t         reply_cap,
+                                         size_t        *reply_data_len);
+alp_cc3501e_resp_t handle_spi1_transfer(const uint8_t *req,
+                                        size_t         req_len,
+                                        uint8_t       *reply_data,
+                                        size_t         reply_cap,
+                                        size_t        *reply_data_len);
+alp_cc3501e_resp_t handle_spi1_release(const uint8_t *req,
+                                       size_t         req_len,
+                                       uint8_t       *reply_data,
+                                       size_t         reply_cap,
+                                       size_t        *reply_data_len);
+
 /* protocol_camera.c: camera enables (0x60..0x61). */
 alp_cc3501e_resp_t handle_cam_enable(const uint8_t *req,
                                      size_t         req_len,
