@@ -7,6 +7,42 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-08-30
+
+First release carrying the E1M connector's SPI1 passthrough (#83): opcodes
+`0x55` / `0x56` / `0x57` (SPI1 CONFIGURE / TRANSFER / RELEASE) and the CC3501E
+SPI1 master HAL behind `CC3501E_WIFI`.  **Wire protocol bumped to v6** — a host
+built against v5 will be refused by `GET_VERSION`, which is the point.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
+
+```
+size    : 1093668 bytes
+sha256  : 5f771b4872933a71757ffaf19946e985423b706d40b6584634acc1058cc075c4
+marker  : fw_version 0.6.0 -> 0x0600
+text    : 1092920
+```
+
+Bench: the E1M-AEN801 runs this image with the alp-sdk host driver — bring-up
+`0`, `PING ok after 1 attempt`, `GET_VERSION -> protocol v6 (host expects v6)
+-- match`, and the SPI1 group exercised end to end (`configure -> 0
+(actual_hz=0 max_xfer=4088)`, a `9F` RDID transfer, a `05` RDSR under CS_HOLD,
+a read under that hold, and a release that is idempotent on repeat).
+
+Also in this release, both no-op for the image:
+
+- `ti/build_ti.ps1` no longer aborts when SysConfig emits a warning (#85).
+  `CONFIG_SPI_1` added four pin warnings, and `$ErrorActionPreference = 'Stop'`
+  turned the `0 error(s), 8 warning(s)` summary on stderr into a terminating
+  error — so every build on main died before the compiler ran while a stale
+  `.bin` sat in `build/ti/` looking flashable.
+- `prebuilt/BUILT_FROM` re-pointed at this release and its `inert:` line
+  dropped, per its own instructions.
+
+**Flash-set stamp:** regenerate with `VERSION=0.6.0.0` — an existing flash-set
+built at another version will not do (see the warning in `README.md`).
+
 ## [0.5.0] — 2026-08-29
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK

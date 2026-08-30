@@ -24,15 +24,8 @@
 # When cutting a real release: bump `built-from` to the release commit, update
 # `image-sha256`, and DELETE every `inert:` line (they described the old blob).
 
-built-from:   4e5bfd665e9cf7e5ed76d979769ce65e7f34f6aa
-image-sha256: 980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109
+built-from:   d8037ccccc9d9901d671e22fbc3de6549d823c83
+image-sha256: 5f771b4872933a71757ffaf19946e985423b706d40b6584634acc1058cc075c4
 
 # Later src/hal/ti commits verified not to change the image.
-#   8ddfff2  fix(ti): guard g_adc_probe_stat behind CC3501E_WEDGE_PROBE (#79)
-#            Guards a definition that was already dead-stripped because nothing
-#            outside CC3501E_WEDGE_PROBE referenced it.  Rebuilt with the guard:
-#            build/ti/cc3501e-bridge.out sha256
-#            de4b6c4b6d2d0244e4c3b97d24e12358fb9babe01d01abf6d2afb22293720faf,
-#            byte-identical to the pre-change build, and the resulting .bin
-#            matched image-sha256 above exactly.
-inert: 8ddfff2773343a6f90f2193676c64f29a95d3760
+#   (none -- this blob is current with main)
