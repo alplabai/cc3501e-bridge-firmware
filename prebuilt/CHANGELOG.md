@@ -7,51 +7,29 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.0] — 2026-08-30
+## [0.5.0] — 2026-08-30
 
-First release carrying the E1M connector's SPI1 passthrough (#83): opcodes
-`0x55` / `0x56` / `0x57` (SPI1 CONFIGURE / TRANSFER / RELEASE) and the CC3501E
-SPI1 master HAL behind `CC3501E_WIFI`.  **Wire protocol bumped to v6** — a host
-built against v5 will be refused by `GET_VERSION`, which is the point.
+> **Re-cut on 2026-08-30, before distribution.**  An earlier 0.5.0 artifact
+> (`sha256 980db6c9...`, wire protocol 5) was built on 2026-08-29 and never
+> left this repository, so the version number was reused rather than burned.
+> The blob, its signature and its manifest under `prebuilt/` are the re-cut
+> ones; nothing carrying the earlier bytes was ever released.
+>
+> **The re-cut changes the wire protocol under an unchanged app SemVer.**  A
+> part flashed with the earlier 0.5.0 reports the same `fw_version=0x0500` as
+> this one while speaking protocol **5**, so that marker no longer separates
+> them.  `GET_VERSION` does, and it is the check that matters: the host refuses
+> a protocol mismatch outright.  Use it, not `fw_version`, to identify what a
+> part is running.
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
 
 ```
 size    : 1093668 bytes
-sha256  : 5f771b4872933a71757ffaf19946e985423b706d40b6584634acc1058cc075c4
-marker  : fw_version 0.6.0 -> 0x0600
-text    : 1092920
-```
-
-Bench: the E1M-AEN801 runs this image with the alp-sdk host driver — bring-up
-`0`, `PING ok after 1 attempt`, `GET_VERSION -> protocol v6 (host expects v6)
--- match`, and the SPI1 group exercised end to end (`configure -> 0
-(actual_hz=0 max_xfer=4088)`, a `9F` RDID transfer, a `05` RDSR under CS_HOLD,
-a read under that hold, and a release that is idempotent on repeat).
-
-Also in this release, both no-op for the image:
-
-- `ti/build_ti.ps1` no longer aborts when SysConfig emits a warning (#85).
-  `CONFIG_SPI_1` added four pin warnings, and `$ErrorActionPreference = 'Stop'`
-  turned the `0 error(s), 8 warning(s)` summary on stderr into a terminating
-  error — so every build on main died before the compiler ran while a stale
-  `.bin` sat in `build/ti/` looking flashable.
-- `prebuilt/BUILT_FROM` re-pointed at this release and its `inert:` line
-  dropped, per its own instructions.
-
-**Flash-set stamp:** regenerate with `VERSION=0.6.0.0` — an existing flash-set
-built at another version will not do (see the warning in `README.md`).
-
-## [0.5.0] — 2026-08-29
-
-Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
-10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
-
-```
-size    : 1092384 bytes
-sha256  : 980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109
+sha256  : dee3c34c594ca14c0af5899b61a73b022ac184adef7670d3cfed2bf04dd8b8d9
 marker  : fw_version 0.5.0 -> 0x0500
+text    : 1092920
 ```
 
 - `cc3501e-v0.5.0.bin`         -- signed firmware image (full shipped stack)
@@ -59,25 +37,34 @@ marker  : fw_version 0.5.0 -> 0x0500
   (the VALIDATION vendor key -- a bench-grade artifact, not production-key;
   verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem -signature
   cc3501e-v0.5.0.bin.sig cc3501e-v0.5.0.bin`)
-- `cc3501e-v0.5.0.bin.sha256`  -- integrity manifest (`980db6c9d5743581f68fe7a89119e06f29ff83273f6fe3ab723a496febc31109`)
+- `cc3501e-v0.5.0.bin.sha256`  -- integrity manifest (`dee3c34c594ca14c0af5899b61a73b022ac184adef7670d3cfed2bf04dd8b8d9`)
 
 | Number | Value | What it gates |
 |---|---|---|
 | App SemVer (`firmware-version.txt`) | **0.5.0** | the `fw_version` marker the bridge reports in `DIAG` (`0x0500`) |
-| Wire protocol (`ALP_CC3501E_PROTOCOL_VERSION`) | **5** | `GET_VERSION`; unchanged from 0.4.x, so a 0.4.x host talks to this image |
+| Wire protocol (`ALP_CC3501E_PROTOCOL_VERSION`) | **6** | `GET_VERSION`; the SPI1 passthrough opcodes bumped it from 5, so a 0.4.x or pre-re-cut host is refused |
 | GPE image `--version` (this artifact's stamp) | **0.5.0.0** | the version the SBL compares against the part's last-seen version |
 
 > **Anti-rollback still applies to this artifact.** The `0.5.0.0` stamp is far
 > BELOW what a bench or OTA-iteration unit has already seen -- the bench part
-> behind these results sits at `0.149.66.35`. Flashing `0.5.0.0` onto such a unit
+> behind these results sits at `0.149.71.0`. Flashing `0.5.0.0` onto such a unit
 > streams clean and then refuses to boot. Re-wrap the same image at a legal stamp
-> (`VERSION=0.149.67.0 ti/regen_flashset.sh`, major MUST be `0`, every field
+> (`VERSION=0.149.72.0 ti/regen_flashset.sh`, major MUST be `0`, every field
 > <= 255). `README.md` and `BRINGUP_STATUS.md` carry the full rule.
 
 **Bench-verified on an E1M-AEN801** (flashset `01496637`): 6/6 cold-cycle trials,
 7/7 functional surfaces, **0 boot failures, 0 failures** — `ver`, `wifi scan`,
 `ble enable`, `ble scan`, `ble scan-stop`, `ver` after the radio op, and the
 GPIO proxy.
+
+**The re-cut was re-verified on the same board** (2026-08-30, re-wrapped at
+`VERSION=0.149.71.0` because the `0.5.0.0` stamp is far below that part's
+history): full 144676 / 240 / 1340 / 12 / 1099332-byte programming run, 20 s
+cold cycle, then bring-up `0`, `PING ok after 1 attempt`, `GET_VERSION ->
+protocol v6 (host expects v6) -- match`, and the SPI1 group end to end
+(`configure -> 0 (actual_hz=0 max_xfer=4088)`, a `9F` RDID transfer, a `05`
+RDSR under CS_HOLD, a read under that hold, and a release that is idempotent on
+repeat).
 
 Minor bump rather than patch: this changes observable behaviour, not only
 defects.
@@ -111,6 +98,15 @@ defects.
   **raw code only, no unit** — the trip awaits TI's transfer function.
 - Bench-probe capture of host-DMA channel state, raw SPI `RIS`, SoC `ERRSRIS`,
   and the watchdog registers.
+- **The E1M connector's SPI1 relayed through the bridge** (#83): opcodes `0x55`
+  / `0x56` / `0x57` (SPI1 CONFIGURE / TRANSFER / RELEASE) and the CC3501E SPI1
+  master HAL behind `CC3501E_WIFI`.  This is what took the wire protocol to
+  **6**.
+- `ti/build_ti.ps1` no longer aborts when SysConfig emits a warning (#85).
+  `CONFIG_SPI_1` added four pin warnings, and `$ErrorActionPreference = 'Stop'`
+  turned the `0 error(s), 8 warning(s)` summary on stderr into a terminating
+  error, so every build died before the compiler ran while a stale `.bin` sat
+  in `build/ti/` looking flashable.  No effect on the image.
 
 ### Known limitations
 
