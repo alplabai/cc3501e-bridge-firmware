@@ -99,9 +99,22 @@ Write-Host "== SysConfig: generate the board file (CONFIG_SPI_0) =="
 # board file + that UART2 instance (on free pins), keeping the silicon-validated
 # DEFAULT board file (cc3501e_aen.syscfg) byte-identical for the default build.
 $syscfgFile = if ($WifiHostDriver) { "$PSScriptRoot\cc3501e_aen_wifi.syscfg" } else { "$PSScriptRoot\cc3501e_aen.syscfg" }
+# sysconfig_cli.bat writes its "N error(s), M warning(s)" summary to STDERR, and
+# under $ErrorActionPreference = 'Stop' PowerShell turns a native stderr write
+# into a terminating NativeCommandError -- so the script died HERE, before the
+# compiler ran, the moment SysConfig had anything to warn about.  #83 made that
+# unconditional: CONFIG_SPI_1 adds four "Connected to hardware ... on the CC35X1
+# LaunchPad" pin warnings, so every build on main aborted at this line while the
+# stale .bin from a previous run sat in $out looking flashable.  Exactly the
+# failure the compile loop at the bottom of this file already guards against.
+# The exit code is the real signal and is checked on the next line.
+$prevEAPsyscfg = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & $SysconfigCli --product "$SdkDir\.metadata\product.json" --compiler ticlang `
-    --output $out $syscfgFile
-if ($LASTEXITCODE -ne 0) { throw "SysConfig failed" }
+    --output $out $syscfgFile 2>&1 | ForEach-Object { Write-Host "  $_" }
+$syscfgRc = $LASTEXITCODE
+$ErrorActionPreference = $prevEAPsyscfg
+if ($syscfgRc -ne 0) { throw "SysConfig failed" }
 
 Write-Host "== SysConfig: MemoryConfigurator -> flash map (memcfg) =="
 # Ports the step build_ti.sh has always had (its lines 82-90).  This script CONSUMED
