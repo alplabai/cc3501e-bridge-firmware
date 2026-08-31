@@ -79,8 +79,35 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * cc3501e_sock_send() in alp-sdk for the host half.  The bump is semantic,
  * not structural (the byte was already on the wire): it exists so THIS
  * firmware never reads an OLD host's always-zero byte 3 as a real seq, which
- * would let it serve a stale cached reply for a genuinely new send. */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL 7
+ * would let it serve a stale cached reply for a genuinely new send.
+ *
+ * v8 (issue #102): the SAME defect, generalised.  #89/v7 covered SOCK_SEND
+ * only; every other worker-routed opcode (25 of them -- see protocol.c's
+ * "generic worker-routed request-identity latch" section) still had no
+ * request identity at all.  v8 repurposes bits 3..7 of the HEADER flags
+ * byte (0x08..0x80, unused by every host through v7 -- protocol.c's
+ * protocol_dispatch() used to `(void)flags` the whole thing) as a 5-bit
+ * retry seq the host assigns once per logical command and re-sends
+ * unchanged on a poll_by_repeat() retry.  Zero wire bytes added; the bump is
+ * semantic, exactly like v7's, and for the identical reason: an OLD (v7)
+ * host always sends flags bits 3..7 == 0, and a v8 firmware reading that as
+ * "seq 0" WITHOUT the version gate would see every one of that host's
+ * same-opcode frames as a matching retry and could serve a stale cached
+ * reply for a genuinely new command -- the same silent-drop shape the v7
+ * paragraph above describes, just triggered by the header instead of one
+ * struct's reserved byte.  The GET_VERSION gate is what stops it, as before.
+ *
+ * PAIRED ALP-SDK CHANGE NOT YET LANDED.  This firmware repo and alp-sdk are
+ * separate repos + separate PRs (ADR 0031); the host-side half -- assigning
+ * the seq once per logical command in poll_by_repeat() and re-sending it
+ * unchanged on retries, plus bumping ALP_CC3501E_PROTOCOL_VERSION 7 -> 8 --
+ * is deliberately NOT part of this change (see the PR body).  Until it
+ * lands, this firmware's v8 disagrees with alp-sdk's default-branch v7 on
+ * purpose: the assert below is EXPECTED to fail CI's "protocol version
+ * parity" job and this repo's own stub-build / gen_protocol_vectors.py
+ * --check gates in the meantime -- the atomicity cost the README already
+ * documents for the repo split, not a regression to chase here. */
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL 8
 
 _Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
                "<alp/protocol/cc3501e.h> is not the protocol version this firmware "

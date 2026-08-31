@@ -443,4 +443,12 @@ extern uint8_t  g_last_error;
 extern uint32_t g_frames_ok;
 extern uint32_t g_frames_err;
 
+/* Generic worker-routed request-identity latch hit counter (issue #102).
+ * DEFINED + incremented in protocol.c (the three shared worker-routed
+ * helpers, both SPI-ISR context like the counters above, so no volatile /
+ * critical section needed).  Its ground-truth pair, g_worker_execs, is
+ * owned by worker.c and declared in worker.h (included above) since it is
+ * DEFINED there.  protocol_diag.c reads both for DIAG_GET_STATS. */
+extern uint32_t g_retry_latch_hits;
+
 #endif /* CC3501E_BRIDGE_PROTOCOL_INTERNAL_H */

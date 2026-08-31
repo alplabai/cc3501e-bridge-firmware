@@ -44,6 +44,7 @@
  * ALP_CC3501E_RESP_ERR_INVALID").
  */
 
+#include <stdbool.h>
 #include <string.h>
 #include "protocol_internal.h"
 
@@ -54,6 +55,148 @@
 uint8_t  g_last_error = ALP_CC3501E_RESP_OK;
 uint32_t g_frames_ok;
 uint32_t g_frames_err;
+uint32_t g_retry_latch_hits;
+
+/* --------------------------------------------------------------- */
+/* Generic worker-routed request-identity latch (issue #102)         */
+/* --------------------------------------------------------------- */
+/*
+ * #89 gave CMD_SOCK_SEND a request seq (protocol_sockets.c's
+ * g_sock_send_*) so a lost reply could not make poll_by_repeat()'s retry
+ * look like a brand-new send.  That fix is scoped to one opcode; #102 is
+ * every OTHER worker-routed opcode (25 of them) having no request identity
+ * at all.  Rather than duplicate the cache per family, this lifts it into
+ * the ONE seam every one of them already funnels through -- the three
+ * helpers below -- so all 25 get it with zero per-opcode edits.  SOCK_SEND
+ * keeps its own cache unchanged (folding it in is a follow-up, see the PR:
+ * the bench that would validate the fold is down).  SPI1_TRANSFER also
+ * keeps its own existing mechanism (protocol_spi.c) -- it hand-rolls its
+ * own poll loop and never calls these helpers.  SOCK_RECV's ring fast path
+ * (protocol_sockets.c) is untouched; only its worker-routed FALLBACK (rare,
+ * ring miss) funnels through here, same as any other opcode.
+ *
+ * MECHANISM: bits 3..7 of the request header's flags byte (0x08..0x80) are
+ * unused by every host up to protocol v7 -- protocol_dispatch() used to
+ * discard the whole byte with `(void)flags`.  Repurposing them as a 5-bit
+ * retry seq costs zero wire bytes, the same shape as v7's SOCK_SEND bump.
+ * s_current_req_seq is extracted from flags ONCE per protocol_dispatch()
+ * call (see there) and read by the three helpers below; a plain static is
+ * safe because the transport is strict request/reply lockstep (one frame
+ * decoded end-to-end per protocol_dispatch() call, see protocol.h's framing
+ * doc) -- there is no re-entrant or cross-context caller to race with.
+ */
+#define CC3501E_REQ_SEQ_SHIFT 3u
+#define CC3501E_REQ_SEQ_MASK  0x1Fu /* 5 bits: flags 0x08,0x10,0x20,0x40,0x80 */
+
+static uint8_t s_current_req_seq;
+
+/*
+ * The single most-recently-COLLECTED worker-routed outcome, cached so a
+ * matching-(cmd,seq) retry -- a lost/misframed reply that made
+ * poll_by_repeat() re-send the identical frame -- is served WITHOUT
+ * resubmitting to the worker.  ~38 B of static RAM.
+ *
+ * FAILURE MODE, STATED PLAINLY -- this is a residual risk being accepted,
+ * not a case the design eliminates.  seq wraps mod 32.  A genuinely NEW
+ * command could be served a STALE cached reply if ALL of: same opcode,
+ * same 5-bit seq as the cached entry, no intervening worker-routed
+ * completion (ANY other worker-routed opcode's DONE/ERR overwrites this
+ * one latch -- see retry_latch_store), AND no intervening same-cmd frame
+ * carrying a DIFFERENT seq (retry_latch_serve's invalidation below closes
+ * that specific gap).  That needs ~32 intervening logical commands, none
+ * of them worker-routed -- unlikely, but constructible, and the
+ * consequence is the bad one: e.g. a WIFI_AP_STOP believed executed but
+ * never run, on a part where ap-stop already wedges the bridge
+ * (alp-sdk#1564).
+ */
+static struct {
+	bool    valid;
+	uint8_t cmd;
+	uint8_t seq;
+	uint8_t status; /* alp_cc3501e_resp_t */
+	uint8_t len;    /* <= sizeof(data); a bigger successful reply is never cached */
+	uint8_t data[32];
+} s_retry_latch;
+
+void protocol_reset_retry_latch(void)
+{
+	s_retry_latch.valid = false;
+}
+
+/* Serve @p cmd's request from the latch when the request's seq (already
+ * extracted into s_current_req_seq by protocol_dispatch) matches the cached
+ * entry -- WITHOUT touching the worker.  @p reply_data / @p reply_cap may
+ * be NULL / 0 for a helper that never produces reply data
+ * (handle_worker_routed_payload): the cached len for THOSE opcodes is
+ * always 0 (every store call site for that helper passes len 0), so
+ * nothing is ever copied through a NULL pointer.
+ *
+ * Also implements the MANDATORY item-4 mitigation: a same-cmd request
+ * carrying a DIFFERENT seq proves the host has moved on to a new logical
+ * command, so the stale entry is dropped right here rather than waiting for
+ * an unrelated opcode to eventually overwrite the single latch.  Mirrors
+ * protocol_spi.c's SPI1_TRANSFER "different seq: drop it and start fresh"
+ * rule. */
+static bool retry_latch_serve(alp_cc3501e_cmd_t   cmd,
+                              uint8_t            *reply_data,
+                              size_t              reply_cap,
+                              size_t             *reply_data_len,
+                              alp_cc3501e_resp_t *status)
+{
+	if (!s_retry_latch.valid || s_retry_latch.cmd != (uint8_t)cmd) {
+		return false; /* nothing cached for this opcode */
+	}
+	if (s_retry_latch.seq != s_current_req_seq) {
+		s_retry_latch.valid = false; /* different logical command -- drop it */
+		return false;
+	}
+	if ((size_t)s_retry_latch.len > reply_cap) {
+		/* Should not happen (the len<=32 cap on store, and each opcode always
+		 * routes through the same one of the three helpers) -- fall through to
+		 * a fresh submit rather than risk a buffer overrun. */
+		return false;
+	}
+	if (s_retry_latch.len > 0u) {
+		memcpy(reply_data, s_retry_latch.data, s_retry_latch.len);
+	}
+	*reply_data_len = s_retry_latch.len;
+	*status         = (alp_cc3501e_resp_t)s_retry_latch.status;
+	g_retry_latch_hits++;
+	return true;
+}
+
+/* Cache a worker-routed collect-edge outcome (WORKER_DONE / WORKER_ERR in
+ * the three helpers below).  The collecting frame IS a retry of the logical
+ * command, so s_current_req_seq is already the right seq to store.
+ *
+ * Caps cached data at 32 bytes: every hazardous opcode's reply fits well
+ * under it (SOCK_OPEN 4 B, SPI1_CONFIGURE 8 B -- via its own family cache,
+ * not this one, BLE_GATT_REGISTER <= 18 B per ALP_CC3501E_BLE_GATT_MAX_CHARS
+ * 8 -- 2 + 2*8, every argless op 0 B).  The large-reply opcodes this
+ * excludes (WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ) are
+ * idempotent reads whose re-execution on a lost reply is slow, not
+ * harmful, so leaving them uncached is the deliberate tradeoff.
+ *
+ * A completion too big to cache still counts as "any completion overwrites
+ * the single latch" -- the failure-mode analysis on s_retry_latch above
+ * depends on that -- so it still drops whatever WAS cached rather than
+ * leave a stale, unrelated entry behind. */
+static void
+retry_latch_store(alp_cc3501e_cmd_t cmd, alp_cc3501e_resp_t status, const uint8_t *data, size_t len)
+{
+	if (len > sizeof(s_retry_latch.data)) {
+		s_retry_latch.valid = false;
+		return;
+	}
+	s_retry_latch.cmd    = (uint8_t)cmd;
+	s_retry_latch.seq    = s_current_req_seq;
+	s_retry_latch.status = (uint8_t)status;
+	s_retry_latch.len    = (uint8_t)len;
+	if (len > 0u) {
+		memcpy(s_retry_latch.data, data, len);
+	}
+	s_retry_latch.valid = true;
+}
 
 /* --------------------------------------------------------------- */
 /* Worker-routed state-machine helpers                               */
@@ -95,6 +238,11 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
 	if (reply_cap < min_cap) return ALP_CC3501E_RESP_ERR_NO_MEM;
 
+	alp_cc3501e_resp_t cached_status;
+	if (retry_latch_serve(cmd, reply_data, reply_cap, reply_data_len, &cached_status)) {
+		return cached_status;
+	}
+
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
 	const enum worker_state st  = worker_poll((uint8_t)cmd, reply_data, reply_cap, &n, &err);
@@ -103,15 +251,26 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 	case WORKER_DONE:
 		worker_reset();
 		*reply_data_len = n; /* command-specific payload (6 for GET_MAC, etc.) */
+		retry_latch_store(cmd, ALP_CC3501E_RESP_OK, reply_data, n);
 		return ALP_CC3501E_RESP_OK;
 	case WORKER_ERR:
 		worker_reset();
-		if (err == CC3501E_HW_ERR_NOTIMPL) return ALP_CC3501E_RESP_ERR_NOT_READY;
-		if (err == CC3501E_HW_ERR_INVAL) return ALP_CC3501E_RESP_ERR_INVALID;
+		if (err == CC3501E_HW_ERR_NOTIMPL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NOT_READY, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NOT_READY;
+		}
+		if (err == CC3501E_HW_ERR_INVAL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_INVALID;
+		}
 		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
 		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
 		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
-		if (err == CC3501E_HW_ERR_STATE) return ALP_CC3501E_RESP_ERR_STATE;
+		if (err == CC3501E_HW_ERR_STATE) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
 		/* No job in flight: queue one and ask the host to re-issue. */
@@ -134,6 +293,11 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 {
 	*reply_data_len = 0u;
 
+	alp_cc3501e_resp_t cached_status;
+	if (retry_latch_serve(cmd, NULL, 0u, reply_data_len, &cached_status)) {
+		return cached_status;
+	}
+
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
 	const enum worker_state st  = worker_poll((uint8_t)cmd, NULL, 0u, &n, &err);
@@ -141,15 +305,26 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 	switch (st) {
 	case WORKER_DONE:
 		worker_reset();
+		retry_latch_store(cmd, ALP_CC3501E_RESP_OK, NULL, 0u);
 		return ALP_CC3501E_RESP_OK;
 	case WORKER_ERR:
 		worker_reset();
-		if (err == CC3501E_HW_ERR_NOTIMPL) return ALP_CC3501E_RESP_ERR_NOT_READY;
-		if (err == CC3501E_HW_ERR_INVAL) return ALP_CC3501E_RESP_ERR_INVALID;
+		if (err == CC3501E_HW_ERR_NOTIMPL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NOT_READY, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NOT_READY;
+		}
+		if (err == CC3501E_HW_ERR_INVAL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_INVALID;
+		}
 		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
 		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
 		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
-		if (err == CC3501E_HW_ERR_STATE) return ALP_CC3501E_RESP_ERR_STATE;
+		if (err == CC3501E_HW_ERR_STATE) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
 		/* No job in flight: queue THIS one (with its payload) + return BUSY (the
@@ -187,6 +362,11 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 	*reply_data_len = 0u;
 	if (reply_cap < min_cap) return ALP_CC3501E_RESP_ERR_NO_MEM;
 
+	alp_cc3501e_resp_t cached_status;
+	if (retry_latch_serve(cmd, reply_data, reply_cap, reply_data_len, &cached_status)) {
+		return cached_status;
+	}
+
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
 	const enum worker_state st  = worker_poll((uint8_t)cmd, reply_data, reply_cap, &n, &err);
@@ -195,15 +375,26 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 	case WORKER_DONE:
 		worker_reset();
 		*reply_data_len = n; /* the worker copied the attribute value into reply_data */
+		retry_latch_store(cmd, ALP_CC3501E_RESP_OK, reply_data, n);
 		return ALP_CC3501E_RESP_OK;
 	case WORKER_ERR:
 		worker_reset();
-		if (err == CC3501E_HW_ERR_NOTIMPL) return ALP_CC3501E_RESP_ERR_NOT_READY;
-		if (err == CC3501E_HW_ERR_INVAL) return ALP_CC3501E_RESP_ERR_INVALID;
+		if (err == CC3501E_HW_ERR_NOTIMPL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NOT_READY, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NOT_READY;
+		}
+		if (err == CC3501E_HW_ERR_INVAL) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_INVALID;
+		}
 		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
 		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
 		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
-		if (err == CC3501E_HW_ERR_STATE) return ALP_CC3501E_RESP_ERR_STATE;
+		if (err == CC3501E_HW_ERR_STATE) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
 		/* No job in flight: queue THIS one (with its payload) + return BUSY. */
@@ -232,8 +423,13 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
                                      size_t         reply_cap,
                                      size_t        *reply_data_len)
 {
-	(void)flags; /* no request flag alters dispatch today */
-	*reply_data_len = 0u;
+	/* Bits 3..7 of flags carry the v8 request-retry seq (issue #102); bits
+	 * 0..2 (RESP_REQUIRED / ASYNC_EVENT / CONTINUATION) still don't alter
+	 * dispatch.  Stashed here, once, for the three worker-routed helpers in
+	 * this file to read -- see the "generic worker-routed request-identity
+	 * latch" section above for why one seam suffices for every opcode. */
+	s_current_req_seq = (uint8_t)((flags >> CC3501E_REQ_SEQ_SHIFT) & CC3501E_REQ_SEQ_MASK);
+	*reply_data_len   = 0u;
 
 	cmd_handler_t h = NULL;
 	switch (cmd) {

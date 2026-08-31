@@ -90,6 +90,19 @@ static struct {
 	volatile uint16_t req_len;
 } job;
 
+/* Ground truth for "the HAL body actually ran" (issue #102's DIAG_GET_STATS
+ * pairing with g_retry_latch_hits -- protocol.c / protocol_diag.c).
+ * worker_execute() is the ONE place any cc3501e_hw_* body is called from, on
+ * either path (the ISR-synchronous stub submit or the real drain thread), so
+ * incrementing it here -- and nowhere else -- is what lets a bench run tell
+ * "reply lost, correctly de-duped" (this stays put, the latch hit counts)
+ * from "reply lost, re-executed" (this increments again).  volatile: the
+ * real (CC3501E_WIFI) build increments it from worker_run_pending()'s drain
+ * context, which protocol_diag.c's DIAG_GET_STATS handler (SPI-ISR context)
+ * reads from a different context -- unlike g_frames_ok/g_frames_err/
+ * g_retry_latch_hits, which are only ever touched from the SPI-ISR side. */
+volatile uint32_t g_worker_execs;
+
 /* Little-endian store helper for the socket reply wire (parallels protocol.c). */
 static void wk_put_le16(uint8_t *p, uint16_t v)
 {
@@ -132,6 +145,12 @@ static void worker_execute(uint8_t cmd)
 	uint8_t buf[ALP_CC3501E_MAX_PAYLOAD];
 	size_t  len = 0u;
 	int     rv  = CC3501E_HW_ERR_NOTIMPL;
+
+	/* One increment per drain execution, unconditionally -- issue #102's
+	 * ground truth that the HAL body ran, independent of what it returned
+	 * (OK, an HW_ERR_*, or the default NOTIMPL below for an opcode nobody
+	 * added a case for). */
+	g_worker_execs++;
 
 	switch (cmd) {
 	case ALP_CC3501E_CMD_GET_MAC: {

@@ -57,7 +57,16 @@ alp_cc3501e_resp_t handle_diag_log_level(const uint8_t *req,
 	return hw_to_resp(cc3501e_hw_set_log_level(req[0]));
 }
 
-/* DIAG_GET_STATS (0x70): reply data = frames_ok(LE32) | frames_err(LE32). */
+/* DIAG_GET_STATS (0x70): reply data = frames_ok(LE32) | frames_err(LE32) |
+ * worker_execs(LE32) | retry_latch_hits(LE32).  The reply grew from 8 to 16
+ * bytes additively (issue #102) -- an old host reading only the first 8
+ * still gets frames_ok/frames_err unchanged; no protocol bump needed for
+ * this, unlike the flags-byte seq itself (see protocol_meta.c).
+ *
+ * worker_execs / retry_latch_hits are the pair a bench run reads to tell
+ * "reply lost, correctly de-duped" from "reply lost, re-executed": issue
+ * one logical command, deliberately drop its first OK reply, let the retry
+ * land, then read this.  Pass = worker_execs +1 and retry_latch_hits +1. */
 alp_cc3501e_resp_t handle_diag_get_stats(const uint8_t *req,
                                          size_t         req_len,
                                          uint8_t       *reply_data,
@@ -67,10 +76,12 @@ alp_cc3501e_resp_t handle_diag_get_stats(const uint8_t *req,
 	(void)req;
 	*reply_data_len = 0u;
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
-	if (reply_cap < 8u) return ALP_CC3501E_RESP_ERR_NO_MEM;
+	if (reply_cap < 16u) return ALP_CC3501E_RESP_ERR_NO_MEM;
 	put_le32(&reply_data[0], g_frames_ok);
 	put_le32(&reply_data[4], g_frames_err);
-	*reply_data_len = 8u;
+	put_le32(&reply_data[8], g_worker_execs);
+	put_le32(&reply_data[12], g_retry_latch_hits);
+	*reply_data_len = 16u;
 	return ALP_CC3501E_RESP_OK;
 }
 

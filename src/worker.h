@@ -50,6 +50,20 @@ enum worker_state {
 /* Initialise the worker to IDLE (called once from transport init / main). */
 void worker_init(void);
 
+/* Ground truth for "worker_execute() actually ran the HAL body" (issue
+ * #102).  DEFINED and incremented in worker.c's worker_execute() -- the ONE
+ * call site for every cc3501e_hw_* body, on either path (the ISR-
+ * synchronous stub submit or the real drain thread) -- and read by
+ * protocol_diag.c's DIAG_GET_STATS handler alongside protocol.c's
+ * g_retry_latch_hits: a bench run that deliberately drops one reply and
+ * lets the retry land tells "correctly de-duped" (this counter stays put,
+ * the latch-hit counter increments) from "re-executed" (this counter
+ * increments again) by comparing the two.  volatile: the real build's
+ * increment (drain-thread context) and DIAG_GET_STATS's read (SPI-ISR
+ * context) are different contexts, unlike the SPI-ISR-only counters in
+ * protocol_internal.h. */
+extern volatile uint32_t g_worker_execs;
+
 /*
  * worker_submit -- queue a job for the drain.  @p cmd is the opcode the
  * job services (e.g. ALP_CC3501E_CMD_GET_MAC).  For argument-free getters

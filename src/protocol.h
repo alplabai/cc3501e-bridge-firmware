@@ -161,4 +161,23 @@ size_t protocol_build_reply(const uint8_t *req_frame,
                             uint8_t       *reply_frame,
                             size_t         reply_cap);
 
+/*
+ * protocol_reset_retry_latch -- invalidate the generic worker-routed
+ * request-identity latch (protocol.c's static s_retry_latch, issue #102).
+ *
+ * Production boot needs no call to this: a static struct's `valid` field is
+ * zero-initialised, so the latch already starts empty.  It exists purely so
+ * the host unit-test binary can clear the SAME file-static between ZTEST
+ * cases -- it is a single process that never reboots between tests, so
+ * without this a latch entry written by one test (e.g. a BLE_ENABLE
+ * collected under seq 0) would be served back as a cache hit to a LATER,
+ * unrelated test that happens to exercise the same opcode with the same
+ * (default-zero) seq, turning an expected BUSY/submit into a served-from-
+ * cache status and breaking that test.  Mirrors worker_init(), which exists
+ * for the identical reason (see the worker.h doc comment); called from
+ * tests/unit/transport_spi/src/test_transport_spi.c's per-test reset hook,
+ * never from main().
+ */
+void protocol_reset_retry_latch(void);
+
 #endif /* CC3501E_BRIDGE_PROTOCOL_H */
