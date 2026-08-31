@@ -137,14 +137,26 @@ sha256  7db034a748840f2387725ef1388d5092c78fd6de517958938819f6130025772a
 size    1093732
 ```
 
-Reproducible in that build: two independent clean rebuilds in the same
-environment agree byte-for-byte. `git log 3d963c98..dddefee -- src hal ti`
-shows only #93 touches those paths between the evidence above and
-`built-from`, and #93 was already attested byte-identical — so this should be
-the same source tree the `64ad6abb...` evidence above measured, at the same
-size. It is not the same hash. Not chased further here: both values are
-independently reproducible within their own build, and reconciling them needs
-the exact tool builds used each time, not just the `5.1.1.LTS` / `1.28.0` /
-`10.10.01.08` version strings this recipe pins — which is itself worth
-narrowing if a THIRD rebuild disagrees with either. Flagged, not papered
-over.
+Reproducible: two independent clean rebuilds in the same environment agree
+byte-for-byte.
+
+**Why this differs from the `64ad6abb...` above, and why that is expected.**
+The two are not the same source tree, despite `git log … -- src hal ti`
+showing nothing but the already-attested #93 between them. `firmware-version.txt`
+is **not** in that pathspec, and it is compiled in: `build_ti.ps1` stamps the
+`fw_version` marker from it at build time (`== fw_version marker: 0.5.1 ->
+0x0501 (from firmware-version.txt) ==`). `64ad6abb...` was built when that file
+read `0.6.0` (marker `0x0600`); `7db034a7...` was built at `0.5.1` (marker
+`0x0501`). One differing half-word, same 1093732-byte size. Nothing about the
+toolchain is implicated.
+
+That has a consequence worth stating, because it caused a real error here:
+**`built-from` must name a commit whose tree actually builds the shipped
+blob — which means watching `firmware-version.txt`, not just `src`/`hal`/`ti`.**
+This file first recorded `dddefee3` (the #97 merge), chosen because the
+freshness gate only walks `src hal ti` and `firmware-version.txt` is outside
+it. The gate was satisfied and the field was still wrong: `dddefee3`'s tree
+reads `0.6.0`, so it cannot produce the v0.5.1 artifact under it. Corrected to
+`615c723` (#100), the release commit that produced the shipped blob;
+`git diff 369c7e1 615c723 -- src hal ti` is empty, so the re-stamp changed the
+wrap only and the raw image is the one measured here.
