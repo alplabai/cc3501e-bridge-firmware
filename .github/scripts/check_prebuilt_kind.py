@@ -56,8 +56,17 @@ WRAPPED_MAGIC = bytes((0xC2, 0x47, 0x0C, 0x69))
 RAW_SP_MASK = 0xFFF00000
 RAW_SP_MATCH = 0x20000000
 
+#: A wrapped image carries its GPE anti-rollback stamp as four bytes
+#: (major, a, b, c) at file offset 36.  The CC35 SBL enforces monotonicity
+#: against the part's last-seen version, permanently, even with every
+#: *_rollback_protection_* fuse reading 0 -- so a stamp below what our units
+#: have seen ships a blob that streams clean and then refuses to boot.
+GPE_OFFSET = 36
+GPE_LEN = 4
+
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 RECIPE = REPO / "prebuilt" / "BUILD_RECIPE.md"
+BUILT_FROM = REPO / "prebuilt" / "BUILT_FROM"
 PREBUILT = REPO / "prebuilt"
 
 _VERSION = re.compile(r"\b\d+\.\d+\.\d+\b")
@@ -112,6 +121,61 @@ def observed_kind(head: bytes) -> tuple[str | None, str]:
     )
 
 
+def gpe_floor() -> tuple[int, ...] | None:
+    """Parse `gpe-floor: 0.a.b.c` out of prebuilt/BUILT_FROM, or None."""
+    if not BUILT_FROM.is_file():
+        return None
+    for line in BUILT_FROM.read_text(encoding="utf-8").splitlines():
+        if line.startswith("gpe-floor:"):
+            parts = line.split(":", 1)[1].strip().split(".")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                return tuple(int(p) for p in parts)
+    return None
+
+
+def newest_wrapped(blobs: list[pathlib.Path]) -> pathlib.Path | None:
+    """The highest-versioned wrapped blob -- the one customers are told to flash."""
+    best = None
+    best_key: tuple[int, ...] = ()
+    for b in blobs:
+        m = _BLOB.match(b.name)
+        if not m:
+            continue
+        head = b.read_bytes()[:20]
+        if len(head) < 20 or head[16:20] != WRAPPED_MAGIC:
+            continue
+        key = tuple(int(x) for x in m.group(1).split("."))
+        if key > best_key:
+            best, best_key = b, key
+    return best
+
+
+def check_gpe(blob: pathlib.Path, floor: tuple[int, ...]) -> int:
+    """Assert the shipped stamp has major 0 and clears the recorded floor."""
+    raw = blob.read_bytes()[GPE_OFFSET:GPE_OFFSET + GPE_LEN]
+    if len(raw) < GPE_LEN:
+        print(f"::error::{blob.relative_to(REPO)} is too short to hold a GPE stamp")
+        return 1
+    stamp = tuple(raw)
+    shown = ".".join(str(x) for x in stamp)
+    rc = 0
+    if stamp[0] != 0:
+        print(f"::error::{blob.relative_to(REPO)} GPE stamp {shown} has major "
+              f"{stamp[0]}; a GPE major >= 1 fails BL2 secure-boot with AUTH_ERROR")
+        rc = 1
+    if stamp < floor:
+        print(f"::error::{blob.relative_to(REPO)} GPE stamp {shown} is BELOW the "
+              f"recorded floor {'.'.join(str(x) for x in floor)} -- it would stream "
+              f"clean and then refuse to boot on any unit already at that version. "
+              f"Re-wrap at a higher stamp, or raise gpe-floor in prebuilt/BUILT_FROM "
+              f"if the floor itself is stale")
+        rc = 1
+    if rc == 0:
+        print(f"ok  {blob.relative_to(REPO)}  GPE {shown} >= floor "
+              f"{'.'.join(str(x) for x in floor)}, major 0")
+    return rc
+
+
 def main() -> int:
     if not RECIPE.is_file():
         print(f"::error::{RECIPE.relative_to(REPO)} is missing -- "
@@ -159,6 +223,19 @@ def main() -> int:
             rc = 1
         else:
             print(f"ok  {rel}  {actual}  ({detail})")
+
+    floor = gpe_floor()
+    if floor is None:
+        print("::error::prebuilt/BUILT_FROM declares no `gpe-floor:` line -- "
+              "without it nothing stops a release shipping a stamp our own "
+              "units can never accept")
+        return 1
+
+    newest = newest_wrapped(blobs)
+    if newest is None:
+        print("::error::no wrapped blob found to check the GPE stamp of")
+        return 1
+    rc |= check_gpe(newest, floor)
 
     return rc
 

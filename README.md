@@ -161,9 +161,9 @@ openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
 sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.1.bin.sha256)  prebuilt/cc3501e-v0.5.1.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
-#    THIS artifact's stamp (0.5.1.0) -- see the warning below.  An existing
+#    THIS artifact's stamp (0.149.74.0) -- see the warning below.  An existing
 #    flash-set built at another version will NOT do; regenerate it:
-#      VERSION=0.5.1.0 ti/regen_flashset.sh
+#      VERSION=0.149.74.0 ti/regen_flashset.sh
 #
 # 3. Drop the blob in as the primary vendor image, and remove any stale
 #    pre-flattened image -- a leftover *.flashready.bin is used in preference
@@ -205,9 +205,9 @@ discriminator -- `0x0501` for this release, `0x0500` for anything older.
 
 Three distinct version numbers are in play here and they are **not**
 interchangeable -- app SemVer (`0.5.1`), wire protocol (`7`), and the GPE
-image stamp (`0.5.1.0`).  `prebuilt/CHANGELOG.md` has the table.
+image stamp (`0.149.74.0`).  `prebuilt/CHANGELOG.md` has the table.
 
-> **STOP -- check the unit's flash history before using this artifact's `0.5.1.0`
+> **STOP -- check the unit's flash history before using this artifact's `0.149.74.0`
 > stamp.**  The CC35 SBL enforces GPE-version **monotonicity against the last-seen
 > version on that part**, and it does so **even when every `*_rollback_protection_*`
 > fuse reads `0`**.  A warm programming run burns no fuses, so the report will show
@@ -215,7 +215,8 @@ image stamp (`0.5.1.0`).  `prebuilt/CHANGELOG.md` has the table.
 > stamp LOWER than anything ever flashed on the unit and it streams clean (exit 0,
 > the full ~1.09 MB) and then the SBL refuses to boot it: **dead link**, with an
 > empty XDS110 `query` image table.  Bench units used for OTA or flash iteration sit
-> far above `0.5.1.0` -- the bench part here is at `0.149.70.0`.  For such a unit,
+> at or above `0.149.74.0`.  The bench part here was last seen at `0.149.73.0`.
+> For a unit above this artifact's stamp,
 > re-wrap this same image at a legal stamp instead:
 >
 > ```sh

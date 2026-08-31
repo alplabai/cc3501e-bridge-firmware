@@ -39,7 +39,27 @@
 # failure the moment its PR merges.
 
 built-from:   dddefee3b37a2c637b11dd38d736318debd45a08
-image-sha256: 9d766385dd820a1dfb7b9cfa6348f1b4937ee2938f77927f7b66476f82ab0a5a
+image-sha256: d58d78a6697ea6d74c12ee51912dfb0434214f4244add2e6af03928919b0eb9f
+
+# The GPE anti-rollback floor the NEWEST shipped artifact must clear.
+#
+# The CC35 SBL enforces GPE-version monotonicity per part, against that part's
+# last-seen version, even when every *_rollback_protection_* fuse reads 0.  A
+# stamp below what a unit has already seen streams clean -- exit 0, the full
+# ~1.09 MB -- and then the SBL refuses to boot it: dead link, empty XDS110
+# `query` table.  It is permanent for that part.
+#
+# So an artifact stamped below our own bench units is unshippable, and no
+# amount of documentation fixes it: re-wrapping at a legal stamp needs the
+# signing assets, which a customer does not have.  This floor records the
+# highest stamp any unit here has been flashed at, and CI asserts the newest
+# wrapped blob clears it.  Raise it whenever a bench run flashes higher.
+#
+# History: releases 0.4.0/0.4.1/0.5.0 stamped SemVer-shaped values (0.4.0.0
+# etc.) and an earlier cut of 0.5.1 did the same.  That convention is broken by
+# construction -- every bench or OTA-iterated unit climbs into 0.149.x through
+# ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
+gpe-floor:    0.149.73.0
 
 # Later src/hal/ti commits verified not to change the image.
 #
