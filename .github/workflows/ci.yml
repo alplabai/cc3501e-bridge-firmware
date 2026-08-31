@@ -369,3 +369,17 @@ jobs:
             fi
           done
           exit $rc
+
+      # A blob's KIND matters as much as its hash.  prebuilt/ has shipped two
+      # of them under one naming scheme -- a raw build_ti.ps1 image and a TI
+      # flash-images-builder vendor_image -- and README's recipe copies the
+      # blob straight in as primary_vendor_image.sign.bin, which is only
+      # correct for the wrapped kind.  A raw blob there puts a bare Cortex-M
+      # vector table where the programmer expects a signed container: not a
+      # different build of the right thing, a different file format (#96).
+      #
+      # prebuilt/BUILD_RECIPE.md records which release is which in prose; this
+      # makes that record machine-checked, and also fails a NEW release whose
+      # kind nobody wrote down.
+      - name: each prebuilt's artifact kind matches BUILD_RECIPE.md
+        run: python3 .github/scripts/check_prebuilt_kind.py
