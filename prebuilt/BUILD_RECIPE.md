@@ -122,3 +122,29 @@ output of exactly the recipe above, built from exactly the commit
 `prebuilt/BUILT_FROM` names. The original "does not reproduce" finding
 compared stage 1's output to a stage-2 artifact — not a source, flag, or
 toolchain mismatch.
+
+## `raw-sha256` in `prebuilt/BUILT_FROM` (issue #92)
+
+`prebuilt/BUILT_FROM` records `raw-sha256` beside `image-sha256` so an
+`inert:` claim has a reproducible stage-1 target to rebuild and diff against,
+instead of the unreachable stage-2 one established above. Current value,
+rebuilt at `built-from` (`dddefee3b37a2c637b11dd38d736318debd45a08`) with
+`build_ti.ps1 -Ble` against a protocol-7 `alp-sdk` checkout (ticlang
+5.1.1.LTS, SysConfig 1.28.0, SimpleLink Wi-Fi SDK 10.10.01.08):
+
+```
+sha256  7db034a748840f2387725ef1388d5092c78fd6de517958938819f6130025772a
+size    1093732
+```
+
+Reproducible in that build: two independent clean rebuilds in the same
+environment agree byte-for-byte. `git log 3d963c98..dddefee -- src hal ti`
+shows only #93 touches those paths between the evidence above and
+`built-from`, and #93 was already attested byte-identical — so this should be
+the same source tree the `64ad6abb...` evidence above measured, at the same
+size. It is not the same hash. Not chased further here: both values are
+independently reproducible within their own build, and reconciling them needs
+the exact tool builds used each time, not just the `5.1.1.LTS` / `1.28.0` /
+`10.10.01.08` version strings this recipe pins — which is itself worth
+narrowing if a THIRD rebuild disagrees with either. Flagged, not papered
+over.

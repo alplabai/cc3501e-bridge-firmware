@@ -1,5 +1,5 @@
 # Which commit the newest prebuilt blob was built from, and which later
-# firmware commits have been VERIFIED to leave that blob byte-identical.
+# firmware commits have been VERIFIED not to change the compiled image.
 #
 # Why this file exists.  The `prebuilt freshness` CI job used to compare commit
 # DATES: it failed when any commit touching src/, hal/ or ti/ was newer than the
@@ -13,8 +13,21 @@
 #
 # So the check is now an ATTESTATION, not a date heuristic.  Every commit
 # touching src/, hal/ or ti/ after `built-from` must be listed under `inert:`,
-# with evidence, or the gate fails.  Nothing is auto-forgiven: adding a line here
-# is a deliberate claim that the shipped binary still corresponds to the source.
+# with evidence, or the gate fails.
+#
+# WHAT AN `inert:` LINE CLAIMS, precisely.  NOT that the shipped blob still
+# corresponds to source -- for a WRAPPED release that is impossible on any
+# permitted host, full stop: the last build stage signs with the vendor
+# VALIDATION private key, which is deliberately never on a build host
+# (keys/README.md: "The private half is not in this repository and never will
+# be"), so 70 bytes of ECDSA-P256 signature TLV plus the 32-byte SHA-256 TLV
+# over it are unreachable by construction (#94, #92).  An `inert:` line claims
+# the narrower, checkable thing instead: THIS COMMIT DOES NOT CHANGE THE
+# COMPILED IMAGE, established by rebuilding `raw-sha256` -- the stage-1
+# build_ti.ps1 output, before flash-images-builder wraps and signs it (see
+# BUILD_RECIPE.md) -- with and without the commit's diff, and comparing.  That
+# raw half is the only one a source commit can affect; the wrap and signature
+# add no source-derived content.
 #
 # CI cannot verify an `inert:` claim itself -- rebuilding needs license-gated TI
 # ticlang, which is not in CI -- so the claim is only as good as the evidence
@@ -22,7 +35,8 @@
 # get a PR green.
 #
 # When cutting a real release: bump `built-from` to the release commit, update
-# `image-sha256`, and DELETE every `inert:` line (they described the old blob).
+# `image-sha256` and `raw-sha256`, and DELETE every `inert:` line (they
+# described the old blob).
 #
 # This repo SQUASH-MERGES.  The commit that built the shipped blob almost always
 # lived on a feature branch first, under a different SHA than the one that lands
@@ -35,11 +49,16 @@
 # (sockets): cache SOCK_SEND's reply by seq..." (#89)).  CI failed every PR with
 # "built-from (9eb7751...) is not a commit in this repository" until this line
 # was repointed at 3d963c9 -- same blob, same sha256, just the SHA main actually
-# has.  Only record a SHA reachable from `main`; a branch-tip SHA is a ticking
-# failure the moment its PR merges.
+# has.  The same rot applies to every `inert:` SHA below, for the same reason --
+# it is copied from a PR branch too.  `.github/scripts/check_prebuilt_freshness.py`
+# checks both `built-from` and every `inert:` SHA for exactly this before doing
+# anything else, and fails with this incident named rather than a bare "not a
+# commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
+# ticking failure the moment its PR merges.
 
 built-from:   dddefee3b37a2c637b11dd38d736318debd45a08
 image-sha256: d58d78a6697ea6d74c12ee51912dfb0434214f4244add2e6af03928919b0eb9f
+raw-sha256:   7db034a748840f2387725ef1388d5092c78fd6de517958938819f6130025772a
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -61,17 +80,9 @@ image-sha256: d58d78a6697ea6d74c12ee51912dfb0434214f4244add2e6af03928919b0eb9f
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
 gpe-floor:    0.149.73.0
 
-# Later src/hal/ti commits verified not to change the image.
-#
-# WHAT AN `inert:` LINE CLAIMS HERE, precisely.  For a WRAPPED release the
-# shipped blob cannot be reproduced on any permitted host at all -- its last
-# step is a signature the build host cannot compute by design, so 70 bytes of
-# ECDSA TLV plus the 32-byte SHA-256 TLV over it are unreachable (#94, #92).
-# An `inert:` line therefore does NOT claim "the shipped blob reproduces".  It
-# claims the narrower, checkable thing: THIS COMMIT DOES NOT CHANGE THE
-# COMPILED IMAGE, established by rebuilding the raw stage-1 output with and
-# without the commit's diff and comparing.  That is the only half a source
-# commit can affect; the wrap and signature add no source-derived content.
+# Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
+# AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
+# compares against `raw-sha256`, not `image-sha256`.
 #   (none -- the v0.5.1 cut supersedes them.  The previous entry attested #93
 #   inert against the old built-from; that blob is gone and its attestation
 #   with it, exactly as this file's header prescribes for a real release.)
