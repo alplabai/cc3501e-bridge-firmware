@@ -23,7 +23,7 @@ only producers so far (see § 4).
 | **Inter-chip link** (PING / GET_VERSION / GET_MAC / RESET) | PASS, cold + warm | Hardware SS0 + READY framing is bench-validated on E1M-AEN801; `ver` remains responsive after radio ops. |
 | **Wi-Fi GET_MAC / scan / RSSI** | PASS | Real scan records with security decode validated through the bridge. |
 | **Wi-Fi connect-STA** | PASS | Async connect survives the bridge; re-confirmed 2026-08-28 on fw 0.4.0 (`state: connected`, `rssi=-35 dBm`, DHCP lease). Association is INTERMITTENT in practice -- several attempts returned `wifi connect ... timed out` or `-5` and needed a cold cycle. |
-| **Sockets** | **FAIL - does not connect** | `sock tcp-get` cannot open a TCP connection to ANY destination on fw 0.4.0 / protocol 5: LAN targets return `-1` (`ALP_ERR_INVAL`), public ones `-4` (`ALP_ERR_TIMEOUT`), while the same targets fetch fine from the host on the same LAN. `sock_open` succeeds (`handle=1`); the firmware emits no new error (`lasterr` stays `2` = `RESP_ERR_BUSY`), so the failure is host-side or a worker that never completes the connect job. **alp-sdk#1746 -- do not treat sockets as shipped.** |
+| **Sockets** | **PASS - 10/10 end-to-end** (fixed 2026-08-31) | `sock tcp-get` now completes 10 of 10 consecutive trials against a bare `accept()` listener, zero `send failed`. Two defects, both closed: (1) no request identity on `SOCK_SEND`, so `poll_by_repeat()`'s byte-identical retry hit `WORKER_IDLE` and re-transmitted the payload -- fixed by a `seq` byte at offset 3 (the old `reserved`), wire protocol 5 -> 7, #89 + alp-sdk#1872, taking it to 6/10 with zero `-4` timeouts; (2) the host's blind 40 us `CC3501E_PHASE_SETTLE_US` raced this side's re-arm, so the request payload landed short and this firmware correctly rejected it with `RESP_ERR_INVALID` -- fixed HOST-side at 250 us (alp-sdk#1873), taking it to 10/10. Nothing in `src/protocol_sockets.c` needed changing for (2); the length check was right all along. **Still open:** socket RX stalls around 2 kB, and 250 us is an empirical upper bound paid per payload phase, so it is a throughput tax on anything that streams (alp-sdk#1677). |
 | **Soft-AP** | PASS (fixed 2026-08-28, fw 0.4.1) | A real second radio (Intel AX200) associates from a cold boot -- **t+13s** WPA2, **t+13s** open, **t+20s** on the hold run -- and stays associated: **0 of 9** samples dropped across a 270 s hold, `connected` at t+291s at 93-94%, well past the ~100 s this issue was named for. `wifievt` steps 3 -> 4, the station event the broken build could never emit. **One live limitation:** a second `wifi ap` on a device already in AP role does NOT take (measured: no association across ~340 s, `wifievt` stuck at 3) -- cold-cycle between AP experiments, and do NOT use `ap-stop` to reset, it wedges the bridge (alp-sdk#1564). Root cause was `RoleUpApCmd_t.sta_limit` left at **0** by a zero-init, i.e. an AP permitted zero clients; it beaconed perfectly, which is why one radio could never tell the difference (alp-sdk#1562). `ap start` still returns `-4 unconfirmed` -- there is no AP status latch (alp-sdk#1385), so AP state is still checked out of band. |
 | **BLE** (enable / advertise / scan / connect + GATT scaffolding) | PASS for enable + real scan (re-confirmed 2026-08-28: 9-15 real advertisers) | NimBLE enable and `ble_gap_disc` scan validated with real advertisers; full runtime GATT/event parity remains v1.0 work. |
 | **CAM enables** | PASS | `which` 0 -> GPIO_1 (LDO0), 1 -> GPIO_0 (LDO1); mapping fixed from U4 pins 54/55. |
@@ -164,6 +164,21 @@ of the ungated historical ones.
 
 The current E1M-AEN bridge is not the early bring-up three-pin assumption. It
 uses:
+
+**Which board revision this table describes: `E1M-AEN-2626-R2`, as designed.**
+It used to be presented without a revision, which made it look like it
+contradicted `alp-sdk`'s `metadata/e1m_modules/aen/inter-chip.tsv` (alp-sdk#1807).
+It does not -- the TSV was corrected, and both now agree that on R2 the module
+routes Alif `P14_5` (`SPI1_MOSI_C`) through series resistor `R62` to CC3501E
+`GPIO_29`, and `P14_4` (`SPI1_MISO_C`) through `R48` to `GPIO_28`. That is the
+only pairing the CC35xx silicon allows, since `SPI0_PICO` (peripheral data IN)
+is fixed on `GPIO_29` and `SPI0_POCI` (peripheral data OUT) on `GPIO_28`.
+
+**This says nothing about board rev r1.** No r1 module netlist exists, so how an
+r1 board routes these two nets is not established anywhere. Read the module's
+own revision before assuming this table applies to the unit in front of you --
+and note that if a board really does wire MOSI straight to `GPIO_28`, bringing
+both SPI ends up puts two outputs on one net.
 
 | Net | Alif side | CC3501E side | Role |
 |---|---|---|---|
