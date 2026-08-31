@@ -88,6 +88,13 @@ uint32_t g_retry_latch_hits;
 #define CC3501E_REQ_SEQ_SHIFT 3u
 #define CC3501E_REQ_SEQ_MASK  0x1Fu /* 5 bits: flags 0x08,0x10,0x20,0x40,0x80 */
 
+/* Seq 0 is RESERVED to mean "this request carries no identity", so the usable
+ * seq space is 1..31.  A host that never assigns one leaves the reserved flags
+ * bits zero, and without this reservation every such frame would read as
+ * "seq 0, latch valid" -- i.e. a retry of the previous same-opcode command,
+ * forever, with the different-seq invalidation unable to fire. */
+#define CC3501E_REQ_SEQ_NONE 0x00u
+
 static uint8_t s_current_req_seq;
 
 /*
@@ -103,11 +110,26 @@ static uint8_t s_current_req_seq;
  * completion (ANY other worker-routed opcode's DONE/ERR overwrites this
  * one latch -- see retry_latch_store), AND no intervening same-cmd frame
  * carrying a DIFFERENT seq (retry_latch_serve's invalidation below closes
- * that specific gap).  That needs ~32 intervening logical commands, none
- * of them worker-routed -- unlikely, but constructible, and the
- * consequence is the bad one: e.g. a WIFI_AP_STOP believed executed but
- * never run, on a part where ap-stop already wedges the bridge
- * (alp-sdk#1564).
+ * that specific gap).
+ *
+ * DO NOT read "~32 intervening logical commands, none worker-routed" as
+ * rare.  The non-worker-routed set is the HIGH-FREQUENCY one:
+ * GET_PENDING_EVENTS (the console workqueue polls it periodically),
+ * WIFI_STATUS (polled throughout a connect), the SOCK_RECV ring fast path,
+ * SPI1_TRANSFER, OTA_WRITE, PING, DIAG_*.  Thirty-two of those is SECONDS
+ * OF ORDINARY IDLE, not a contrived sequence.
+ *
+ * The concrete case: `wifi ap-stop` latches at seq N -> ~32 event polls
+ * wrap the 5-bit counter -> the user runs `ap-stop` again -> it is served
+ * RESP_OK straight from this latch, and poll_by_repeat accepts it (AP_STOP
+ * is not on the dead-phase-alias list) -> the AP never stopped and the host
+ * believes it did.  On a part where ap-stop already wedges the bridge
+ * (alp-sdk#1564), that is the bad direction.
+ *
+ * Reserving seq 0 (CC3501E_REQ_SEQ_NONE) removes the much larger
+ * unset-seq class, but NOT this one.  Closing it properly needs a wider
+ * seq field or a per-opcode counter; measuring the real hit rate is the
+ * soak test named in the PR's bench procedure.
  */
 static struct {
 	bool    valid;
@@ -137,12 +159,53 @@ void protocol_reset_retry_latch(void)
  * an unrelated opcode to eventually overwrite the single latch.  Mirrors
  * protocol_spi.c's SPI1_TRANSFER "different seq: drop it and start fresh"
  * rule. */
+
+/* Opcodes the GENERIC latch must not touch, and why.
+ *
+ * CMD_SOCK_SEND carries its OWN identity: an 8-bit seq at req[3]
+ * (alp_cc3501e_sock_send_t.seq, v7), served from g_sock_send_reply in
+ * protocol_sockets.c.  That key is strictly STRONGER than this latch's 5-bit
+ * header seq, and handle_sock_send falls through to
+ * handle_worker_routed_payload_reply after correctly missing its own cache --
+ * so a generic latch keyed only on (cmd, 5-bit seq) would OVERRIDE the
+ * authoritative decision and serve the previous send's reply for a genuinely
+ * different one.  On the wire that is RESP_OK plus the PREVIOUS send's byte
+ * count, i.e. cc3501e_sock_send() reporting success for bytes never
+ * transmitted -- issue #88 reintroduced on the data path, with a weaker key.
+ * It needs no host bug: any send cadence whose intervening-command count is
+ * congruent to 0 (mod 32) hits it, and a chunked transfer loop IS a fixed
+ * cadence.
+ *
+ * CMD_SOCK_RECV is excluded for the same family of reason: its reply is
+ * WK_SOCK_RECV_HDR (24) + recv_len, so a generic cap of 32 would latch it
+ * exactly when recv_len <= 8 and drop it otherwise -- a size-dependent replay
+ * policy on a STREAM-CONSUMING opcode, where replaying a reply and
+ * re-consuming the ring are different things.  Leave recv to its own path.
+ *
+ * Both are exclusions from THIS mechanism only; neither loses the protection
+ * it already has. */
+static bool retry_latch_applies(alp_cc3501e_cmd_t cmd)
+{
+	switch (cmd) {
+	case ALP_CC3501E_CMD_SOCK_SEND: /* stronger 8-bit identity of its own */
+	case ALP_CC3501E_CMD_SOCK_RECV: /* stream-consuming; see above */
+		return false;
+	default:
+		return true;
+	}
+}
 static bool retry_latch_serve(alp_cc3501e_cmd_t   cmd,
                               uint8_t            *reply_data,
                               size_t              reply_cap,
                               size_t             *reply_data_len,
                               alp_cc3501e_resp_t *status)
 {
+	if (!retry_latch_applies(cmd)) {
+		return false;
+	}
+	if (s_current_req_seq == CC3501E_REQ_SEQ_NONE) {
+		return false; /* request carries no identity -- see retry_latch_store */
+	}
 	if (!s_retry_latch.valid || s_retry_latch.cmd != (uint8_t)cmd) {
 		return false; /* nothing cached for this opcode */
 	}
@@ -169,13 +232,17 @@ static bool retry_latch_serve(alp_cc3501e_cmd_t   cmd,
  * the three helpers below).  The collecting frame IS a retry of the logical
  * command, so s_current_req_seq is already the right seq to store.
  *
- * Caps cached data at 32 bytes: every hazardous opcode's reply fits well
- * under it (SOCK_OPEN 4 B, SPI1_CONFIGURE 8 B -- via its own family cache,
- * not this one, BLE_GATT_REGISTER <= 18 B per ALP_CC3501E_BLE_GATT_MAX_CHARS
- * 8 -- 2 + 2*8, every argless op 0 B).  The large-reply opcodes this
- * excludes (WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ) are
- * idempotent reads whose re-execution on a lost reply is slow, not
- * harmful, so leaving them uncached is the deliberate tradeoff.
+ * Caps cached data at 32 bytes.  Recomputed maxima for every opcode this
+ * latch actually covers: GET_MAC 6 B, WIFI_GET_RSSI 1 B, SOCK_OPEN 4 B,
+ * SPI1_CONFIGURE 8 B (which DOES route here, via
+ * handle_worker_routed_payload_reply in protocol_spi.c -- an earlier version
+ * of this comment wrongly said it used its own family cache),
+ * BLE_GATT_REGISTER <= 18 B (2 + 2*8, per ALP_CC3501E_BLE_GATT_MAX_CHARS 8),
+ * every argless op 0 B.  The large-reply opcodes this excludes
+ * (WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ) are idempotent reads
+ * whose re-execution on a lost reply is slow, not harmful, so leaving them
+ * uncached is the deliberate tradeoff.  SOCK_SEND and SOCK_RECV are excluded
+ * outright -- see retry_latch_applies().
  *
  * A completion too big to cache still counts as "any completion overwrites
  * the single latch" -- the failure-mode analysis on s_retry_latch above
@@ -184,6 +251,19 @@ static bool retry_latch_serve(alp_cc3501e_cmd_t   cmd,
 static void
 retry_latch_store(alp_cc3501e_cmd_t cmd, alp_cc3501e_resp_t status, const uint8_t *data, size_t len)
 {
+	if (!retry_latch_applies(cmd)) {
+		return; /* exempt opcode -- never store, so it can never be served */
+	}
+	if (s_current_req_seq == CC3501E_REQ_SEQ_NONE) {
+		/* seq 0 means "this request carries no identity" -- never latch it.
+		 * Without this, a host that does not assign a seq (every bare
+		 * cc3501e_request() call site, and any pre-v8 host, whose reserved
+		 * flags bits are zero) would send seq 0 on EVERY frame: each one
+		 * would look like a retry of the last, and the different-seq
+		 * invalidation could never fire because the seq never changes. */
+		s_retry_latch.valid = false;
+		return;
+	}
 	if (len > sizeof(s_retry_latch.data)) {
 		s_retry_latch.valid = false;
 		return;
@@ -238,7 +318,7 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
 	if (reply_cap < min_cap) return ALP_CC3501E_RESP_ERR_NO_MEM;
 
-	alp_cc3501e_resp_t cached_status;
+	alp_cc3501e_resp_t cached_status = ALP_CC3501E_RESP_OK;
 	if (retry_latch_serve(cmd, reply_data, reply_cap, reply_data_len, &cached_status)) {
 		return cached_status;
 	}
@@ -293,7 +373,7 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 {
 	*reply_data_len = 0u;
 
-	alp_cc3501e_resp_t cached_status;
+	alp_cc3501e_resp_t cached_status = ALP_CC3501E_RESP_OK;
 	if (retry_latch_serve(cmd, NULL, 0u, reply_data_len, &cached_status)) {
 		return cached_status;
 	}
@@ -362,7 +442,7 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 	*reply_data_len = 0u;
 	if (reply_cap < min_cap) return ALP_CC3501E_RESP_ERR_NO_MEM;
 
-	alp_cc3501e_resp_t cached_status;
+	alp_cc3501e_resp_t cached_status = ALP_CC3501E_RESP_OK;
 	if (retry_latch_serve(cmd, reply_data, reply_cap, reply_data_len, &cached_status)) {
 		return cached_status;
 	}

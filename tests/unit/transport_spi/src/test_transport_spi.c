@@ -784,6 +784,81 @@ ZTEST(cc3501e_bridge_transport, test_worker_routed_retry_seq_served_from_latch_a
 	              "different seq, same opcode -> stale latch dropped, worker resubmits");
 }
 
+/* NOT COVERED HERE, and saying so rather than shipping a test that passes
+ * either way: item 4's `s_retry_latch.valid = false` on a seq mismatch is not
+ * observable in this harness.  The stub HAL runs each worker body
+ * SYNCHRONOUSLY at submit, so every frame meets a completed job and every
+ * collect overwrites the latch -- there is no window in which a stale entry
+ * survives to be wrongly served.  Two attempts at a distinguishing sequence
+ * both passed with the invalidation deleted; a third contrived one failed on
+ * the PRISTINE build too, which means it was testing the stub's synchrony, not
+ * the guard.
+ *
+ * The guard is kept because it is correct and free on a real asynchronous
+ * worker, where the window does exist.  Proving it needs either an
+ * async-capable stub or the bench.  Recorded in the PR's bench procedure. */
+
+/* SOCK_SEND must never be served by the GENERIC latch: it carries its own
+ * 8-bit seq at req[3], a strictly stronger key than this latch's 5-bit header
+ * seq, and handle_sock_send reaches the shared helper only AFTER correctly
+ * missing its own cache.  Letting the generic latch answer there returns the
+ * PREVIOUS send's reply for a genuinely different send -- success reported for
+ * bytes never transmitted (issue #88, on the data path). */
+ZTEST(cc3501e_bridge_transport, test_sock_send_is_exempt_from_the_generic_latch)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	/* Same header seq (5), different struct seq and different payload byte:
+	 * two genuinely different logical sends. */
+	/* alp_cc3501e_sock_send_t is handle(2) flags(1) seq(1) data_len(2)
+	 * reserved2(2) = 8 B, then data inline -> payload_len 9. */
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x28u /* header seq 5 */,
+		                       9u,
+		                       0x00u,
+		                       1u,
+		                       0u /* handle */,
+		                       0u /* flags */,
+		                       1u /* struct seq */,
+		                       1u,
+		                       0u /* data_len */,
+		                       0u,
+		                       0u /* reserved2 */,
+		                       0xAAu };
+	const uint8_t send_b[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x28u /* SAME header seq 5 */,
+		                       9u,
+		                       0x00u,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       2u /* DIFFERENT struct seq */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xBBu /* DIFFERENT payload */ };
+
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	transaction(send_a, sizeof send_a); /* collect -- would latch if not exempt */
+	(void)drain(reply, sizeof reply);
+
+	/* send_b differs in struct seq AND payload.  It must reach the worker, not
+	 * be answered from send_a's cached outcome. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	/* BUSY specifically, not merely "not OK": the stub has no socket, so
+	 * send_b errors either way and a `!= RESP_OK` assertion would pass with the
+	 * exemption deleted.  BUSY is the IDLE->QUEUED edge, i.e. proof it reached
+	 * the worker; a stale serve answers with send_a's cached status instead. */
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "a different logical send must reach the worker, not be served "
+	              "send_a's cached reply");
+}
+
 ZTEST(cc3501e_bridge_transport, test_diag_log_level_ok)
 {
 	uint8_t reply[16];
