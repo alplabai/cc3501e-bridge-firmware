@@ -24,12 +24,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > nothing and keeps the marker meaningful: this artifact reports **`0x0501`**,
 > which no other build does.
 >
-> **The GPE stamp follows the app SemVer again.**  0.4.0 stamped `0.4.0.0`,
-> 0.4.1 stamped `0.4.1.0`, 0.5.0 stamped `0.5.0.0` — and 0.6.0 broke that by
-> stamping a bench-style `0.149.70.0`, which belongs to the *flash-set* series,
-> not to a release artifact.  This one stamps **`0.5.1.0`**.  The two are
-> genuinely different things and the README warning about regenerating a
-> flash-set at a higher `0.149.x` version still applies unchanged.
+> **The GPE stamp is `0.149.74.0`, and the "follow the SemVer" convention is
+> the thing that was wrong.**  0.4.0 stamped `0.4.0.0`, 0.4.1 stamped
+> `0.4.1.0`, 0.5.0 stamped `0.5.0.0`, and an earlier cut of this release
+> stamped `0.5.1.0` to match them.  **That convention is broken by
+> construction.**  The GPE stamp is the CC35 SBL's **anti-rollback** field and
+> it is enforced *per part, against that part's last-seen version* — even when
+> every `*_rollback_protection_*` fuse reads `0`.  A unit that has ever been
+> flashed at a `0.149.x` stamp will therefore **never** accept a `0.5.x.0`
+> artifact again: it streams clean, exit 0, the full ~1.09 MB, and then the SBL
+> refuses to boot it.  Dead link, empty XDS110 `query` table.
+>
+> It is not a documentation problem that a `STOP` block can carry.  Every bench
+> or OTA-iterated unit climbs into the `0.149.x` range through
+> `ti/regen_flashset.sh`, and the shipped artifact is then permanently
+> unflashable on it without re-wrapping — which needs the signing assets a
+> customer does not have.  0.6.0's `0.149.70.0` was the pragmatic choice, not
+> the deviation.
+>
+> So this release stamps **`0.149.74.0`**: above the `0.149.70.0` this bench
+> part was last seen at, and above the `0.149.73.0` a verification run flashed
+> during the attempt to confirm it.  `major` stays `0` — a GPE major `>= 1`
+> fails BL2 secure-boot with `AUTH_ERROR`.
+>
+> The firmware bytes are unchanged by this.  Re-stamping re-wraps the same
+> `.out`: only the header hash, the four stamp bytes at file offset 36, and the
+> in-band signature differ.
 
 **Wire protocol 6 -> 7.** `CMD_SOCK_SEND` gains request identity: byte 3 of
 `alp_cc3501e_sock_send_t` — previously `reserved`, always written 0 — is now a
@@ -84,7 +104,7 @@ no spare byte and putting one there would be a real layout change.
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)` — then
 wrapped as a TI `flash-images-builder` vendor image and signed with the Alp
-Lab VALIDATION key at GPE stamp `0.5.1.0` (below). This artifact is the
+Lab VALIDATION key at GPE stamp `0.149.74.0` (below). This artifact is the
 **wrapped** kind, not the raw `build_ti.ps1` output; see
 [`BUILD_RECIPE.md`](BUILD_RECIPE.md) for the exact two-stage recipe and the
 byte-level evidence that confirms it (issue #94 — the raw output alone does
@@ -94,15 +114,25 @@ than trusting the prose (#97).
 
 ```
 size    : 1099396 bytes
-sha256  : 9d766385dd820a1dfb7b9cfa6348f1b4937ee2938f77927f7b66476f82ab0a5a
+sha256  : d58d78a6697ea6d74c12ee51912dfb0434214f4244add2e6af03928919b0eb9f
 marker  : fw_version 0.5.1 -> 0x0501
 wire    : protocol 7
-GPE     : 0.5.1.0      (this artifact's own anti-rollback stamp, tracking the
-                        app SemVer as 0.4.0/0.4.1/0.5.0 did; NOT the flash-set
-                        stamp, which lives in the 0.149.x series and must
-                        exceed the part's last-seen version -- see README)
+GPE     : 0.149.74.0   (anti-rollback stamp, enforced per part against that
+                        part's last-seen version.  ONE field -- the artifact's
+                        stamp IS the flash-set stamp; they are not separate.
+                        Chosen above 0.149.73.0, the highest this bench part
+                        has seen.  major MUST stay 0)
 kind    : wrapped (TI flash-images-builder vendor_image, signed in-band)
 ```
+
+**Not yet confirmed booting.** The AEN801 bench unit stopped booting on
+2026-08-31 — SEROM cannot load SERAM from MRAM `0x0005ffff`, 0 of 10 cold
+cycles (alp-sdk#1883) — and the Alif host is what releases the CC35 from
+reset, so `alp companion` is unreachable and no post-flash check can run. The
+image was written cleanly (all five transfers, `Saved report image bin file`),
+its signature verifies, and its kind is machine-checked; what is **not**
+established is that a part boots it. Treat this release as unverified on
+silicon until that unit is repaired or replaced.
 
 - `cc3501e-v0.5.1.bin`         -- signed vendor image (the wrapped kind; this
   is what `primary_vendor_image.sign.bin` expects, so the README recipe's `cp`
