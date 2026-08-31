@@ -24,8 +24,8 @@
 # When cutting a real release: bump `built-from` to the release commit, update
 # `image-sha256`, and DELETE every `inert:` line (they described the old blob).
 
-built-from:   0b958854ce49d4a2b3e2440e5393dc6600d37bbf
-image-sha256: dee3c34c594ca14c0af5899b61a73b022ac184adef7670d3cfed2bf04dd8b8d9
+built-from:   9eb775109879d4d97600d7c51c8a712c7fe92243
+image-sha256: 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
 
 # Later src/hal/ti commits verified not to change the image.
 #   (none -- this blob is current with main)
