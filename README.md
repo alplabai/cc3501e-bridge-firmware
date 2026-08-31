@@ -195,8 +195,13 @@ expensive trap on this part.  `programming_instructions` is built from
 *same* `--version` as the vendor image (`ti/regen_flashset.sh`).
 
 Verify the flash took by asking the device, not by trusting the programmer:
-`GET_VERSION` must answer wire protocol **6**, and `GET_DIAG_INFO` must report
-`fw_version=0x0500`.
+`GET_VERSION` must answer wire protocol **7**, and `GET_DIAG_INFO` must report
+`fw_version=0x0501`.
+
+`GET_VERSION` alone is **not** a sufficient check after an upgrade: v0.5.1 and
+the v0.6.0 artifact it replaced both answer protocol **7**, so a part still
+running the older image looks identical on that field. `fw_version` is the
+discriminator -- `0x0501` for this release, `0x0500` for anything older.
 
 Three distinct version numbers are in play here and they are **not**
 interchangeable -- app SemVer (`0.5.1`), wire protocol (`7`), and the GPE
