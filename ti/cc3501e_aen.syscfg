@@ -25,23 +25,35 @@
 	 *   GPIO_17       WIFI_SPI0.READY   P2_6                 -> phase-ready GPIO
  *
  * ============================ HARDWARE NOTE ============================
- * *** SoM rev BUG: the SPI0 data lines are CROSSED. ***  The CC35xx silicon
- * FIXES the SPI0 pin roles (confirmed via SysConfig valid-pin sets):
+ * The CC35xx silicon FIXES the SPI0 data roles (confirmed via SysConfig
+ * valid-pin sets):
  *     PICO (peripheral data IN)  = GPIO29  (GPIO28 is NOT a valid PICO pin)
  *     POCI (peripheral data OUT) = GPIO28
- * but the SoM (som_pinmap.csv) wires, via straight series resistors:
- *     Alif P14_5 SPI1_MOSI (master OUT) --R48-- CC3501E GPIO28 (= POCI, OUT)
- *     Alif P14_4 SPI1_MISO (master IN)  --R62-- CC3501E GPIO29 (= PICO, IN)
- * => MOSI lands on the CC3501E's OUTPUT (two drivers contend) and MISO lands
- * on its INPUT (two receivers, no driver).  Both Alif pads (SPI1_MOSI_C /
- * SPI1_MISO_C) and both CC35xx data roles are silicon-fixed, so NEITHER side
- * can correct it in firmware.  The link needs a HARDWARE fix (cross the two
- * data nets: route Alif MOSI/P14_5 -> GPIO29, Alif MISO/P14_4 -> GPIO28) or a
- * next SoM rev.  See alp-sdk-internal HW tracker.
+ * This file therefore assigns the only silicon-legal mapping.  Neither side
+ * can change it: both Alif pads (SPI1_MOSI_C / SPI1_MISO_C) and both CC35xx
+ * data roles are fixed.  (It happens to equal the LaunchPad LP_SPI0_BUS
+ * default.)
  *
- * This file uses the only SILICON-LEGAL mapping (PICO=GPIO29, POCI=GPIO28),
- * which is ALSO the correct firmware pinout once the HW data lines are
- * crossed.  (It happens to equal the LaunchPad LP_SPI0_BUS default.)
+ * CORRECTED for board rev 2626-R2 (alp-sdk#1807).  This note used to open
+ * "*** SoM rev BUG: the SPI0 data lines are CROSSED ***" and claim the module
+ * wires Alif P14_5 MOSI --R48-- GPIO28 and P14_4 MISO --R62-- GPIO29, i.e.
+ * master output onto the slave's output.  It then told the reader the link
+ * "needs a HARDWARE fix (cross the two data nets)".
+ *
+ * That is wrong for R2, and it is wrong in the direction that costs hardware:
+ * the E1M-AEN-2626-R2 module netlist routes P14_5 through R62 to GPIO29 and
+ * P14_4 through R48 to GPIO28 -- exactly the pairing the silicon requires, and
+ * exactly what this file already assigns.  R2 is correct as designed.  Acting
+ * on the old note and "crossing" the data nets on an R2 board would CREATE the
+ * contention it warned about.  Note also that the two resistor designators
+ * were paired the opposite way round from the netlist.
+ *
+ * SCOPE.  The above is about R2 as designed, NOT about any particular physical
+ * module.  No r1 module netlist exists, so how an r1 board routes these two
+ * nets is not established anywhere -- and r1 units are known to carry reworks
+ * on other nets (the CS and READY lines).  Read the module's own revision
+ * before deciding whether any rework applies, and do not remove one on the
+ * strength of this note.
  * ======================================================================
  *
 	 * Hardware-framed SPI: the Alif dwc-ssi master drives SS0 per protocol phase,
@@ -77,8 +89,8 @@ spi0.defaultTxBufferValue = "0xA5";       /* idle MISO = the 0xA5 SYNC marker (A
 /* Silicon-legal pads (see HARDWARE NOTE).  The pin resources live under the
  * instance's `spi` peripheral group; $assign uses the device pad names. */
 spi0.spi.sclkPin.$assign = "GPIO27";  /* <- Alif SCLK/P14_6 (correctly wired) */
-spi0.spi.picoPin.$assign = "GPIO29";  /* peripheral data IN  (needs Alif MOSI here -- HW cross) */
-spi0.spi.pociPin.$assign = "GPIO28";  /* peripheral data OUT (needs Alif MISO here -- HW cross) */
+spi0.spi.picoPin.$assign = "GPIO29";  /* peripheral data IN  <- Alif MOSI/P14_5 via R62 (R2) */
+spi0.spi.pociPin.$assign = "GPIO28";  /* peripheral data OUT -> Alif MISO/P14_4 via R48 (R2) */
 spi0.spi.csnPin.$assign  = "GPIO16";  /* CSN resource paired with Alif SPI1_SS0_C; GPIO17 is READY. */
 
 /* host-DMA on channels 12/13 (SHIP-CRITICAL -- keep in sync with
