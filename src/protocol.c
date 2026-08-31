@@ -85,15 +85,22 @@ uint32_t g_retry_latch_hits;
  * decoded end-to-end per protocol_dispatch() call, see protocol.h's framing
  * doc) -- there is no re-entrant or cross-context caller to race with.
  */
-#define CC3501E_REQ_SEQ_SHIFT 3u
-#define CC3501E_REQ_SEQ_MASK  0x1Fu /* 5 bits: flags 0x08,0x10,0x20,0x40,0x80 */
-
-/* Seq 0 is RESERVED to mean "this request carries no identity", so the usable
- * seq space is 1..31.  A host that never assigns one leaves the reserved flags
- * bits zero, and without this reservation every such frame would read as
- * "seq 0, latch valid" -- i.e. a retry of the previous same-opcode command,
- * forever, with the different-seq invalidation unable to fire. */
-#define CC3501E_REQ_SEQ_NONE 0x00u
+/* The seq's shift/mask and the reserved value are WIRE facts, so they come from
+ * <alp/protocol/cc3501e.h> -- the same header this firmware compiles against,
+ * not a local copy of the same numbers.  A duplicate would be a second source of
+ * truth for a field both sides have to agree on byte-for-byte, which is exactly
+ * the drift the shared-header arrangement exists to prevent (see the repo README
+ * on why the firmware #includes the header directly rather than mirroring it).
+ *
+ * Seq 0 is RESERVED to mean "this request carries no identity", so the usable
+ * seq space is 1..ALP_CC3501E_REQ_SEQ_LAST.  A host that never assigns one
+ * leaves the reserved flags bits zero, and without that reservation every such
+ * frame would read as "seq 0, latch valid" -- i.e. a retry of the previous
+ * same-opcode command, forever, with the different-seq invalidation unable to
+ * fire. */
+#define CC3501E_REQ_SEQ_SHIFT ALP_CC3501E_FLAG_REQ_SEQ_SHIFT
+#define CC3501E_REQ_SEQ_MASK  ALP_CC3501E_REQ_SEQ_MASK
+#define CC3501E_REQ_SEQ_NONE  ALP_CC3501E_REQ_SEQ_NONE
 
 static uint8_t s_current_req_seq;
 
