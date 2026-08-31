@@ -49,7 +49,13 @@ behaviour — and needs its own investigation. alp-sdk#1746 stays open for it.
 no spare byte and putting one there would be a real layout change.
 
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
-10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
+10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)` — then
+wrapped as a TI `flash-images-builder` vendor image and signed with the Alp
+Lab VALIDATION key at GPE stamp `0.149.70.0` (below). This artifact is the
+**wrapped** kind, not the raw `build_ti.ps1` output; see
+[`BUILD_RECIPE.md`](BUILD_RECIPE.md) for the exact two-stage recipe and the
+byte-level evidence that confirms it (issue #94 — the raw output alone does
+not reproduce this file, by design, and was never meant to).
 
 ```
 size    : 1099396 bytes
