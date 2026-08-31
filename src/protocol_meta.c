@@ -68,8 +68,19 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * then trust.  This assert makes that case just as loud, at compile time.
  *
  * Bumping the protocol means changing BOTH this literal and the header, in the
- * same change. */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL 6
+ * same change.
+ *
+ * v7 (alp-sdk#1746 / issue #88): CMD_SOCK_SEND's request byte @3 (formerly
+ * always-zero `reserved`, now `seq` in <alp/protocol/cc3501e.h>) is a retry
+ * identity.  Root cause: the worker-routed socket opcodes had none, so a host
+ * poll that re-sent the identical frame after the worker had already
+ * completed the job was indistinguishable from a new request -- see
+ * handle_sock_send() in protocol_sockets.c for the fix and
+ * cc3501e_sock_send() in alp-sdk for the host half.  The bump is semantic,
+ * not structural (the byte was already on the wire): it exists so THIS
+ * firmware never reads an OLD host's always-zero byte 3 as a real seq, which
+ * would let it serve a stale cached reply for a genuinely new send. */
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL 7
 
 _Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
                "<alp/protocol/cc3501e.h> is not the protocol version this firmware "

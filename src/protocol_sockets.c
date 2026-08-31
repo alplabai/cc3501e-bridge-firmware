@@ -18,10 +18,37 @@
  * struct in the drain.
  */
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "protocol_internal.h"
 #include "../hal/cc3501e_hw.h"
+
+/* SOCK_SEND retry-safe reply cache (issue #88 / alp-sdk#1746).
+ *
+ * The worker-routed socket opcodes had no request identity, so a host poll
+ * that re-sent the identical frame -- which is exactly what poll_by_repeat()
+ * does on BUSY/IO -- was indistinguishable, once the worker had already
+ * finished the job and freed its slot, from a brand-new request:
+ * handle_worker_routed_payload_reply()'s WORKER_IDLE edge submits whatever it
+ * is handed.  For CMD_SOCK_SEND that meant a lost/misframed RESP_OK reply
+ * caused the payload to be TRANSMITTED AGAIN.
+ *
+ * protocol_spi.c solves the analogous problem for SPI1_TRANSFER by serving a
+ * matching-seq retry straight out of the WORKER JOB SLOT.  That shape does
+ * not fit here: sockets share that single slot with every other worker-
+ * routed op (Wi-Fi scan, BLE, ...), and worker_poll()'s orphan-discard arm
+ * destroys a terminal result the instant any OTHER opcode polls before the
+ * host collects it (see the comment there) -- an interleaved poll between a
+ * send completing and its retry landing would silently defeat an in-slot
+ * cache.  A dedicated static cache sidesteps that entirely, and it is cheap:
+ * the send reply is a 2-byte queued-count, so this is 4 bytes of static RAM
+ * (valid flag + seq + the 2 reply bytes), nothing like SPI1's 4 KB (see
+ * protocol_spi.c's own note on that cost, offered as the upgrade path if a
+ * host ever needs more than the single most-recent send cached). */
+static bool    g_sock_send_cached;
+static uint8_t g_sock_send_seq;
+static uint8_t g_sock_send_reply[2];
 
 /* SOCK_OPEN (0x20): req = alp_cc3501e_sock_open_t { family | type | protocol |
  * reserved } = 4 B.  Reply DATA = alp_cc3501e_sock_handle_t (4 B). */
@@ -62,7 +89,16 @@ alp_cc3501e_resp_t handle_sock_connect(const uint8_t *req,
 }
 
 /* SOCK_SEND (0x22): req = alp_cc3501e_sock_send_t (8 B) + data_len inline bytes.
- * Reply DATA = uint16_t LE queued-byte count. */
+ * Reply DATA = uint16_t LE queued-byte count.
+ *
+ * req[3] is alp_cc3501e_sock_send_t.seq (v7; formerly `reserved`, always 0
+ * through v6 -- see the wire-compat note on CC3501E_FW_IMPLEMENTS_PROTOCOL in
+ * protocol_meta.c).  A retry of an already-completed send carries the SAME
+ * seq (the host assigns it once per logical send, see alp-sdk's
+ * cc3501e_sock_send()), so a matching seq is served from g_sock_send_reply
+ * WITHOUT touching the worker at all -- no submit, no re-transmit.  Anything
+ * else (a genuinely new send, or the very first one) falls through to the
+ * worker-routed path unchanged, exactly as before this fix. */
 alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
                                     size_t         req_len,
                                     uint8_t       *reply_data,
@@ -75,8 +111,28 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 	if (req_len != sizeof(alp_cc3501e_sock_send_t) + (size_t)data_len) {
 		return ALP_CC3501E_RESP_ERR_INVALID; /* declared length must match the frame */
 	}
-	return handle_worker_routed_payload_reply(
+
+	const uint8_t seq = req[3];
+	if (g_sock_send_cached && seq == g_sock_send_seq) {
+		if (reply_cap < sizeof(g_sock_send_reply)) return ALP_CC3501E_RESP_ERR_NO_MEM;
+		memcpy(reply_data, g_sock_send_reply, sizeof(g_sock_send_reply));
+		*reply_data_len = sizeof(g_sock_send_reply);
+		return ALP_CC3501E_RESP_OK;
+	}
+
+	const alp_cc3501e_resp_t st = handle_worker_routed_payload_reply(
 	    ALP_CC3501E_CMD_SOCK_SEND, req, req_len, 2u, reply_data, reply_cap, reply_data_len);
+	if (st == ALP_CC3501E_RESP_OK) {
+		/* The worker body (worker.c's ALP_CC3501E_CMD_SOCK_SEND case) always
+		 * publishes exactly 2 result bytes on success, so *reply_data_len is 2
+		 * here; cache defensively on the actual length anyway. */
+		if (*reply_data_len == sizeof(g_sock_send_reply)) {
+			memcpy(g_sock_send_reply, reply_data, sizeof(g_sock_send_reply));
+			g_sock_send_seq    = seq;
+			g_sock_send_cached = true;
+		}
+	}
+	return st;
 }
 
 /* SOCK_RECV (0x23): req = alp_cc3501e_sock_recv_t { handle | max_len } = 4 B.
