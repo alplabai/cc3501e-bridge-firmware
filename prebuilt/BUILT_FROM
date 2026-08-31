@@ -38,8 +38,8 @@
 # has.  Only record a SHA reachable from `main`; a branch-tip SHA is a ticking
 # failure the moment its PR merges.
 
-built-from:   3d963c98107178961ff7341ee8a9ac37d947ed75
-image-sha256: 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
+built-from:   dddefee3b37a2c637b11dd38d736318debd45a08
+image-sha256: 9d766385dd820a1dfb7b9cfa6348f1b4937ee2938f77927f7b66476f82ab0a5a
 
 # Later src/hal/ti commits verified not to change the image.
 #
@@ -52,15 +52,6 @@ image-sha256: 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
 # COMPILED IMAGE, established by rebuilding the raw stage-1 output with and
 # without the commit's diff and comparing.  That is the only half a source
 # commit can affect; the wrap and signature add no source-derived content.
-inert: 937afd90355d245226b03344d09efbcfb7d645ae
-#   docs(aen): revision-scope the syscfg HARDWARE NOTE (#93).
-#   Comment-only change to ti/cc3501e_aen.syscfg: all four $assign VALUES are
-#   byte-unchanged (sclkPin GPIO27, picoPin GPIO29, pociPin GPIO28, csnPin
-#   GPIO16); only trailing comments and the HARDWARE NOTE prose differ.
-#   EVIDENCE: build_ti.ps1 -Ble against a protocol-7 alp-sdk checkout
-#   (ticlang 5.1.1, SysConfig 1.28.0) was run at built-from 3d963c98 itself --
-#   i.e. with this commit's diff ABSENT -- and at the commit's own tree.  Both
-#   produced the identical raw image
-#   64ad6abbc06df3b8537fc944ec53f23223dab2ac0a39ef723f8a9d322842a267
-#   (1093732 bytes).  Two independent clean rebuilds of the same tree also
-#   produced that hash, ruling out build non-determinism.
+#   (none -- the v0.5.1 cut supersedes them.  The previous entry attested #93
+#   inert against the old built-from; that blob is gone and its attestation
+#   with it, exactly as this file's header prescribes for a real release.)

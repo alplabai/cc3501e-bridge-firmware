@@ -7,7 +7,29 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.0] — 2026-08-31
+## [0.5.1] — 2026-08-31
+
+> **Re-cut from 0.6.0, before distribution.**  This content shipped briefly as
+> **0.6.0**, which burned a minor version it did not need to.  0.5.0 had never
+> been tagged or released either — `gh release list` and the tag list are both
+> empty for this repository — so the correct step was a **patch** bump, not a
+> minor.  That is the same rule 0.5.0's own re-cut applied a day earlier; it
+> simply was not applied here.  The three `cc3501e-v0.6.0.*` files are deleted
+> and nothing outside this repository ever referred to them.
+>
+> **0.5.1, not a second 0.5.0.**  The `fw_version` marker is stamped from
+> `firmware-version.txt` at build time, so reusing `0.5.0` would have given a
+> **third** distinct build reporting `0x0500` — the 2026-08-29 protocol-5 build,
+> the 2026-08-30 protocol-6 re-cut, and this protocol-7 one.  A patch bump costs
+> nothing and keeps the marker meaningful: this artifact reports **`0x0501`**,
+> which no other build does.
+>
+> **The GPE stamp follows the app SemVer again.**  0.4.0 stamped `0.4.0.0`,
+> 0.4.1 stamped `0.4.1.0`, 0.5.0 stamped `0.5.0.0` — and 0.6.0 broke that by
+> stamping a bench-style `0.149.70.0`, which belongs to the *flash-set* series,
+> not to a release artifact.  This one stamps **`0.5.1.0`**.  The two are
+> genuinely different things and the README warning about regenerating a
+> flash-set at a higher `0.149.x` version still applies unchanged.
 
 **Wire protocol 6 -> 7.** `CMD_SOCK_SEND` gains request identity: byte 3 of
 `alp_cc3501e_sock_send_t` — previously `reserved`, always written 0 — is now a
@@ -36,13 +58,24 @@ a bare `accept()` listener, 10 trials across two runs:
 - `-4` timeouts on completed sends: **zero in 10** — previously frequent.
 - request reached the peer: **all 10**.
 
-**Known-unfixed, and it is a different defect.** `send failed (-1)`
-(`RESP_ERR_INVALID`) still occurs on roughly 4 of 10 trials on transfers the
-peer received in full. It comes from the pre-existing strict length check in
-`handle_sock_send()` (`req_len != sizeof(alp_cc3501e_sock_send_t) + data_len`),
-present before this change. An intermittently wrong `req_len` on a frame whose
-payload arrives points at frame delivery — the per-phase SS0 / READY re-arm
-behaviour — and needs its own investigation. alp-sdk#1746 stays open for it.
+**The remaining 4 of 10 are now fixed too, host-side, and nothing here
+changed for it.** When 0.6.0 was cut, `send failed (-1)`
+(`RESP_ERR_INVALID`) still occurred on roughly 4 of 10 trials on transfers the
+peer received in full, and it was recorded as a different, unexplained defect.
+It has since been root-caused: the host's blind `CC3501E_PHASE_SETTLE_US` gap
+between the request header and payload transfers was 40 us, which
+intermittently out-ran this side's DMA re-arm, so the payload genuinely landed
+short. **This firmware's strict length check was correct throughout** —
+`req_len != sizeof(alp_cc3501e_sock_send_t) + data_len` was rejecting a frame
+that really was incomplete, and loosening it would have accepted truncated
+sends. Raising the host gap to 250 us (alp-sdk#1873) takes the same 10-trial
+measurement to **10 of 10 end-to-end, zero `send failed`**. Nothing in
+`src/protocol_sockets.c` was changed for it. alp-sdk#1746 and issue #90 are
+both closed.
+
+Two limits are still open and are not addressed by either half: socket **RX**
+stalls at roughly 2 kB, and 250 us is an empirical upper bound paid per payload
+phase, so it taxes anything that streams (alp-sdk#1677).
 
 `SOCK_RECV` deliberately gets no seq: `alp_cc3501e_sock_recv_t` is
 `{ handle, max_len }` and `max_len`'s high byte occupies offset 3, so there is
@@ -51,22 +84,32 @@ no spare byte and putting one there would be a real layout change.
 Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
 10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)` — then
 wrapped as a TI `flash-images-builder` vendor image and signed with the Alp
-Lab VALIDATION key at GPE stamp `0.149.70.0` (below). This artifact is the
+Lab VALIDATION key at GPE stamp `0.5.1.0` (below). This artifact is the
 **wrapped** kind, not the raw `build_ti.ps1` output; see
 [`BUILD_RECIPE.md`](BUILD_RECIPE.md) for the exact two-stage recipe and the
 byte-level evidence that confirms it (issue #94 — the raw output alone does
-not reproduce this file, by design, and was never meant to).
+not reproduce this file, by design, and was never meant to). The `prebuilt
+integrity` job now machine-checks that kind against `BUILD_RECIPE.md` rather
+than trusting the prose (#97).
 
 ```
 size    : 1099396 bytes
-sha256  : 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
-marker  : fw_version 0.6.0 -> 0x0600
+sha256  : 9d766385dd820a1dfb7b9cfa6348f1b4937ee2938f77927f7b66476f82ab0a5a
+marker  : fw_version 0.5.1 -> 0x0501
 wire    : protocol 7
-GPE     : 0.149.70.0   (the anti-rollback stamp on the artifact flashed for the
-                        bench numbers above; not the app SemVer, not the wire
-                        protocol -- all three differ and are listed separately
-                        on purpose)
+GPE     : 0.5.1.0      (this artifact's own anti-rollback stamp, tracking the
+                        app SemVer as 0.4.0/0.4.1/0.5.0 did; NOT the flash-set
+                        stamp, which lives in the 0.149.x series and must
+                        exceed the part's last-seen version -- see README)
+kind    : wrapped (TI flash-images-builder vendor_image, signed in-band)
 ```
+
+- `cc3501e-v0.5.1.bin`         -- signed vendor image (the wrapped kind; this
+  is what `primary_vendor_image.sign.bin` expects, so the README recipe's `cp`
+  is correct for it, which it was not for the raw 0.5.0 artifact -- issue #96)
+- `cc3501e-v0.5.1.bin.sig`     -- detached **ECDSA-P256/SHA-256** signature
+  (the VALIDATION vendor key -- a bench-grade artifact, not production-key)
+- `cc3501e-v0.5.1.bin.sha256`  -- SHA-256 manifest
 
 ## [0.5.0] — 2026-08-30
 

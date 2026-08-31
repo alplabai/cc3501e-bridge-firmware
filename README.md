@@ -121,46 +121,60 @@ installed and on the right paths -- a long toolchain to require of anyone who
 just wants a working companion.  The signed blob in `prebuilt/` is already
 built and signed:
 
-> **`cc3501e-v0.5.0.bin` is built from this tree's v0.5.0 release commit,
-> which is current `main`.**  It was RE-CUT on 2026-08-30, before distribution:
-> an earlier 0.5.0 built on 2026-08-29 went stale the moment #84 landed the
-> SPI1 passthrough, and since it had never left this repository the version
-> number was reused rather than burned.  `cc3501e-v0.4.1.bin` and older are kept
-> only for traceability.  The `prebuilt freshness` CI
-> job goes red when a change lands in `src/`, `hal/` or `ti/` that is neither
-> released nor attested byte-identical in `prebuilt/BUILT_FROM`, so this is a
-> checked claim rather than an asserted one -- that gap is what let 0.4.1 go
-> stale under a green `prebuilt integrity` (#75).
+> **`cc3501e-v0.5.1.bin` is built from this tree's v0.5.1 release commit,
+> which is current `main`.**  `cc3501e-v0.5.0.bin` and older are kept only for
+> traceability, and note they are not all the same KIND of artifact: 0.2.0,
+> 0.3.0 and 0.5.0 are raw `build_ti.ps1` output, while 0.4.0, 0.4.1 and this
+> 0.5.1 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
+> kind can be dropped straight into `primary_vendor_image.sign.bin` by the
+> recipe below (#96).  `prebuilt/BUILD_RECIPE.md` records which is which and CI
+> machine-checks it (#97).
 >
-> **What the re-cut adds over the 2026-08-29 build:** the E1M connector's SPI1
-> relayed through the bridge (#83) -- opcodes `0x55` / `0x56` / `0x57` -- which
-> bumps the wire protocol to **6** under an unchanged app SemVer.  `fw_version`
-> therefore reads `0x0500` for both; `GET_VERSION` is what separates them, and
-> it is the check the host enforces.  A host built against v5 is refused by `GET_VERSION`; pair this blob
-> with alp-sdk at or after the matching host driver.  Bench-verified on the
-> E1M-AEN801: bring-up `0`, `PING ok after 1 attempt`, `protocol v6 ... match`,
-> and the SPI1 group exercised end to end.
+> The `prebuilt freshness` CI job goes red when a change lands in `src/`,
+> `hal/` or `ti/` that is neither released nor attested byte-identical in
+> `prebuilt/BUILT_FROM`, so this is a checked claim rather than an asserted one
+> -- that gap is what let 0.4.1 go stale under a green `prebuilt integrity`
+> (#75).
 >
-> **One caveat carried forward from 0.5.0.**  The socket-EOF repair (#32) is
-> still **not exercised on silicon**: the host-side path that would drive it
-> hits a separate alp-sdk defect (alp-sdk#1746), so the fix remains reviewed and
-> unit-tested but not bench-proven.
+> **Why 0.5.1 and not 0.6.0.**  This content shipped briefly as 0.6.0, which
+> burned a minor version for no reason: neither 0.5.0 nor 0.6.0 was ever tagged
+> or released, so a patch bump was the right step.  0.5.1 also keeps the
+> `fw_version` marker unique -- it reads **`0x0501`**, where reusing 0.5.0 would
+> have made a third distinct build report `0x0500`.
+>
+> **What this adds over 0.5.0:** request identity on `CMD_SOCK_SEND` (#89 +
+> alp-sdk#1872), which bumps the wire protocol to **7**.  A host built against
+> an older protocol is refused by `GET_VERSION`; pair this blob with alp-sdk at
+> or after the matching host driver.  Bench-verified on the E1M-AEN801 serial
+> `2617-0001`: `sock tcp-get` **10 of 10** end-to-end against a bare `accept()`
+> listener with zero `send failed`, once the host-side phase settle was widened
+> in alp-sdk#1873.
+>
+> **Two limits still open**, neither fixed here: socket **RX** stalls at
+> roughly 2 kB, and the 250 us host phase settle is an empirical upper bound
+> paid per payload phase, so it taxes anything that streams (alp-sdk#1677).
 
 ```sh
 # 1. Verify what you are about to flash (never skip this).
 openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
-    -signature prebuilt/cc3501e-v0.5.0.bin.sig prebuilt/cc3501e-v0.5.0.bin
-sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.0.bin.sha256)  prebuilt/cc3501e-v0.5.0.bin"
+    -signature prebuilt/cc3501e-v0.5.1.bin.sig prebuilt/cc3501e-v0.5.1.bin
+sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.1.bin.sha256)  prebuilt/cc3501e-v0.5.1.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
-#    THIS artifact's stamp (0.5.0.0) -- see the warning below.  An existing
+#    THIS artifact's stamp (0.5.1.0) -- see the warning below.  An existing
 #    flash-set built at another version will NOT do; regenerate it:
-#      VERSION=0.5.0.0 ti/regen_flashset.sh
+#      VERSION=0.5.1.0 ti/regen_flashset.sh
 #
 # 3. Drop the blob in as the primary vendor image, and remove any stale
 #    pre-flattened image -- a leftover *.flashready.bin is used in preference
 #    to the file you just copied.
-cp prebuilt/cc3501e-v0.5.0.bin <flashset>/primary_vendor_image.sign.bin
+#    This blob is the WRAPPED kind -- a TI flash-images-builder vendor_image,
+#    signed in-band -- which is what this slot expects.  Do NOT do this with a
+#    raw build_ti.ps1 image: the raw kind starts with a bare Cortex-M vector
+#    table, not a signed container, and installing one here is a different file
+#    format, not a different build (#96).  prebuilt/BUILD_RECIPE.md records
+#    which release is which, and CI machine-checks it (#97).
+cp prebuilt/cc3501e-v0.5.1.bin <flashset>/primary_vendor_image.sign.bin
 rm -f <flashset>/*.flashready.bin
 
 # 4. Program over XDS110/SWD (~18 s).
@@ -185,10 +199,10 @@ Verify the flash took by asking the device, not by trusting the programmer:
 `fw_version=0x0500`.
 
 Three distinct version numbers are in play here and they are **not**
-interchangeable -- app SemVer (`0.5.0`), wire protocol (`6`), and the GPE
-image stamp (`0.5.0.0`).  `prebuilt/CHANGELOG.md` has the table.
+interchangeable -- app SemVer (`0.5.1`), wire protocol (`7`), and the GPE
+image stamp (`0.5.1.0`).  `prebuilt/CHANGELOG.md` has the table.
 
-> **STOP -- check the unit's flash history before using this artifact's `0.5.0.0`
+> **STOP -- check the unit's flash history before using this artifact's `0.5.1.0`
 > stamp.**  The CC35 SBL enforces GPE-version **monotonicity against the last-seen
 > version on that part**, and it does so **even when every `*_rollback_protection_*`
 > fuse reads `0`**.  A warm programming run burns no fuses, so the report will show
@@ -196,7 +210,7 @@ image stamp (`0.5.0.0`).  `prebuilt/CHANGELOG.md` has the table.
 > stamp LOWER than anything ever flashed on the unit and it streams clean (exit 0,
 > the full ~1.09 MB) and then the SBL refuses to boot it: **dead link**, with an
 > empty XDS110 `query` image table.  Bench units used for OTA or flash iteration sit
-> far above `0.5.0.0` -- the bench part here is at `0.149.70.0`.  For such a unit,
+> far above `0.5.1.0` -- the bench part here is at `0.149.70.0`.  For such a unit,
 > re-wrap this same image at a legal stamp instead:
 >
 > ```sh
@@ -313,14 +327,13 @@ release blob is version-pinned at `prebuilt/cc3501e-vX.Y.Z.bin`.
 validates that blob (relaying the image to the CC3501E over the
 inter-chip link) -- it is not a customer-facing utility, and lives
 in `alp-sdk-internal`, not this public tree.
-`prebuilt/` holds the signed release blob; `cc3501e-v0.5.0.bin` is the
-current one (wire protocol **6**).  Every older blob answers a DIFFERENT
+`prebuilt/` holds the signed release blob; `cc3501e-v0.5.1.bin` is the
+current one (wire protocol **7**).  Every older blob answers a DIFFERENT
 protocol and a host built from this tree refuses all of them:
-`cc3501e-v0.4.1.bin` and `cc3501e-v0.4.0.bin` answer **5**, `cc3501e-v0.3.0.bin`
-answers **4**.  So does the 2026-08-29 build this 0.5.0 replaced, which is not
-in the tree.  They are kept for traceability only -- and among them 0.4.1
-predates the socket-EOF repair (#32) and 0.4.0's soft-AP accepts no clients
-(alp-sdk#1562).
+`cc3501e-v0.5.0.bin` answers **6**, `cc3501e-v0.4.1.bin` and
+`cc3501e-v0.4.0.bin` answer **5**, `cc3501e-v0.3.0.bin` answers **4**.  They
+are kept for traceability only -- and among them 0.4.1 predates the socket-EOF
+repair (#32) and 0.4.0's soft-AP accepts no clients (alp-sdk#1562).
 
 ## Status
 

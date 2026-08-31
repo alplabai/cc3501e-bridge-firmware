@@ -17,14 +17,14 @@ one.
 | Release | Kind | How to tell |
 |---|---|---|
 | 0.2.0, 0.3.0, 0.5.0 | **raw** — `build_ti.ps1`'s `.bin` output, unwrapped, unsigned-in-band | byte 0 is the vector table directly: a stack-pointer word in `0x2000xxxx`/`0x2001xxxx`, then a reset-handler word in `0x1400xxxx` |
-| 0.4.0, 0.4.1, 0.6.0 | **wrapped** — a TI `flash-images-builder` **vendor_image**, built from the same raw `.out` and then signed with the Alp Lab VALIDATION key | byte 0 is not a vector table; there is a small (~48-byte) header, then an `0xFF`-padded gap, then the vector table starts around offset 4100-4120; a `--version` stamp (see below) is embedded as 4 bytes at file offset 36 |
+| 0.4.0, 0.4.1, 0.5.1 | **wrapped** — a TI `flash-images-builder` **vendor_image**, built from the same raw `.out` and then signed with the Alp Lab VALIDATION key | byte 0 is not a vector table; there is a small (~48-byte) header, then an `0xFF`-padded gap, then the vector table starts around offset 4100-4120; a `--version` stamp (see below) is embedded as 4 bytes at file offset 36 |
 
 Nothing before this file recorded which kind a given release is. That is
 itself the defect `prebuilt/BUILT_FROM` cannot see: its attestation only
 asks whether the *source* changed, never what *kind* of artifact was
 produced from it.
 
-## The wrapped-kind recipe (0.4.0, 0.4.1, 0.6.0, and every release going forward unless a raw one is deliberately re-introduced and documented as such)
+## The wrapped-kind recipe (0.4.0, 0.4.1, 0.5.1, and every release going forward unless a raw one is deliberately re-introduced and documented as such)
 
 Two stages. Stage 1 needs the license-gated TI toolchain; stage 2 needs the
 license-gated TI Wi-Fi Toolbox **and** two Alp Lab bench-only assets that are
