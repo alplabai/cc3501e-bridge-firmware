@@ -23,8 +23,22 @@
 #
 # When cutting a real release: bump `built-from` to the release commit, update
 # `image-sha256`, and DELETE every `inert:` line (they described the old blob).
+#
+# This repo SQUASH-MERGES.  The commit that built the shipped blob almost always
+# lived on a feature branch first, under a different SHA than the one that lands
+# on main -- the squash rewrites it.  Once that PR merges and the branch is
+# deleted, the pre-squash SHA is reachable from nobody's remote and a fresh CI
+# clone cannot resolve it, even though the release commit it became is sitting
+# right there on main.  This happened for real: `built-from` here pointed at
+# 9eb7751 (a feature-branch commit from "release: cut prebuilt v0.6.0 for the
+# protocol-7 seq change"), which squash-merged into main as 3d963c9 ("fix
+# (sockets): cache SOCK_SEND's reply by seq..." (#89)).  CI failed every PR with
+# "built-from (9eb7751...) is not a commit in this repository" until this line
+# was repointed at 3d963c9 -- same blob, same sha256, just the SHA main actually
+# has.  Only record a SHA reachable from `main`; a branch-tip SHA is a ticking
+# failure the moment its PR merges.
 
-built-from:   9eb775109879d4d97600d7c51c8a712c7fe92243
+built-from:   3d963c98107178961ff7341ee8a9ac37d947ed75
 image-sha256: 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
 
 # Later src/hal/ti commits verified not to change the image.
