@@ -7,6 +7,61 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-08-31
+
+**Wire protocol 6 -> 7.** `CMD_SOCK_SEND` gains request identity: byte 3 of
+`alp_cc3501e_sock_send_t` — previously `reserved`, always written 0 — is now a
+`seq` the host assigns once per logical send. `handle_sock_send()` serves a
+matching-seq retry from a 4-byte static cache instead of re-submitting the job.
+
+Why it matters: alp-sdk's `poll_by_repeat()` re-sends the identical frame on
+every poll, and `handle_worker_routed_payload_reply()`'s `WORKER_IDLE` edge
+submits whatever it is handed. Once a send completed and the worker slot was
+freed, the host's next poll was read as a NEW request and **the payload was
+transmitted again** — so a single lost `RESP_OK` became an endless re-execute
+and the host reported a timeout on a send that had succeeded. Root cause of
+alp-sdk#1746; see issue #88.
+
+**The protocol bump is semantic, not structural.** The frame layout is
+unchanged. An OLD host writes `reserved = 0` on every request, so this firmware
+reading byte 3 as a seq would see `seq == 0` forever and could serve a cached
+reply for a genuinely new send. The version gate is what stops new firmware
+misreading an old host. Host half: alp-sdk#1872.
+
+Bench-measured on E1M-AEN801 serial 2617-0001 with both halves flashed, against
+a bare `accept()` listener, 10 trials across two runs:
+
+- full end-to-end successes (reply body retrieved): **6 of 10** — previously
+  none confirmed across three runs on protocol 6.
+- `-4` timeouts on completed sends: **zero in 10** — previously frequent.
+- request reached the peer: **all 10**.
+
+**Known-unfixed, and it is a different defect.** `send failed (-1)`
+(`RESP_ERR_INVALID`) still occurs on roughly 4 of 10 trials on transfers the
+peer received in full. It comes from the pre-existing strict length check in
+`handle_sock_send()` (`req_len != sizeof(alp_cc3501e_sock_send_t) + data_len`),
+present before this change. An intermittently wrong `req_len` on a frame whose
+payload arrives points at frame delivery — the per-phase SS0 / READY re-arm
+behaviour — and needs its own investigation. alp-sdk#1746 stays open for it.
+
+`SOCK_RECV` deliberately gets no seq: `alp_cc3501e_sock_recv_t` is
+`{ handle, max_len }` and `max_len`'s high byte occupies offset 3, so there is
+no spare byte and putting one there would be a real layout change.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0), `build_ti.ps1 -Ble`, `0 error(s)`.
+
+```
+size    : 1099396 bytes
+sha256  : 91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6
+marker  : fw_version 0.6.0 -> 0x0600
+wire    : protocol 7
+GPE     : 0.149.70.0   (the anti-rollback stamp on the artifact flashed for the
+                        bench numbers above; not the app SemVer, not the wire
+                        protocol -- all three differ and are listed separately
+                        on purpose)
+```
+
 ## [0.5.0] — 2026-08-30
 
 > **Re-cut on 2026-08-30, before distribution.**  An earlier 0.5.0 artifact

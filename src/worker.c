@@ -338,8 +338,10 @@ static void worker_execute(uint8_t cmd)
 	}
 	case ALP_CC3501E_CMD_SOCK_SEND: {
 		/* job.req = alp_cc3501e_sock_send_t: handle(LE16 @0) | flags(@2) |
-		 * reserved(@3) | data_len(LE16 @4) | reserved2(@6) | data @8.  Reply
-		 * DATA = uint16_t LE byte count actually queued. */
+		 * seq(@3, v7 -- protocol_sockets.c's handle_sock_send() already served
+		 * a matching retry off its own cache before this ever submits) |
+		 * data_len(LE16 @4) | reserved2(@6) | data @8.  Reply DATA = uint16_t
+		 * LE byte count actually queued. */
 		const uint16_t handle   = wk_get_le16(job.req, 0u);
 		const uint8_t  flags    = job.req[2];
 		const uint16_t data_len = wk_get_le16(job.req, 4u);
