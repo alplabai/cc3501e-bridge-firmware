@@ -272,74 +272,24 @@ jobs:
       # customers to flash that blob, so the property that matters to them is
       # whether it still corresponds to the source -- which nothing checked.
       #
-      # This started out comparing commit DATES: red whenever anything under
-      # src/, hal/ or ti/ was newer than the prebuilt.  Right property, wrong
-      # instrument -- it cannot tell a real firmware change from one that
-      # provably does not alter the image.  #79 was the second kind (it guarded a
-      # global the linker already dead-stripped; the rebuilt .out was
-      # byte-identical), the gate went red, and it STAYED red on every later PR.
-      # A permanently red gate is how a real staleness gets waved through, which
-      # is the failure #75 was about, so the date test was replaced by an
-      # explicit attestation in prebuilt/BUILT_FROM.
-      #
-      # Nothing is auto-forgiven: every firmware commit after `built-from` must be
-      # listed there as `inert:`, which is a deliberate human claim backed by a
-      # rebuild.  CI cannot check that claim -- rebuilding needs license-gated TI
-      # ticlang -- so the ledger's evidence is the only thing standing behind it.
+      # Nothing is auto-forgiven: every firmware commit after `built-from` must
+      # be listed in prebuilt/BUILT_FROM as `inert:`, a deliberate human claim
+      # backed by a rebuild of `raw-sha256` (the stage-1, unwrapped output --
+      # the shipped `image-sha256` is unreproducible by construction for a
+      # WRAPPED release, #94/#92).  CI cannot check that claim itself --
+      # rebuilding needs license-gated TI ticlang -- so the ledger's evidence
+      # is the only thing standing behind it.
       #
       # This job is deliberately NOT in the branch ruleset's required contexts.
       # It should go RED when firmware lands without a release or an attestation,
       # because that is true and worth seeing; it must not block every unrelated
       # PR until someone can sign a new blob (the signing key is not in CI).
+      #
+      # The check itself lives in .github/scripts/check_prebuilt_freshness.py,
+      # not inline here, for the same reason check_prebuilt_kind.py does: a
+      # heredoc inside this file has already produced a YAML parse error once.
       - name: every firmware commit since the prebuilt must be released or attested
-        run: |
-          set -euo pipefail
-          ledger=prebuilt/BUILT_FROM
-          newest_bin=$(ls -1 prebuilt/cc3501e-*.bin 2>/dev/null | sort -V | tail -1 || true)
-          if [ -z "$newest_bin" ]; then
-            echo "::error::no prebuilt/cc3501e-*.bin found"; exit 1
-          fi
-          if [ ! -f "$ledger" ]; then
-            echo "::error::$ledger is missing; it records which commit $newest_bin was built from."
-            exit 1
-          fi
-
-          built_from=$(sed -n 's/^built-from:[[:space:]]*//p' "$ledger" | head -1)
-          if [ -z "$built_from" ]; then
-            echo "::error::$ledger has no 'built-from:' line."; exit 1
-          fi
-          if ! git cat-file -e "${built_from}^{commit}" 2>/dev/null; then
-            echo "::error::$ledger built-from ($built_from) is not a commit in this repository."
-            exit 1
-          fi
-
-          echo "newest prebuilt : $newest_bin"
-          echo "built from      : $built_from"
-
-          # Commits touching the firmware sources since the blob was built.
-          # Each one must be attested inert, or a new release must be cut.
-          unattested=0
-          while read -r sha; do
-            [ -n "$sha" ] || continue
-            if grep -qE "^inert:[[:space:]]*${sha}\b" "$ledger"; then
-              echo "  attested inert : $(git log -1 --format='%h %s' "$sha")"
-            else
-              echo "::error::unattested firmware commit: $(git log -1 --format='%h %s' "$sha")"
-              unattested=$((unattested + 1))
-            fi
-          done <<EOF
-          $(git rev-list "${built_from}..HEAD" -- src hal ti)
-          EOF
-
-          if [ "$unattested" -gt 0 ]; then
-            echo "::error::$unattested firmware commit(s) since $built_from are neither released nor attested."
-            echo "::error::README tells customers to flash $newest_bin, so it must still match src/."
-            echo "::error::Either cut a signed release (bump firmware-version.txt, rebuild, .sha256, .sig,"
-            echo "::error::CHANGELOG, and point built-from at it), or -- ONLY if a rebuild proves the image"
-            echo "::error::is byte-identical -- add an 'inert: <full-sha>' line to $ledger with that evidence."
-            exit 1
-          fi
-          echo "ok  prebuilt corresponds to HEAD (every later firmware commit attested inert)"
+        run: python3 .github/scripts/check_prebuilt_freshness.py
 
   prebuilt-integrity:
     name: prebuilt integrity

@@ -131,10 +131,10 @@ built and signed:
 > machine-checks it (#97).
 >
 > The `prebuilt freshness` CI job goes red when a change lands in `src/`,
-> `hal/` or `ti/` that is neither released nor attested byte-identical in
-> `prebuilt/BUILT_FROM`, so this is a checked claim rather than an asserted one
-> -- that gap is what let 0.4.1 go stale under a green `prebuilt integrity`
-> (#75).
+> `hal/` or `ti/` that is neither released nor attested `inert:` (does not
+> change the compiled image) in `prebuilt/BUILT_FROM`, so this is a checked
+> claim rather than an asserted one -- that gap is what let 0.4.1 go stale
+> under a green `prebuilt integrity` (#75).
 >
 > **Why 0.5.1 and not 0.6.0.**  This content shipped briefly as 0.6.0, which
 > burned a minor version for no reason: neither 0.5.0 nor 0.6.0 was ever tagged
