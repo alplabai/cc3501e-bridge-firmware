@@ -27,11 +27,11 @@ alplabai/alp-sdk#1891 and must land after this ships.
 
 - `cc3501e-v0.6.0.bin`        -- wrapped TI `flash-images-builder` vendor image,
   signed in-band with the Alp Lab VALIDATION key. 1099784 bytes.
-- `cc3501e-v0.6.0.bin.sha256` -- `4468c343350b81f2e3fb251f2c6f0ad013093bd1b7df1db09abafb4330d0f3f1`
+- `cc3501e-v0.6.0.bin.sha256` -- `51e78dc4f9a3285c4a046b2f866188dfd790902879330fc0a4c2091c4de0272d`
 - `cc3501e-v0.6.0.bin.sig`    -- detached **ECDSA-P256/SHA-256** signature,
   verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem
   -signature prebuilt/cc3501e-v0.6.0.bin.sig prebuilt/cc3501e-v0.6.0.bin`
-- GPE stamp: **`0.149.79.0`** (strictly above `0.149.78.0`, the highest stamp this
+- GPE stamp: **`0.149.90.0`** (strictly above `0.149.80.0`, the highest stamp this
   bench unit has been flashed at; major 0, every field <= 255).  The blob was
   first cut at `0.149.76.0`; bench work for issue #18 then iterated the unit to
   `0.149.78.0`, which would have left the shipped artifact unflashable on our own
