@@ -57,7 +57,7 @@
 # ticking failure the moment its PR merges.
 
 built-from:   PENDING-SQUASH-SHA
-image-sha256: 922e71947130c3831fed140c0cc3045e6245981394b292d77e703e7c41a9feed
+image-sha256: 4468c343350b81f2e3fb251f2c6f0ad013093bd1b7df1db09abafb4330d0f3f1
 raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
@@ -78,7 +78,7 @@ raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
 # etc.) and an earlier cut of 0.5.1 did the same.  That convention is broken by
 # construction -- every bench or OTA-iterated unit climbs into 0.149.x through
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
-gpe-floor:    0.149.76.0
+gpe-floor:    0.149.79.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
