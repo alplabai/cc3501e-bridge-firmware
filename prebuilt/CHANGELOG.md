@@ -7,6 +7,54 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.6.0
+
+Wire **protocol 8**: request identity for every worker-routed opcode
+(issue #102, PR #103). Flags bits 3..7 of the request header carry a 5-bit
+retry seq, so a reply lost in transit can no longer make the host's
+poll-by-repeat look like a new request and re-execute the operation. Zero wire
+bytes added. `SOCK_SEND` keeps its own 8-bit struct seq and is exempt, as is
+`SOCK_RECV` (both consume stream state); header seq 0 is reserved to mean "no
+identity", so a pre-v8 host can never be answered from the latch.
+
+`DIAG_GET_STATS` (0x70) grew additively 8 -> 16 bytes, adding `worker_execs`
+and `retry_latch_hits` (both LE32). An old host reading only the first 8 bytes
+is unaffected.
+
+**Requires a protocol-8 host.** A protocol-8 firmware and a protocol-7 host
+refuse each other at `GET_VERSION` by design; the paired alp-sdk change is
+alplabai/alp-sdk#1891 and must land after this ships.
+
+- `cc3501e-v0.6.0.bin`        -- wrapped TI `flash-images-builder` vendor image,
+  signed in-band with the Alp Lab VALIDATION key. 1099784 bytes.
+- `cc3501e-v0.6.0.bin.sha256` -- `51e78dc4f9a3285c4a046b2f866188dfd790902879330fc0a4c2091c4de0272d`
+- `cc3501e-v0.6.0.bin.sig`    -- detached **ECDSA-P256/SHA-256** signature,
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem
+  -signature prebuilt/cc3501e-v0.6.0.bin.sig prebuilt/cc3501e-v0.6.0.bin`
+- GPE stamp: **`0.149.90.0`** (strictly above `0.149.80.0`, the highest stamp this
+  bench unit has been flashed at; major 0, every field <= 255).  The blob was
+  first cut at `0.149.76.0`; bench work for issue #18 then iterated the unit to
+  `0.149.78.0`, which would have left the shipped artifact unflashable on our own
+  hardware, so it was re-wrapped from the identical stage-1 `.out` (raw-sha256
+  unchanged) at a stamp that clears the new floor.
+- stage-1 raw image sha256: `973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42`, 1094120 bytes
+
+**Bench-verified on E1M-AEN801** (`AE822FA0E5597LS0` Rev A0, module rev r1,
+serial `2617-0001`), against a protocol-8 host:
+
+```
+[CTRL ] no drop:  execs +1  latch +0
+[DROP] discarding OK reply for cmd 0x03, re-asking seq 11
+[LATCH] mac_rc=0  execs 10->11 (+1)  latch 0->1 (+1)
+```
+
+One deliberately dropped reply -> the operation executed **once** and the retry
+was served from the latch, versus `execs +2` without the mechanism. Link
+stability across the same run: `frames_ok` 161 -> 541 with `frames_err` frozen
+at 31, i.e. 380 consecutive OK frames with the seq riding in the flags byte and
+no framing regression.
+
+
 ## [0.5.1] — 2026-08-31
 
 > **Re-cut from 0.6.0, before distribution.**  This content shipped briefly as

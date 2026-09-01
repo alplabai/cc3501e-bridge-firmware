@@ -699,7 +699,7 @@ ZTEST(cc3501e_bridge_transport, test_power_policy_bad_len_invalid)
 
 ZTEST(cc3501e_bridge_transport, test_diag_get_stats_counts_frames)
 {
-	uint8_t reply[24];
+	uint8_t reply[32]; /* reply_wire(16u) = 28 B; 24 was sized for the old 8B payload */
 	transport_spi_init();
 	/* A PING first guarantees >= 1 OK frame before we read the stats. */
 	const uint8_t ping[] = { ALP_CC3501E_CMD_PING, 0x00u, 0x00u, 0x00u };
@@ -708,12 +708,155 @@ ZTEST(cc3501e_bridge_transport, test_diag_get_stats_counts_frames)
 
 	const uint8_t s[] = { ALP_CC3501E_CMD_DIAG_GET_STATS, 0x00u, 0x00u, 0x00u };
 	transaction(s, sizeof s);
+	/* 16B, not 8: issue #102 appended worker_execs(LE32) | retry_latch_hits(LE32)
+	 * after the original frames_ok/frames_err pair -- see test_worker_routed_-
+	 * retry_seq_served_from_latch_and_counted below for those two fields. */
 	size_t n = drain(reply, sizeof reply);
-	zassert_equal(n, reply_wire(8u), "stats reply = header + status + 8B");
+	zassert_equal(n, reply_wire(16u), "stats reply = header + status + 16B");
 	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "DIAG_GET_STATS -> OK");
 	const uint32_t frames_ok = (uint32_t)reply[5] | ((uint32_t)reply[6] << 8) |
 	                           ((uint32_t)reply[7] << 16) | ((uint32_t)reply[8] << 24);
 	zassert_true(frames_ok >= 1u, "OK frames counted (>= the prior PING)");
+}
+
+/* issue #102: the generic worker-routed retry latch.  BLE_ENABLE stands in
+ * for the class -- worker-routed + argless, exactly the shape
+ * handle_worker_routed serves.  seq rides flags bits 3..7 (CC3501E_REQ_SEQ_-
+ * SHIFT/MASK in protocol.c): seq 5 = 5<<3 = 0x28, seq 6 = 6<<3 = 0x30. */
+static uint32_t diag_stat_u32(const uint8_t *reply, size_t off)
+{
+	return (uint32_t)reply[off] | ((uint32_t)reply[off + 1u] << 8) |
+	       ((uint32_t)reply[off + 2u] << 16) | ((uint32_t)reply[off + 3u] << 24);
+}
+
+ZTEST(cc3501e_bridge_transport, test_worker_routed_retry_seq_served_from_latch_and_counted)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	const uint8_t stats[] = { ALP_CC3501E_CMD_DIAG_GET_STATS, 0x00u, 0x00u, 0x00u };
+	transaction(stats, sizeof stats);
+	(void)drain(reply, sizeof reply);
+	const uint32_t execs_before = diag_stat_u32(reply, 13u);
+	const uint32_t hits_before  = diag_stat_u32(reply, 17u);
+
+	const uint8_t seq5[] = { ALP_CC3501E_CMD_BLE_ENABLE, 0x28u /* seq=5 */, 0x00u, 0x00u };
+
+	/* Submit -- no job in flight yet, so this is a fresh IDLE->QUEUED edge
+	 * regardless of the latch (which is empty for BLE_ENABLE at this seq). */
+	transaction(seq5, sizeof seq5);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "submit -> BUSY");
+
+	/* Collect -- the stub ran the body synchronously at submit, so this reaches
+	 * WORKER_ERR (no BLE host on stub) and is the collect edge that latches the
+	 * outcome under seq 5. */
+	transaction(seq5, sizeof seq5);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "collected -> NOT_READY");
+
+	/* A THIRD, byte-identical frame (same opcode, same seq) is what
+	 * poll_by_repeat() sends when it never saw the second transaction's reply.
+	 * It must be served from the latch: same answer, and -- proven below via
+	 * g_worker_execs -- the worker must NOT run again. */
+	transaction(seq5, sizeof seq5);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "retry served from the latch");
+
+	transaction(stats, sizeof stats);
+	(void)drain(reply, sizeof reply);
+	const uint32_t execs_after = diag_stat_u32(reply, 13u);
+	const uint32_t hits_after  = diag_stat_u32(reply, 17u);
+	zassert_equal(execs_after,
+	              execs_before + 1u,
+	              "worker_execute() ran exactly once for the submit+collect, "
+	              "not again for the latched retry");
+	zassert_equal(hits_after, hits_before + 1u, "the retry was served from the latch exactly once");
+
+	/* A DIFFERENT seq for the SAME opcode is a genuinely new logical command
+	 * (item 4's mandatory mitigation): the stale latch entry must be dropped,
+	 * not served, and the worker must resubmit. */
+	const uint8_t seq6[] = { ALP_CC3501E_CMD_BLE_ENABLE, 0x30u /* seq=6 */, 0x00u, 0x00u };
+	transaction(seq6, sizeof seq6);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "different seq, same opcode -> stale latch dropped, worker resubmits");
+}
+
+/* NOT COVERED HERE, and saying so rather than shipping a test that passes
+ * either way: item 4's `s_retry_latch.valid = false` on a seq mismatch is not
+ * observable in this harness.  The stub HAL runs each worker body
+ * SYNCHRONOUSLY at submit, so every frame meets a completed job and every
+ * collect overwrites the latch -- there is no window in which a stale entry
+ * survives to be wrongly served.  Two attempts at a distinguishing sequence
+ * both passed with the invalidation deleted; a third contrived one failed on
+ * the PRISTINE build too, which means it was testing the stub's synchrony, not
+ * the guard.
+ *
+ * The guard is kept because it is correct and free on a real asynchronous
+ * worker, where the window does exist.  Proving it needs either an
+ * async-capable stub or the bench.  Recorded in the PR's bench procedure. */
+
+/* SOCK_SEND must never be served by the GENERIC latch: it carries its own
+ * 8-bit seq at req[3], a strictly stronger key than this latch's 5-bit header
+ * seq, and handle_sock_send reaches the shared helper only AFTER correctly
+ * missing its own cache.  Letting the generic latch answer there returns the
+ * PREVIOUS send's reply for a genuinely different send -- success reported for
+ * bytes never transmitted (issue #88, on the data path). */
+ZTEST(cc3501e_bridge_transport, test_sock_send_is_exempt_from_the_generic_latch)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	/* Same header seq (5), different struct seq and different payload byte:
+	 * two genuinely different logical sends. */
+	/* alp_cc3501e_sock_send_t is handle(2) flags(1) seq(1) data_len(2)
+	 * reserved2(2) = 8 B, then data inline -> payload_len 9. */
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x28u /* header seq 5 */,
+		                       9u,
+		                       0x00u,
+		                       1u,
+		                       0u /* handle */,
+		                       0u /* flags */,
+		                       1u /* struct seq */,
+		                       1u,
+		                       0u /* data_len */,
+		                       0u,
+		                       0u /* reserved2 */,
+		                       0xAAu };
+	const uint8_t send_b[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x28u /* SAME header seq 5 */,
+		                       9u,
+		                       0x00u,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       2u /* DIFFERENT struct seq */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xBBu /* DIFFERENT payload */ };
+
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	transaction(send_a, sizeof send_a); /* collect -- would latch if not exempt */
+	(void)drain(reply, sizeof reply);
+
+	/* send_b differs in struct seq AND payload.  It must reach the worker, not
+	 * be answered from send_a's cached outcome. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	/* BUSY specifically, not merely "not OK": the stub has no socket, so
+	 * send_b errors either way and a `!= RESP_OK` assertion would pass with the
+	 * exemption deleted.  BUSY is the IDLE->QUEUED edge, i.e. proof it reached
+	 * the worker; a stale serve answers with send_a's cached status instead. */
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "a different logical send must reach the worker, not be served "
+	              "send_a's cached reply");
 }
 
 ZTEST(cc3501e_bridge_transport, test_diag_log_level_ok)
@@ -1224,11 +1367,20 @@ ZTEST(cc3501e_bridge_transport, test_spi1_request_validation)
  * worker-routed test that submits but never collects its result (the body runs
  * synchronously on the stub and caches ERR) would leave the worker non-IDLE and
  * make EVERY later worker-routed poll report "other cmd busy".  Reset it before
- * each test so the cases are independent of order. */
+ * each test so the cases are independent of order.
+ *
+ * protocol_reset_retry_latch() is the identical fix for the SAME class of bug
+ * in protocol.c's issue-#102 retry latch: it too is a file-static that
+ * outlives each ZTEST case, and without resetting it a latch entry one test
+ * writes (e.g. BLE_ENABLE collected under seq 0, which every OLDER test uses
+ * since none of them set flags) would be served back as a cache hit to a
+ * LATER, unrelated test exercising the same opcode -- turning an expected
+ * BUSY/submit into a served-from-cache status. */
 static void reset_worker(void *fixture)
 {
 	(void)fixture;
 	worker_init();
+	protocol_reset_retry_latch();
 }
 
 ZTEST_SUITE(cc3501e_bridge_transport, NULL, NULL, reset_worker, NULL, NULL);
