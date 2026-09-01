@@ -56,7 +56,7 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   PENDING-SQUASH-SHA
+built-from:   3c88f77a4e87f6d9157946a3668573baac71e607
 image-sha256: 51e78dc4f9a3285c4a046b2f866188dfd790902879330fc0a4c2091c4de0272d
 raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
 
@@ -85,10 +85,8 @@ gpe-floor:    0.149.90.0
 # compares against `raw-sha256`, not `image-sha256`.
 #   (none -- the v0.6.0 cut supersedes them.)
 #
-# built-from is deliberately the placeholder PENDING-SQUASH-SHA, NOT a real SHA.
-# This repo squash-merges, so the commit that built this blob does not survive
-# under its branch SHA, and recording that SHA is the exact rot this file's
-# header describes -- CI would then fail every later PR with "built-from is not
-# a commit in this repository".  Repoint this line at the squash SHA on main
-# immediately after the release PR merges; `prebuilt freshness` fails closed
-# until then, which is the intended forcing function, not an oversight.
+# built-from now names 3c88f77, the squash commit #103 actually landed as on
+# main -- NOT the pre-squash branch SHA, which this repo's history shows becomes
+# unreachable and reddens every later PR (see this file's header).  It carried
+# the placeholder PENDING-SQUASH-SHA through the release PR precisely so
+# `prebuilt freshness` would fail closed until this repoint happened.
