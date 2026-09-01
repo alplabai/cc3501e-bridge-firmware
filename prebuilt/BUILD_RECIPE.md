@@ -12,19 +12,38 @@ and found "5664 bytes apart, diverging from byte 0" — because the shipped
 blob is a different *kind* of artifact, not a different build of the same
 one.
 
+> **Two different artifacts have carried the name `v0.6.0`. Read this before
+> using any `v0.6.0` figure below.**
+>
+> - The **withdrawn pre-release** 0.6.0 (`91e3685c786f4bcfc8d8fb488f995a1fca2ddcc71f106ba53e9e06fa83bf94b6`,
+>   1099396 bytes, protocol 7, GPE `0.149.70.0`). It was re-cut as **v0.5.1
+>   before distribution** — see this directory's CHANGELOG, "Re-cut from 0.6.0,
+>   before distribution" — and its three `cc3501e-v0.6.0.*` files were deleted,
+>   deliberately freeing the version number. It was never distributed.
+> - The **shipped** 0.6.0
+>   (`922e71947130c3831fed140c0cc3045e6245981394b292d77e703e7c41a9feed`,
+>   1099784 bytes, **protocol 8**, GPE `0.149.76.0`) — the blob in this
+>   directory now.
+>
+> Every `v0.6.0` reference in the "Evidence (issue #94)" section below is to the
+> **withdrawn** one, because that is the artifact that investigation examined.
+> They are kept as-is rather than rewritten: the reasoning there is still the
+> proof that the two-stage recipe is the right mechanism, and silently
+> renumbering it would break the link to issue #94.
+
 ## Two artifact kinds have shipped under the same filename pattern
 
 | Release | Kind | How to tell |
 |---|---|---|
 | 0.2.0, 0.3.0, 0.5.0 | **raw** — `build_ti.ps1`'s `.bin` output, unwrapped, unsigned-in-band | byte 0 is the vector table directly: a stack-pointer word in `0x2000xxxx`/`0x2001xxxx`, then a reset-handler word in `0x1400xxxx` |
-| 0.4.0, 0.4.1, 0.5.1 | **wrapped** — a TI `flash-images-builder` **vendor_image**, built from the same raw `.out` and then signed with the Alp Lab VALIDATION key | byte 0 is not a vector table; there is a small (~48-byte) header, then an `0xFF`-padded gap, then the vector table starts around offset 4100-4120; a `--version` stamp (see below) is embedded as 4 bytes at file offset 36 |
+| 0.4.0, 0.4.1, 0.5.1, 0.6.0 | **wrapped** — a TI `flash-images-builder` **vendor_image**, built from the same raw `.out` and then signed with the Alp Lab VALIDATION key | byte 0 is not a vector table; there is a small (~48-byte) header, then an `0xFF`-padded gap, then the vector table starts around offset 4100-4120; a `--version` stamp (see below) is embedded as 4 bytes at file offset 36 |
 
 Nothing before this file recorded which kind a given release is. That is
 itself the defect `prebuilt/BUILT_FROM` cannot see: its attestation only
 asks whether the *source* changed, never what *kind* of artifact was
 produced from it.
 
-## The wrapped-kind recipe (0.4.0, 0.4.1, 0.5.1, and every release going forward unless a raw one is deliberately re-introduced and documented as such)
+## The wrapped-kind recipe (0.4.0, 0.4.1, 0.5.1, 0.6.0, and every release going forward unless a raw one is deliberately re-introduced and documented as such)
 
 Two stages. Stage 1 needs the license-gated TI toolchain; stage 2 needs the
 license-gated TI Wi-Fi Toolbox **and** two Alp Lab bench-only assets that are
@@ -42,7 +61,8 @@ build_ti.ps1 -Ble -AlpSdkRoot <alp-sdk checkout>
   `include/alp/protocol/cc3501e.h` `ALP_CC3501E_PROTOCOL_VERSION` matches
   this tree's `protocol-version.txt` — a mismatch fails a `_Static_assert`
   at compile time, so a successful build already proves the protocol
-  version, but record it anyway: **protocol 7** for `v0.6.0`.
+  version, but record it anyway: **protocol 7** for the withdrawn `v0.6.0`
+  described above; **protocol 8** for the shipped `v0.6.0`.
 - No other switch (no `-AttnPulse`, no `-OtaSelftest`/`-OtaWindowSelftest`,
   default `-Transport spi`) — the release recipe never passed them, and the
   byte-level comparison below is evidence for that, not just the CHANGELOG's
@@ -75,7 +95,8 @@ simplelink-wifi-toolbox flash-images-builder sign vendor_image \
 - **`--version`** is the GPE anti-rollback stamp (`a.b.c.d`, `a` always `0`;
   see `README.md`/`BRINGUP_STATUS.md` for why). It is **distinct** from the
   app SemVer and the wire protocol — CHANGELOG.md records it per release
-  under `GPE:`. For `v0.6.0` it is **`0.149.70.0`**.
+  under `GPE:`. For the withdrawn `v0.6.0` it was **`0.149.70.0`**; for the
+  shipped `v0.6.0` it is **`0.149.76.0`**.
 - **`--conf_bin_file`** is the SoM/board-specific flash-and-RF config
   (`cc35xx-conf.bin`). It is a bench asset, deliberately **not** committed
   here (`ti/deploy_validate.sh`'s own header: "NOT in the repo -- stage from
