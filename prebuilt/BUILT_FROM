@@ -56,9 +56,9 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   615c7236a0d5399263bf4c1a6d6a619f8a125fec
-image-sha256: d58d78a6697ea6d74c12ee51912dfb0434214f4244add2e6af03928919b0eb9f
-raw-sha256:   7db034a748840f2387725ef1388d5092c78fd6de517958938819f6130025772a
+built-from:   PENDING-SQUASH-SHA
+image-sha256: 922e71947130c3831fed140c0cc3045e6245981394b292d77e703e7c41a9feed
+raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -78,11 +78,17 @@ raw-sha256:   7db034a748840f2387725ef1388d5092c78fd6de517958938819f6130025772a
 # etc.) and an earlier cut of 0.5.1 did the same.  That convention is broken by
 # construction -- every bench or OTA-iterated unit climbs into 0.149.x through
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
-gpe-floor:    0.149.73.0
+gpe-floor:    0.149.76.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
 # compares against `raw-sha256`, not `image-sha256`.
-#   (none -- the v0.5.1 cut supersedes them.  The previous entry attested #93
-#   inert against the old built-from; that blob is gone and its attestation
-#   with it, exactly as this file's header prescribes for a real release.)
+#   (none -- the v0.6.0 cut supersedes them.)
+#
+# built-from is deliberately the placeholder PENDING-SQUASH-SHA, NOT a real SHA.
+# This repo squash-merges, so the commit that built this blob does not survive
+# under its branch SHA, and recording that SHA is the exact rot this file's
+# header describes -- CI would then fail every later PR with "built-from is not
+# a commit in this repository".  Repoint this line at the squash SHA on main
+# immediately after the release PR merges; `prebuilt freshness` fails closed
+# until then, which is the intended forcing function, not an oversight.

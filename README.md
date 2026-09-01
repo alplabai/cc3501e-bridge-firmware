@@ -121,11 +121,11 @@ installed and on the right paths -- a long toolchain to require of anyone who
 just wants a working companion.  The signed blob in `prebuilt/` is already
 built and signed:
 
-> **`cc3501e-v0.5.1.bin` is built from this tree's v0.5.1 release commit,
-> which is current `main`.**  `cc3501e-v0.5.0.bin` and older are kept only for
+> **`cc3501e-v0.6.0.bin` is built from this tree's v0.6.0 release commit,
+> which is current `main`.**  `cc3501e-v0.5.1.bin` and older are kept only for
 > traceability, and note they are not all the same KIND of artifact: 0.2.0,
-> 0.3.0 and 0.5.0 are raw `build_ti.ps1` output, while 0.4.0, 0.4.1 and this
-> 0.5.1 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
+> 0.3.0 and 0.5.0 are raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1 and
+> this 0.6.0 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
 > kind can be dropped straight into `primary_vendor_image.sign.bin` by the
 > recipe below (#96).  `prebuilt/BUILD_RECIPE.md` records which is which and CI
 > machine-checks it (#97).
@@ -157,8 +157,8 @@ built and signed:
 ```sh
 # 1. Verify what you are about to flash (never skip this).
 openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
-    -signature prebuilt/cc3501e-v0.5.1.bin.sig prebuilt/cc3501e-v0.5.1.bin
-sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.1.bin.sha256)  prebuilt/cc3501e-v0.5.1.bin"
+    -signature prebuilt/cc3501e-v0.6.0.bin.sig prebuilt/cc3501e-v0.6.0.bin
+sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.6.0.bin.sha256)  prebuilt/cc3501e-v0.6.0.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
 #    THIS artifact's stamp (0.149.74.0) -- see the warning below.  An existing
@@ -174,7 +174,7 @@ sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.5.1.bin.sha256)  prebuilt/cc3501e-v0.
 #    table, not a signed container, and installing one here is a different file
 #    format, not a different build (#96).  prebuilt/BUILD_RECIPE.md records
 #    which release is which, and CI machine-checks it (#97).
-cp prebuilt/cc3501e-v0.5.1.bin <flashset>/primary_vendor_image.sign.bin
+cp prebuilt/cc3501e-v0.6.0.bin <flashset>/primary_vendor_image.sign.bin
 rm -f <flashset>/*.flashready.bin
 
 # 4. Program over XDS110/SWD (~18 s).
@@ -195,13 +195,20 @@ expensive trap on this part.  `programming_instructions` is built from
 *same* `--version` as the vendor image (`ti/regen_flashset.sh`).
 
 Verify the flash took by asking the device, not by trusting the programmer:
-`GET_VERSION` must answer wire protocol **7**, and `GET_DIAG_INFO` must report
-`fw_version=0x0501`.
+`GET_VERSION` must answer wire protocol **8**, and `GET_DIAG_INFO` must report
+`fw_version=0x0600`.
 
-`GET_VERSION` alone is **not** a sufficient check after an upgrade: v0.5.1 and
-the v0.6.0 artifact it replaced both answer protocol **7**, so a part still
-running the older image looks identical on that field. `fw_version` is the
-discriminator -- `0x0501` for this release, `0x0500` for anything older.
+For this release `GET_VERSION` *is* discriminating, because v0.6.0 is the first
+image to answer **8** -- every earlier release answers 7 or lower. That is a
+property of this particular bump, not a rule: v0.5.1 and the withdrawn v0.6.0
+artifact it replaced both answered protocol **7**, so a part running either
+looked identical on that field. `fw_version` remains the reliable
+discriminator -- `0x0600` for this release, `0x0501` / `0x0500` for older.
+
+**A protocol-8 image needs a protocol-8 host.** `cc3501e_reset()` reads
+`GET_VERSION` on every cold boot and returns `ALP_ERR_VERSION` on a mismatch,
+so flashing this blob under a pre-v8 alp-sdk takes the companion link down by
+design. The paired host change is alplabai/alp-sdk#1891.
 
 Three distinct version numbers are in play here and they are **not**
 interchangeable -- app SemVer (`0.5.1`), wire protocol (`7`), and the GPE
@@ -333,7 +340,7 @@ release blob is version-pinned at `prebuilt/cc3501e-vX.Y.Z.bin`.
 validates that blob (relaying the image to the CC3501E over the
 inter-chip link) -- it is not a customer-facing utility, and lives
 in `alp-sdk-internal`, not this public tree.
-`prebuilt/` holds the signed release blob; `cc3501e-v0.5.1.bin` is the
+`prebuilt/` holds the signed release blob; `cc3501e-v0.6.0.bin` is the
 current one (wire protocol **7**).  Every older blob answers a DIFFERENT
 protocol and a host built from this tree refuses all of them:
 `cc3501e-v0.5.0.bin` answers **6**, `cc3501e-v0.4.1.bin` and
