@@ -140,19 +140,29 @@ alp_cc3501e_resp_t handle_wifi_get_rssi(const uint8_t *req,
 	    ALP_CC3501E_CMD_WIFI_GET_RSSI, 1u, req_len, reply_data, reply_cap, reply_data_len);
 }
 
-/* WIFI_GET_IP (0x17): reply data = 4-byte IPv4 address. */
+/* WIFI_GET_IP (0x17): reply data = 4-byte IPv4 address.
+ *
+ * v9 takes an OPTIONAL one-byte interface selector (alp_cc3501e_wifi_iface_t).
+ * A zero-length request keeps its pre-v9 meaning -- the STA address -- so the
+ * frame an older host sends still means what it always meant, even though the
+ * GET_VERSION gate stops such a host from getting this far.  Anything longer
+ * than one byte is a malformed frame, not an old one. */
 alp_cc3501e_resp_t handle_wifi_get_ip(const uint8_t *req,
                                       size_t         req_len,
                                       uint8_t       *reply_data,
                                       size_t         reply_cap,
                                       size_t        *reply_data_len)
 {
-	(void)req;
 	*reply_data_len = 0u;
-	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
+	if (req_len > 1u) return ALP_CC3501E_RESP_ERR_INVALID;
+	const uint8_t iface = (req_len == 1u) ? req[0] : (uint8_t)ALP_CC3501E_WIFI_IFACE_STA;
+	if (iface != (uint8_t)ALP_CC3501E_WIFI_IFACE_STA &&
+	    iface != (uint8_t)ALP_CC3501E_WIFI_IFACE_AP) {
+		return ALP_CC3501E_RESP_ERR_INVALID;
+	}
 	if (reply_cap < 4u) return ALP_CC3501E_RESP_ERR_NO_MEM;
 	uint8_t            ip[4] = { 0 };
-	alp_cc3501e_resp_t st    = hw_to_resp(cc3501e_hw_wifi_get_ip(ip));
+	alp_cc3501e_resp_t st    = hw_to_resp(cc3501e_hw_wifi_get_ip(iface, ip));
 	if (st == ALP_CC3501E_RESP_OK) {
 		memcpy(reply_data, ip, 4u);
 		*reply_data_len = 4u;

@@ -350,9 +350,10 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_INVALID;
 		}
-		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
-		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
-		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
+		/* CC3501E_HW_ERR_STATE: cc3501e_hw_ble_gatt_register's NimBLE
+		 * ble_gatts_mutable() reject (BLE_HS_EBUSY), and cc3501e_hw_sock_listen's
+		 * full listen table -- both deterministic, terminal refusals, not the
+		 * generic radio/protocol RESP_ERR_RADIO bucket below. */
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
@@ -404,9 +405,10 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_INVALID;
 		}
-		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
-		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
-		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
+		/* CC3501E_HW_ERR_STATE: cc3501e_hw_ble_gatt_register's NimBLE
+		 * ble_gatts_mutable() reject (BLE_HS_EBUSY), and cc3501e_hw_sock_listen's
+		 * full listen table -- both deterministic, terminal refusals, not the
+		 * generic radio/protocol RESP_ERR_RADIO bucket below. */
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
@@ -474,9 +476,10 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_INVALID, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_INVALID;
 		}
-		/* CC3501E_HW_ERR_STATE: today only cc3501e_hw_ble_gatt_register's NimBLE
-		 * ble_gatts_mutable() reject (BLE_HS_EBUSY) -- a deterministic, terminal
-		 * refusal, not the generic radio/protocol RESP_ERR_RADIO bucket below. */
+		/* CC3501E_HW_ERR_STATE: cc3501e_hw_ble_gatt_register's NimBLE
+		 * ble_gatts_mutable() reject (BLE_HS_EBUSY), and cc3501e_hw_sock_listen's
+		 * full listen table -- both deterministic, terminal refusals, not the
+		 * generic radio/protocol RESP_ERR_RADIO bucket below. */
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
@@ -637,6 +640,14 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 		break;
 	case ALP_CC3501E_CMD_SOCK_CLOSE:
 		h = handle_sock_close;
+		break;
+	/* Listening path (protocol v9).  No accept opcode: an inbound connection
+	 * arrives as EVT_SOCK_ACCEPTED on the event ring. */
+	case ALP_CC3501E_CMD_SOCK_BIND:
+		h = handle_sock_bind;
+		break;
+	case ALP_CC3501E_CMD_SOCK_LISTEN:
+		h = handle_sock_listen;
 		break;
 	/* BLE 5.4 (v0.3). */
 	case ALP_CC3501E_CMD_BLE_ENABLE:

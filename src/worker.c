@@ -405,6 +405,28 @@ static void worker_execute(uint8_t cmd)
 		rv = cc3501e_hw_sock_close(wk_get_le16(job.req, 0u));
 		break;
 	}
+	case ALP_CC3501E_CMD_SOCK_BIND: {
+		/* job.req = alp_cc3501e_sock_bind_t -- the SOCK_CONNECT layout with the
+		 * LOCAL endpoint: handle(LE16 @0) | reserved(@2) | local sock_addr @4
+		 * { family(@4) | reserved(@5) | port(LE16 @6) | addr[16] @8 }.  An
+		 * all-zero addr[0..3] is INADDR_ANY. */
+		const uint16_t handle = wk_get_le16(job.req, 0u);
+		const uint8_t  family = job.req[4];
+		const uint16_t port   = wk_get_le16(job.req, 6u);
+		uint8_t        addr[4];
+		for (unsigned i = 0u; i < 4u; ++i)
+			addr[i] = job.req[8u + i];
+		rv = cc3501e_hw_sock_bind(handle, family, port, addr);
+		break;
+	}
+	case ALP_CC3501E_CMD_SOCK_LISTEN: {
+		/* job.req = alp_cc3501e_sock_listen_t: handle(LE16 @0) | backlog(@2) |
+		 * reserved(@3).  Returns as soon as the socket is passive; inbound
+		 * connections are accepted on the tick, not here -- a blocking accept in
+		 * the drain would hold READY LOW until a client happened to connect. */
+		rv = cc3501e_hw_sock_listen(wk_get_le16(job.req, 0u), job.req[2]);
+		break;
+	}
 	case ALP_CC3501E_CMD_SPI1_CONFIGURE: {
 		/* job.req = alp_cc3501e_spi1_configure_t: freq_hz(LE32 @0) | mode(@4) |
 		 * bits_per_word(@5) | cs(@6) | reserved(@7); protocol_spi.c validated it.

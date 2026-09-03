@@ -113,6 +113,10 @@ EVT_WIFI_CONNECTED = 0x19
 EVT_WIFI_DISCONNECTED = 0x1A
 CMD_SOCK_OPEN = 0x20
 CMD_SOCK_CLOSE = 0x24
+CMD_SOCK_BIND = 0x25  # listening path (proto v9)
+CMD_SOCK_LISTEN = 0x26
+EVT_SOCK_ACCEPTED = 0x2C  # async: a client connected to a listening socket
+CMD_WIFI_GET_IP = 0x17
 CMD_SPI1_TRANSFER = 0x56  # SPI1 host passthrough (0x55..0x57); only TRANSFER is pinned here
 
 FLAG_SOLICITED = 0x00
@@ -229,6 +233,38 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
                 reply(CMD_SOCK_OPEN, RESP_ERR_INVALID).hex().upper(),
                 "cmd=SOCK_OPEN | len=1 | status=INVALID -- payload length != sizeof(sock_open_t)"))
 
+    # Listening path (proto v9).  SOCK_BIND req = sock_bind_t, byte-for-byte the
+    # SOCK_CONNECT layout with the LOCAL endpoint: handle(LE16)=1 | reserved(2) |
+    # local sock_addr { family=IPV4 | reserved | port(LE16)=80 | addr[16] }.
+    # addr all-zero = INADDR_ANY, which is what a server on the soft-AP binds.
+    sock_bind_payload = (bytes([0x01, 0x00, 0x00, 0x00])
+                         + bytes([0x00, 0x00, 0x50, 0x00])
+                         + bytes(16))
+    out.append(("sock_bind_request",
+                frame(CMD_SOCK_BIND, 0, sock_bind_payload).hex().upper(),
+                "cmd=SOCK_BIND | len=24 | handle=1 family=IPV4 port=80 addr=INADDR_ANY"))
+    out.append(("sock_bind_reply_busy_submitted", reply(CMD_SOCK_BIND, RESP_ERR_BUSY).hex().upper(),
+                "cmd=SOCK_BIND | len=1 | status=BUSY -- job submitted, host re-issues"))
+    # SOCK_LISTEN req = sock_listen_t { handle(LE16)=1 | backlog=4 | reserved }.
+    out.append(("sock_listen_request",
+                frame(CMD_SOCK_LISTEN, 0, bytes([0x01, 0x00, 0x04, 0x00])).hex().upper(),
+                "cmd=SOCK_LISTEN | len=4 | handle=1 backlog=4"))
+    out.append(("sock_listen_reply_not_ready_stub",
+                reply(CMD_SOCK_LISTEN, RESP_ERR_NOT_READY).hex().upper(),
+                "cmd=SOCK_LISTEN | len=1 | status=NOT_READY -- re-issued; stub has no IP stack"))
+    # Handle 0 is the invalid handle, rejected up front (not worker-routed).
+    out.append(("sock_listen_handle_zero_reply_invalid",
+                reply(CMD_SOCK_LISTEN, RESP_ERR_INVALID).hex().upper(),
+                "cmd=SOCK_LISTEN | len=1 | status=INVALID -- handle 0 is never valid"))
+
+    # WIFI_GET_IP (0x17) with the v9 interface selector.  A ZERO-length request
+    # keeps its pre-v9 meaning (STA); one byte selects the interface, and AP is
+    # the address a serving application binds to.
+    out.append(("wifi_get_ip_request_sta_legacy", frame(CMD_WIFI_GET_IP, 0).hex().upper(),
+                "cmd=WIFI_GET_IP | len=0 | pre-v9 form, still means STA"))
+    out.append(("wifi_get_ip_request_ap", frame(CMD_WIFI_GET_IP, 0, bytes([0x01])).hex().upper(),
+                "cmd=WIFI_GET_IP | len=1 | iface=AP (v9)"))
+
     # Async-event queue drain (0x05, proto v3): the reply DATA is a packed list
     # of { evt_opcode(1) | len(1) | payload[len] } entries.
     out.append(("get_pending_events_request", frame(CMD_GET_PENDING_EVENTS, 0).hex().upper(),
@@ -244,6 +280,23 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
         reply(CMD_GET_PENDING_EVENTS, RESP_OK,
               bytes([EVT_WIFI_CONNECTED, 0x00, EVT_WIFI_DISCONNECTED, 0x00])).hex().upper(),
         "cmd=GET_PENDING_EVENTS | status=OK | [WIFI_CONNECTED len0][WIFI_DISCONNECTED len0]",
+    ))
+
+    # One EVT_SOCK_ACCEPTED entry (proto v9): { opcode | len=12 | payload }, the
+    # payload being alp_cc3501e_sock_accepted_evt_t -- listen_handle(LE16)=1 |
+    # handle(LE16)=2 | peer_port(LE16, host order)=54321 | peer_family=IPV4 |
+    # reserved | peer_addr[4]=192.168.1.14 (network order, MSB first).  12 bytes
+    # is under the firmware ring's 16-byte per-entry payload cap, which is why
+    # the peer address is carried in this compact form rather than as a
+    # 20-byte sock_addr_t.
+    sock_accepted_payload = (bytes([0x01, 0x00, 0x02, 0x00, 0x31, 0xD4, 0x00, 0x00])
+                             + bytes([192, 168, 1, 14]))
+    out.append((
+        "get_pending_events_reply_sock_accepted",
+        reply(CMD_GET_PENDING_EVENTS, RESP_OK,
+              bytes([EVT_SOCK_ACCEPTED, 0x0C]) + sock_accepted_payload).hex().upper(),
+        "cmd=GET_PENDING_EVENTS | status=OK | [SOCK_ACCEPTED len12 listen=1 handle=2 "
+        "port=54321 192.168.1.14]",
     ))
 
     # SPI1 host passthrough (0x55..0x57): the only vector here is TRANSFER, and it

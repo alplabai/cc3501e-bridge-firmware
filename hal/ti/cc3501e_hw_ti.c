@@ -504,6 +504,10 @@ void cc3501e_hw_tick(void)
 	/* Fill the socket RX ring on the TASK, so the dispatch can serve
 	 * CMD_SOCK_RECV with a memcpy instead of a worker round trip. */
 	cc3501e_hw_sock_pump();
+	/* Take any inbound connection on a listening socket, also on the TASK and
+	 * also non-blocking, and publish it as EVT_SOCK_ACCEPTED (protocol v9).
+	 * No-op until the host has actually called SOCK_LISTEN. */
+	cc3501e_hw_sock_accept_pump();
 #ifdef CC3501E_WEDGE_PROBE
 	bridge_transport_spi_probe_tick(); /* #1691 wedge snapshot (bench builds only) */
 #endif

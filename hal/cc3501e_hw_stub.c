@@ -247,8 +247,9 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out)
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
-int cc3501e_hw_wifi_get_ip(uint8_t ip_out[4])
+int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 {
+	(void)iface;
 	(void)ip_out;
 	return CC3501E_HW_ERR_NOTIMPL;
 }
@@ -324,8 +325,29 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
+int cc3501e_hw_sock_bind(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4])
+{
+	(void)handle;
+	(void)family;
+	(void)port;
+	(void)addr;
+	return CC3501E_HW_ERR_NOTIMPL;
+}
+
+int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog)
+{
+	(void)handle;
+	(void)backlog;
+	return CC3501E_HW_ERR_NOTIMPL;
+}
+
 void cc3501e_hw_sock_pump(void)
 {
+}
+
+void cc3501e_hw_sock_accept_pump(void)
+{
+	/* No IP stack on the stub -- nothing ever connects, so nothing is pushed. */
 }
 
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)

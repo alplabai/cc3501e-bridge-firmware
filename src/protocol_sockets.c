@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * cc3501e-bridge firmware: TCP/UDP socket command-family handlers
- * (0x20..0x24).  Split out of protocol.c (issue #461); protocol_dispatch()
+ * (0x20..0x26).  Split out of protocol.c (issue #461); protocol_dispatch()
  * in protocol.c still owns the single command-family switch that routes
  * here.
  *
@@ -86,6 +86,49 @@ alp_cc3501e_resp_t handle_sock_connect(const uint8_t *req,
 		return ALP_CC3501E_RESP_ERR_INVALID;
 	}
 	return handle_worker_routed_payload(ALP_CC3501E_CMD_SOCK_CONNECT, req, req_len, reply_data_len);
+}
+
+/* SOCK_BIND (0x25): req = alp_cc3501e_sock_bind_t = 24 B.  No reply data.
+ *
+ * Byte-for-byte the SOCK_CONNECT layout (handle | reserved | sock_addr), so the
+ * validation and the worker-side parse are the same shape; only the endpoint's
+ * meaning differs.  An all-zero local.addr is INADDR_ANY, which is what a
+ * server on the soft-AP binds -- the AP address does not exist until the role
+ * is up -- so unlike CONNECT there is nothing to reject about a zero address. */
+alp_cc3501e_resp_t handle_sock_bind(const uint8_t *req,
+                                    size_t         req_len,
+                                    uint8_t       *reply_data,
+                                    size_t         reply_cap,
+                                    size_t        *reply_data_len)
+{
+	(void)reply_data;
+	(void)reply_cap;
+	if (req_len != sizeof(alp_cc3501e_sock_bind_t)) return ALP_CC3501E_RESP_ERR_INVALID;
+	if (req[4] != (uint8_t)ALP_CC3501E_SOCK_FAMILY_IPV4) { /* local.family */
+		return ALP_CC3501E_RESP_ERR_INVALID;
+	}
+	return handle_worker_routed_payload(ALP_CC3501E_CMD_SOCK_BIND, req, req_len, reply_data_len);
+}
+
+/* SOCK_LISTEN (0x26): req = alp_cc3501e_sock_listen_t { handle | backlog |
+ * reserved } = 4 B.  No reply data.
+ *
+ * Makes the socket passive; it does NOT wait for a connection.  Each inbound
+ * connection is accepted on the housekeeping tick by
+ * cc3501e_hw_sock_accept_pump() and delivered to the host as an
+ * EVT_SOCK_ACCEPTED entry on the event ring -- see the wire-protocol v9 note in
+ * <alp/protocol/cc3501e.h> for why there is no accept opcode. */
+alp_cc3501e_resp_t handle_sock_listen(const uint8_t *req,
+                                      size_t         req_len,
+                                      uint8_t       *reply_data,
+                                      size_t         reply_cap,
+                                      size_t        *reply_data_len)
+{
+	(void)reply_data;
+	(void)reply_cap;
+	if (req_len != sizeof(alp_cc3501e_sock_listen_t)) return ALP_CC3501E_RESP_ERR_INVALID;
+	if (req[0] == 0u && req[1] == 0u) return ALP_CC3501E_RESP_ERR_INVALID; /* handle 0 invalid */
+	return handle_worker_routed_payload(ALP_CC3501E_CMD_SOCK_LISTEN, req, req_len, reply_data_len);
 }
 
 /* SOCK_SEND (0x22): req = alp_cc3501e_sock_send_t (8 B) + data_len inline bytes.
