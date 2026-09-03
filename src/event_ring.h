@@ -41,13 +41,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The canonical wire contract (single-sourced from alp-sdk, see CMakeLists):
+ * ALP_CC3501E_EVENT_PAYLOAD_MAX is the per-entry payload cap this ring
+ * enforces. */
+#include "alp/protocol/cc3501e.h"
+
 /* Ring depth (number of queued events) and the per-entry payload cap.  16 slots
  * absorb a burst of connect/disconnect/GPIO events between two host polls; 16
  * payload bytes cover the largest EVT_* payload the firmware enqueues (the
  * 8-byte alp_cc3501e_gpio_event_t, with headroom).  Overflow drops the NEWEST
  * event (the ring never blocks a producer). */
-#define CC3501E_EVENT_RING_SLOTS  16u
-#define CC3501E_EVENT_PAYLOAD_MAX 16u
+#define CC3501E_EVENT_RING_SLOTS 16u
+/* The per-entry payload cap is part of the WIRE CONTRACT, not a private
+ * firmware size: a host that defines an EVT_* payload larger than this gets it
+ * CLAMPED by event_ring_push() below and silently truncated.  So it is defined
+ * once, in the canonical <alp/protocol/cc3501e.h> both repos compile, and
+ * consumed here -- keeping the two numbers independent is how one of them
+ * would eventually drift past the other unnoticed. */
+#define CC3501E_EVENT_PAYLOAD_MAX ALP_CC3501E_EVENT_PAYLOAD_MAX
 
 /* Initialise the ring to empty.  Called once from main(), right after
  * worker_init() and before the transport is started -- worker_init() itself does

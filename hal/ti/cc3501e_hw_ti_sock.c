@@ -239,29 +239,42 @@ int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog)
 		}
 	}
 
+	/* RESERVE THE PUMP SLOT BEFORE GOING PASSIVE.  If lwip_listen() ran first and
+	 * the table turned out to be full, the socket would already be accepting
+	 * handshakes into a backlog nothing ever drains: a client would see a
+	 * connected socket and then silence, which is worse than a refused connect
+	 * and is invisible from the host.  Claiming the slot first means the failure
+	 * happens while the socket is still inert.
+	 *
+	 * Re-listening on an already-registered handle refreshes its slot rather
+	 * than consuming a second one. */
+	listen_table_remove(handle);
+	unsigned slot = CC3501E_SOCK_LISTEN_MAX;
+	for (unsigned i = 0u; i < CC3501E_SOCK_LISTEN_MAX; ++i) {
+		if (listen_handles[i] == 0u) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == CC3501E_SOCK_LISTEN_MAX) {
+		/* Table full, and the socket is NOT listening -- nothing to undo.  Fail
+		 * loudly.  ERR_STATE, not ERR_IO: this is a deterministic, terminal
+		 * refusal (the host asked for more listening sockets than this backend
+		 * tracks), and ERR_IO would map to RESP_ERR_RADIO, which poll_by_repeat
+		 * retries for its whole budget. */
+		Report("\n\rcc3501e sock_listen: no free listen slot (max %u)\n\r",
+		       (unsigned)CC3501E_SOCK_LISTEN_MAX);
+		return CC3501E_HW_ERR_STATE;
+	}
+	listen_handles[slot] = handle;
+
 	const int bl = (backlog == 0u) ? CC3501E_SOCK_LISTEN_BACKLOG_DEFAULT : (int)backlog;
 	if (lwip_listen(fd, bl) != 0) {
+		listen_handles[slot] = 0u; /* never went passive -- give the slot back */
 		Report("\n\rcc3501e sock_listen: lwip_listen failed errno=%d\n\r", errno);
 		return CC3501E_HW_ERR_IO;
 	}
-
-	/* Register for the pump.  Re-listening on an already-registered handle
-	 * refreshes its slot rather than consuming a second one. */
-	listen_table_remove(handle);
-	for (unsigned i = 0u; i < CC3501E_SOCK_LISTEN_MAX; ++i) {
-		if (listen_handles[i] == 0u) {
-			listen_handles[i] = handle;
-			return CC3501E_HW_OK;
-		}
-	}
-	/* Table full: the socket IS listening but nothing would ever accept on it,
-	 * which presents as a silently dead server.  Fail loudly instead.  ERR_STATE,
-	 * not ERR_IO: this is a deterministic, terminal refusal (the host asked for
-	 * more listening sockets than this backend tracks), and ERR_IO would map to
-	 * RESP_ERR_RADIO, which poll_by_repeat retries for its whole budget. */
-	Report("\n\rcc3501e sock_listen: no free listen slot (max %u)\n\r",
-	       (unsigned)CC3501E_SOCK_LISTEN_MAX);
-	return CC3501E_HW_ERR_STATE;
+	return CC3501E_HW_OK;
 }
 
 void cc3501e_hw_sock_accept_pump(void)
@@ -286,7 +299,19 @@ void cc3501e_hw_sock_accept_pump(void)
 		/* The ACCEPTED socket does NOT inherit the listener's options, so give it
 		 * the same bounded receive timeout cc3501e_hw_sock_open() sets.  Without
 		 * it a worker-routed CMD_SOCK_RECV on an idle connection blocks in lwIP
-		 * with no timeout at all, holding READY LOW and wedging the bridge. */
+		 * with no timeout at all, holding READY LOW and wedging the bridge.
+		 *
+		 * KNOWN EXPOSURE, the SEND direction is NOT bounded the same way.
+		 * cc3501e_hw_sock_send()'s lwip_send() is blocking, and this SDK's lwIP
+		 * build does not enable LWIP_SO_SNDTIMEO -- there is no SO_SNDTIMEO to
+		 * set here.  CMD_SOCK_SEND is worker-routed, so a peer that opens a
+		 * connection and then stops reading fills the TCP window and parks the
+		 * worker inside lwip_send (READY LOW, no opcode served) until lwIP gives
+		 * up on the connection.  That shape pre-dates this change for CLIENT
+		 * sockets, where the host chooses the peer; a listening socket hands the
+		 * trigger to whoever can reach the AP.  Bounding it needs either
+		 * LWIP_SO_SNDTIMEO in the vendor lwipopts or a chunked non-blocking
+		 * send, neither of which belongs in this change -- tracked separately. */
 		struct timeval tv = { .tv_sec  = CC3501E_SOCK_RCVTIMEO_MS / 1000,
 			                  .tv_usec = (CC3501E_SOCK_RCVTIMEO_MS % 1000) * 1000 };
 		(void)lwip_setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
