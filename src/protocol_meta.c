@@ -97,17 +97,31 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * paragraph above describes, just triggered by the header instead of one
  * struct's reserved byte.  The GET_VERSION gate is what stops it, as before.
  *
+ * v9 adds the LISTENING-SOCKET path, and this bump IS structural: two new
+ * opcodes (CMD_SOCK_BIND 0x25, CMD_SOCK_LISTEN 0x26), one new async opcode
+ * (EVT_SOCK_ACCEPTED 0x2C) and an optional interface-selector byte on
+ * CMD_WIFI_GET_IP.  Before it the socket family was client-only, so a host
+ * could not terminate an inbound TCP connection over the module's own soft-AP
+ * even though lwIP already offers bind/listen/accept here (issue #104).
+ *
+ * There is deliberately NO accept opcode: accept() blocks, worker_run_pending()
+ * holds READY LOW across a worker body, and an accept opcode would therefore
+ * black the whole bridge out for as long as no client connected.  The accept
+ * runs non-blocking on the housekeeping tick instead
+ * (cc3501e_hw_sock_accept_pump) and each connection reaches the host as an
+ * event on the existing polled queue.
+ *
  * PAIRED ALP-SDK CHANGE NOT YET LANDED.  This firmware repo and alp-sdk are
- * separate repos + separate PRs (ADR 0031); the host-side half -- assigning
- * the seq once per logical command in poll_by_repeat() and re-sending it
- * unchanged on retries, plus bumping ALP_CC3501E_PROTOCOL_VERSION 7 -> 8 --
- * is deliberately NOT part of this change (see the PR body).  Until it
- * lands, this firmware's v8 disagrees with alp-sdk's default-branch v7 on
- * purpose: the assert below is EXPECTED to fail CI's "protocol version
- * parity" job and this repo's own stub-build / gen_protocol_vectors.py
- * --check gates in the meantime -- the atomicity cost the README already
- * documents for the repo split, not a regression to chase here. */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL 8
+ * separate repos + separate PRs (ADR 0031); the host-side half -- the wire
+ * definitions in <alp/protocol/cc3501e.h>, cc3501e_sock_bind/_listen and the
+ * ALP_CC3501E_PROTOCOL_VERSION 8 -> 9 bump -- ships as its own alp-sdk PR (see
+ * the PR body).  Until that lands, this firmware's v9 disagrees with alp-sdk's
+ * default-branch v8 on purpose: the assert below is EXPECTED to fail CI's
+ * "protocol version parity" job and this repo's own stub-build /
+ * gen_protocol_vectors.py --check gates in the meantime -- the atomicity cost
+ * the README already documents for the repo split, not a regression to chase
+ * here.  This is the same sequence v8 itself went through. */
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL 9
 
 _Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
                "<alp/protocol/cc3501e.h> is not the protocol version this firmware "

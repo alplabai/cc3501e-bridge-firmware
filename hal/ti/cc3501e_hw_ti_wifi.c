@@ -975,23 +975,39 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out)
 	return CC3501E_HW_OK;
 }
 
-int cc3501e_hw_wifi_get_ip(uint8_t ip_out[4])
+int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 {
 	if (ip_out == 0) {
 		return CC3501E_HW_ERR_INVAL;
 	}
-	if (!wifi_started) {
-		return CC3501E_HW_ERR_IO; /* no STA up -> no lease */
+	if (iface != (uint8_t)ALP_CC3501E_WIFI_IFACE_STA &&
+	    iface != (uint8_t)ALP_CC3501E_WIFI_IFACE_AP) {
+		return CC3501E_HW_ERR_INVAL;
 	}
-	uint32_t ip = 0u, mask = 0u, gw = 0u, dhcp = 0u;
-	if (network_stack_get_if_ip(WLAN_ROLE_STA, &ip, &mask, &gw, &dhcp) != 0) {
+	if (!wifi_started) {
+		return CC3501E_HW_ERR_IO; /* stack not up -> neither interface has an address */
+	}
+	/* The AP interface only exists once WIFI_AP_START has rolled the role up;
+	 * asking before that is a host sequencing error, not a transient, so say
+	 * NOTIMPL (-> RESP_ERR_NOT_READY) rather than IO (-> RESP_ERR_RADIO, which
+	 * the host retries for its whole budget). */
+	if (iface == (uint8_t)ALP_CC3501E_WIFI_IFACE_AP && !wifi_ap_role_up) {
+		return CC3501E_HW_ERR_NOTIMPL;
+	}
+	const int role = (iface == (uint8_t)ALP_CC3501E_WIFI_IFACE_AP) ? WLAN_ROLE_AP : WLAN_ROLE_STA;
+	uint32_t  ip = 0u, mask = 0u, gw = 0u, dhcp = 0u;
+	if (network_stack_get_if_ip(role, &ip, &mask, &gw, &dhcp) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	if (ip == 0u) {
 		return CC3501E_HW_ERR_IO; /* DHCP not yet acquired -> NOT-ready-ish (RADIO) */
 	}
-	/* network_stack_get_if_ip returns the lwIP host-order u32; emit MSB-first
-	 * (a.b.c.d) to match the host's 4-byte IPv4 wire order. */
+	/* Emit the u32 MSB-first.  network_stack_get_if_ip hands back the lwIP
+	 * netif address, which is a NETWORK-order u32, so on this little-endian core
+	 * this extraction puts the LAST octet in ip_out[0] -- the wire order is
+	 * reversed, and alp-sdk's cc3501e_wifi_get_ip() reverses it back (see the
+	 * byte-order note there).  Both interfaces go through this same extraction,
+	 * so the AP address needs no separate host-side handling. */
 	ip_out[0] = (uint8_t)((ip >> 24) & 0xFFu);
 	ip_out[1] = (uint8_t)((ip >> 16) & 0xFFu);
 	ip_out[2] = (uint8_t)((ip >> 8) & 0xFFu);
@@ -1061,8 +1077,9 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out)
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
-int cc3501e_hw_wifi_get_ip(uint8_t ip_out[4])
+int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 {
+	(void)iface;
 	(void)ip_out;
 	return CC3501E_HW_ERR_NOTIMPL;
 }

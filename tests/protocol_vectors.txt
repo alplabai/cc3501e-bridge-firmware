@@ -16,8 +16,8 @@ ping_request                       = 00000000
 ping_reply_ok                      = 000008000000000000000000
 # cmd=GET_VERSION | flags=0 | len=0
 get_version_request                = 01000000
-# cmd=GET_VERSION | len=3 | status=OK | version=8 (LE16)
-get_version_reply_proto8           = 010008000008000000000000
+# cmd=GET_VERSION | len=3 | status=OK | version=9 (LE16)
+get_version_reply_proto9           = 010008000009000000000000
 # cmd=GET_MAC | flags=0 | len=0
 get_mac_request                    = 03000000
 # cmd=GET_MAC | len=1 | status=BUSY -- job submitted, host re-issues
@@ -40,12 +40,28 @@ sock_open_reply_not_ready_stub     = 200008000500000000000000
 sock_close_request                 = 2400040001000000
 # cmd=SOCK_OPEN | len=1 | status=INVALID -- payload length != sizeof(sock_open_t)
 sock_open_bad_len_reply_invalid    = 200008000100000000000000
+# cmd=SOCK_BIND | len=24 | handle=1 family=IPV4 port=80 addr=INADDR_ANY
+sock_bind_request                  = 25001800010000000000500000000000000000000000000000000000
+# cmd=SOCK_BIND | len=1 | status=BUSY -- job submitted, host re-issues
+sock_bind_reply_busy_submitted     = 250008000200000000000000
+# cmd=SOCK_LISTEN | len=4 | handle=1 backlog=4
+sock_listen_request                = 2600040001000400
+# cmd=SOCK_LISTEN | len=1 | status=NOT_READY -- re-issued; stub has no IP stack
+sock_listen_reply_not_ready_stub   = 260008000500000000000000
+# cmd=SOCK_LISTEN | len=1 | status=INVALID -- handle 0 is never valid
+sock_listen_handle_zero_reply_invalid = 260008000100000000000000
+# cmd=WIFI_GET_IP | len=0 | pre-v9 form, still means STA
+wifi_get_ip_request_sta_legacy     = 17000000
+# cmd=WIFI_GET_IP | len=1 | iface=AP (v9)
+wifi_get_ip_request_ap             = 1700010001
 # cmd=GET_PENDING_EVENTS | flags=0 | len=0
 get_pending_events_request         = 05000000
 # cmd=GET_PENDING_EVENTS | len=1 | status=OK | no events queued
 get_pending_events_reply_empty     = 050008000000000000000000
 # cmd=GET_PENDING_EVENTS | status=OK | [WIFI_CONNECTED len0][WIFI_DISCONNECTED len0]
 get_pending_events_reply_wifi_conn_disc = 050008000019001A00000000
+# cmd=GET_PENDING_EVENTS | status=OK | [SOCK_ACCEPTED len12 listen=1 handle=2 port=54321 192.168.1.14]
+get_pending_events_reply_sock_accepted = 05001000002C0C0100020031D40000C0A8010E00
 # cmd=SPI1_TRANSFER | len=4 flags=0 seq=1 tx_fill=0 | tx=DEADBEEF packed inline, no padding
 spi1_transfer_request              = 56000C000400000100000000DEADBEEF
 # cmd=SPI1_TRANSFER | status=OK | rx_len=4 flags=0 seq=1 | rx=DEADBEEF, self-delimiting before the REPLY_PAD padding

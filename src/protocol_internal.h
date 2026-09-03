@@ -276,7 +276,17 @@ alp_cc3501e_resp_t handle_wifi_status(const uint8_t *req,
                                       size_t         reply_cap,
                                       size_t        *reply_data_len);
 
-/* protocol_sockets.c: TCP/UDP sockets (0x20..0x24). */
+/* protocol_sockets.c: TCP/UDP sockets (0x20..0x26). */
+alp_cc3501e_resp_t handle_sock_bind(const uint8_t *req,
+                                    size_t         req_len,
+                                    uint8_t       *reply_data,
+                                    size_t         reply_cap,
+                                    size_t        *reply_data_len);
+alp_cc3501e_resp_t handle_sock_listen(const uint8_t *req,
+                                      size_t         req_len,
+                                      uint8_t       *reply_data,
+                                      size_t         reply_cap,
+                                      size_t        *reply_data_len);
 alp_cc3501e_resp_t handle_sock_open(const uint8_t *req,
                                     size_t         req_len,
                                     uint8_t       *reply_data,

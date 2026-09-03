@@ -252,7 +252,11 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
                              uint8_t        security);
 int cc3501e_hw_wifi_ap_stop(void);
 int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
-int cc3501e_hw_wifi_get_ip(uint8_t ip_out[4]);
+/* Report one interface's IPv4 address.  @p iface is an
+ * alp_cc3501e_wifi_iface_t: STA = the DHCP lease from the joined AP, AP = the
+ * module's own address on the soft-AP it runs.  The 4 octets are written in the
+ * same order for both, unchanged from the pre-v9 STA-only body. */
+int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
 
 /* ---- async-connect status latch (CMD_WIFI_STATUS) -------------------------- *
  * The connect body (cc3501e_hw_wifi_connect_sta) BLOCKS for seconds on the
@@ -296,6 +300,29 @@ int cc3501e_hw_sock_open(uint8_t family, uint8_t type, uint8_t protocol, uint16_
 /* STREAM: start + complete the TCP handshake to @p addr:@p port.  DGRAM: set the
  * default peer for later sends.  Blocks until the handshake resolves. */
 int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4]);
+
+/* Assign the socket's LOCAL endpoint (the serving side of connect).  An all-zero
+ * @p addr is INADDR_ANY -- bind every interface, which is what a server on the
+ * soft-AP wants since the AP address only exists once the role is up. */
+int cc3501e_hw_sock_bind(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4]);
+
+/* Make a bound STREAM socket passive, queueing at most @p backlog pending
+ * connections (0 = the backend's default).  Does NOT wait for a connection:
+ * cc3501e_hw_sock_accept_pump() picks each one up on the housekeeping tick. */
+int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog);
+
+/* TASK CONTEXT ONLY -- called from cc3501e_hw_tick(), alongside
+ * cc3501e_hw_sock_pump().  NON-BLOCKING accept on every listening socket: each
+ * connection it takes is pushed onto the event ring as EVT_SOCK_ACCEPTED with
+ * an alp_cc3501e_sock_accepted_evt_t payload, and the host owns the new handle
+ * from that point (nothing here ever closes it).
+ *
+ * WHY A PUMP AND NOT AN OPCODE: accept() blocks, and a worker-routed blocking
+ * body holds READY LOW for its whole duration (worker_run_pending brackets the
+ * drain with cc3501e_bridge_busy/ready) -- so an accept opcode would black the
+ * entire bridge out for as long as no client connects.  Same task-side shape as
+ * cc3501e_hw_sock_pump(), for the same reason. */
+void cc3501e_hw_sock_accept_pump(void);
 
 /* Queue @p data_len bytes on the socket; @p sent_out receives the byte count the
  * stack accepted.  @p flags mirrors alp_cc3501e_sock_send_t::flags (bit 0 = MORE). */

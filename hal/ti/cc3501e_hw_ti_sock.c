@@ -34,6 +34,12 @@ extern size_t xPortGetFreeHeapSize(void);
 
 #include "alp/protocol/cc3501e.h"
 
+/* Async-event ring (src/event_ring.h, on the firmware CMake include path):
+ * cc3501e_hw_sock_accept_pump() publishes each accepted connection as an
+ * EVT_SOCK_ACCEPTED entry the host drains with CMD_GET_PENDING_EVENTS -- the
+ * same producer role hal/ti/cc3501e_hw_ti_wifi.c has for the Wi-Fi events. */
+#include "event_ring.h"
+
 #include "../cc3501e_hw.h"
 
 /* --------------------------------------------------------------- */
@@ -133,6 +139,209 @@ int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, cons
 	 * CMD_SOCK_RECV can be answered synchronously from the dispatch. */
 	cc3501e_hw_sock_prefetch(handle, true);
 	return CC3501E_HW_OK;
+}
+
+/* ==================== LISTENING SOCKETS (protocol v9) ====================
+ *
+ * The host binds + listens, and every inbound connection is delivered as an
+ * EVT_SOCK_ACCEPTED event carrying a ready-to-use handle.  There is no accept
+ * opcode on the wire, because accept() blocks and a worker-routed blocking body
+ * holds READY LOW for its whole duration -- an accept opcode would black the
+ * whole bridge out for as long as no client happened to connect.
+ *
+ * So the accept runs on the TASK, NON-BLOCKING, once per housekeeping tick,
+ * exactly like the RX prefetch pump above and for the same reason.
+ *
+ * The table below is what the pump iterates.  Four slots because a listening
+ * socket costs 2 bytes here and a product may plausibly serve more than one
+ * port (an HTTP console plus a provisioning port); this is NOT the
+ * single-socket restriction the prefetch ring has, which exists for a different
+ * reason (one producer / one consumer on that ring). */
+#define CC3501E_SOCK_LISTEN_MAX 4u
+/* lwIP backlog when the host passes 0.  Small on purpose: each queued
+ * connection holds a netconn, and MEMP_NUM_NETCONN is the scarce resource that
+ * makes lwip_socket() fail (see the sock_open failure path above). */
+#define CC3501E_SOCK_LISTEN_BACKLOG_DEFAULT 4
+
+/* Listening handles (fd + 1; 0 = free slot).  Touched only from the TASK:
+ * bind/listen/close run in the worker drain and the pump runs in the tick, and
+ * main.c runs both on the same bring-up task -- so no critical section is
+ * needed here, unlike the ISR-vs-task ring above. */
+static uint16_t listen_handles[CC3501E_SOCK_LISTEN_MAX];
+
+static void listen_table_remove(uint16_t handle)
+{
+	for (unsigned i = 0u; i < CC3501E_SOCK_LISTEN_MAX; ++i) {
+		if (listen_handles[i] == handle) {
+			listen_handles[i] = 0u;
+		}
+	}
+}
+
+int cc3501e_hw_sock_bind(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4])
+{
+	if (handle == 0u || addr == 0) {
+		return CC3501E_HW_ERR_INVAL;
+	}
+	if (family != (uint8_t)ALP_CC3501E_SOCK_FAMILY_IPV4) {
+		return CC3501E_HW_ERR_INVAL;
+	}
+	const int fd = (int)handle - 1;
+
+	/* SO_REUSEADDR so a server that closes and re-binds the same port does not
+	 * have to wait out TIME_WAIT.  Restarting the serving app is the ordinary
+	 * case for an embedded console, and without this the re-bind fails with
+	 * EADDRINUSE for minutes, which reads as "the firmware broke". */
+	int on = 1;
+	(void)lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port   = lwip_htons(port);
+	/* addr[0..3] are already big-endian (network order), same convention as
+	 * connect above; all-zero is INADDR_ANY, which is the normal choice for a
+	 * server on the soft-AP (the AP address does not exist until the role is
+	 * up, so binding it explicitly would race the role-up). */
+	memcpy(&sa.sin_addr.s_addr, addr, 4);
+	if (lwip_bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		Report(
+		    "\n\rcc3501e sock_bind: lwip_bind port=%u failed errno=%d\n\r", (unsigned)port, errno);
+		return CC3501E_HW_ERR_IO;
+	}
+	return CC3501E_HW_OK;
+}
+
+int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog)
+{
+	if (handle == 0u) {
+		return CC3501E_HW_ERR_INVAL;
+	}
+	const int fd = (int)handle - 1;
+
+	/* NON-BLOCKING BEFORE PASSIVE, and the order matters: the pump calls
+	 * lwip_accept() on this fd from the housekeeping tick, and a BLOCKING accept
+	 * there stalls the whole task -- and with it the RX pump, the OTA pump and
+	 * the SPI self-heals -- until a client connects.  That is a dead bridge,
+	 * recoverable only by a power cycle.
+	 *
+	 * lwip_fcntl(O_NONBLOCK) is the primitive for it.  If it is unavailable on
+	 * this build it returns -1, and rather than proceed with a socket whose
+	 * accept can block forever, fall back to a 1 ms SO_RCVTIMEO -- netconn_accept
+	 * honours the same receive timeout, so the accept stays BOUNDED.  Never
+	 * leave this socket in the default wait-forever mode. */
+	if (lwip_fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+		struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
+
+		if (lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+			Report("\n\rcc3501e sock_listen: cannot bound accept (fcntl+rcvtimeo failed)\n\r");
+			return CC3501E_HW_ERR_IO;
+		}
+	}
+
+	/* RESERVE THE PUMP SLOT BEFORE GOING PASSIVE.  If lwip_listen() ran first and
+	 * the table turned out to be full, the socket would already be accepting
+	 * handshakes into a backlog nothing ever drains: a client would see a
+	 * connected socket and then silence, which is worse than a refused connect
+	 * and is invisible from the host.  Claiming the slot first means the failure
+	 * happens while the socket is still inert.
+	 *
+	 * Re-listening on an already-registered handle refreshes its slot rather
+	 * than consuming a second one. */
+	listen_table_remove(handle);
+	unsigned slot = CC3501E_SOCK_LISTEN_MAX;
+	for (unsigned i = 0u; i < CC3501E_SOCK_LISTEN_MAX; ++i) {
+		if (listen_handles[i] == 0u) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == CC3501E_SOCK_LISTEN_MAX) {
+		/* Table full, and the socket is NOT listening -- nothing to undo.  Fail
+		 * loudly.  ERR_STATE, not ERR_IO: this is a deterministic, terminal
+		 * refusal (the host asked for more listening sockets than this backend
+		 * tracks), and ERR_IO would map to RESP_ERR_RADIO, which poll_by_repeat
+		 * retries for its whole budget. */
+		Report("\n\rcc3501e sock_listen: no free listen slot (max %u)\n\r",
+		       (unsigned)CC3501E_SOCK_LISTEN_MAX);
+		return CC3501E_HW_ERR_STATE;
+	}
+	listen_handles[slot] = handle;
+
+	const int bl = (backlog == 0u) ? CC3501E_SOCK_LISTEN_BACKLOG_DEFAULT : (int)backlog;
+	if (lwip_listen(fd, bl) != 0) {
+		listen_handles[slot] = 0u; /* never went passive -- give the slot back */
+		Report("\n\rcc3501e sock_listen: lwip_listen failed errno=%d\n\r", errno);
+		return CC3501E_HW_ERR_IO;
+	}
+	return CC3501E_HW_OK;
+}
+
+void cc3501e_hw_sock_accept_pump(void)
+{
+	for (unsigned i = 0u; i < CC3501E_SOCK_LISTEN_MAX; ++i) {
+		const uint16_t lh = listen_handles[i];
+
+		if (lh == 0u) {
+			continue;
+		}
+		struct sockaddr_in peer;
+		socklen_t          peerlen = sizeof(peer);
+		memset(&peer, 0, sizeof(peer));
+		const int nfd = lwip_accept((int)lh - 1, (struct sockaddr *)&peer, &peerlen);
+		if (nfd < 0) {
+			continue; /* EWOULDBLOCK -- nobody connecting on this one right now */
+		}
+		if (nfd >= 0xFFFF) {
+			(void)lwip_close(nfd); /* cannot be expressed as a u16 handle */
+			continue;
+		}
+		/* The ACCEPTED socket does NOT inherit the listener's options, so give it
+		 * the same bounded receive timeout cc3501e_hw_sock_open() sets.  Without
+		 * it a worker-routed CMD_SOCK_RECV on an idle connection blocks in lwIP
+		 * with no timeout at all, holding READY LOW and wedging the bridge.
+		 *
+		 * KNOWN EXPOSURE, the SEND direction is NOT bounded the same way.
+		 * cc3501e_hw_sock_send()'s lwip_send() is blocking, and this SDK's lwIP
+		 * build does not enable LWIP_SO_SNDTIMEO -- there is no SO_SNDTIMEO to
+		 * set here.  CMD_SOCK_SEND is worker-routed, so a peer that opens a
+		 * connection and then stops reading fills the TCP window and parks the
+		 * worker inside lwip_send (READY LOW, no opcode served) until lwIP gives
+		 * up on the connection.  That shape pre-dates this change for CLIENT
+		 * sockets, where the host chooses the peer; a listening socket hands the
+		 * trigger to whoever can reach the AP.  Bounding it needs either
+		 * LWIP_SO_SNDTIMEO in the vendor lwipopts or a chunked non-blocking
+		 * send, neither of which belongs in this change -- tracked in #107. */
+		struct timeval tv = { .tv_sec  = CC3501E_SOCK_RCVTIMEO_MS / 1000,
+			                  .tv_usec = (CC3501E_SOCK_RCVTIMEO_MS % 1000) * 1000 };
+		(void)lwip_setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+		/* alp_cc3501e_sock_accepted_evt_t, packed: listen_handle(LE16) |
+		 * handle(LE16) | peer_port(LE16, host order) | peer_family | reserved |
+		 * peer_addr[4] (network order, MSB first -- the same convention
+		 * cc3501e_sock_connect's addr[] uses). */
+		const uint16_t nh    = (uint16_t)(nfd + 1);
+		const uint16_t pport = lwip_ntohs(peer.sin_port);
+		uint8_t        ev[12];
+
+		ev[0] = (uint8_t)(lh & 0xFFu);
+		ev[1] = (uint8_t)((lh >> 8) & 0xFFu);
+		ev[2] = (uint8_t)(nh & 0xFFu);
+		ev[3] = (uint8_t)((nh >> 8) & 0xFFu);
+		ev[4] = (uint8_t)(pport & 0xFFu);
+		ev[5] = (uint8_t)((pport >> 8) & 0xFFu);
+		ev[6] = (uint8_t)ALP_CC3501E_SOCK_FAMILY_IPV4;
+		ev[7] = 0u;
+		memcpy(&ev[8], &peer.sin_addr.s_addr, 4);
+
+		if (event_ring_push((uint8_t)ALP_CC3501E_EVT_SOCK_ACCEPTED, ev, sizeof(ev)) == 0) {
+			/* Ring full -- the host would never learn this handle exists, so it
+			 * would leak a firmware socket for the life of the boot.  Close it and
+			 * let the client retry; a full ring means the host is not draining. */
+			(void)lwip_close(nfd);
+			Report("\n\rcc3501e accept: event ring full, dropped a connection\n\r");
+		}
+	}
 }
 
 int cc3501e_hw_sock_send(uint16_t       handle,
@@ -492,6 +701,10 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 int cc3501e_hw_sock_close(uint16_t handle)
 {
 	cc3501e_hw_sock_prefetch(handle, false);
+	/* Drop it from the accept table too, or the pump keeps calling lwip_accept()
+	 * on a closed fd -- and worse, on the fd number lwIP hands to whatever
+	 * socket is opened next. */
+	listen_table_remove(handle);
 	if (handle == 0u) {
 		return CC3501E_HW_ERR_INVAL;
 	}
@@ -563,7 +776,27 @@ int cc3501e_hw_sock_close(uint16_t handle)
  * without these a ti build without -WifiHostDriver / -Ble does not link at all
  * (undefined symbol cc3501e_hw_sock_pump / _prefetch / _recv_ring), defeating
  * the whole point of this #else arm.  Bodies match hal/cc3501e_hw_stub.c. */
+int cc3501e_hw_sock_bind(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4])
+{
+	(void)handle;
+	(void)family;
+	(void)port;
+	(void)addr;
+	return CC3501E_HW_ERR_NOTIMPL;
+}
+
+int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog)
+{
+	(void)handle;
+	(void)backlog;
+	return CC3501E_HW_ERR_NOTIMPL;
+}
+
 void cc3501e_hw_sock_pump(void)
+{
+}
+
+void cc3501e_hw_sock_accept_pump(void)
 {
 }
 
