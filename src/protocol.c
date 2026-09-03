@@ -541,6 +541,9 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 	case ALP_CC3501E_CMD_GET_PENDING_EVENTS:
 		h = handle_get_pending_events;
 		break;
+	case ALP_CC3501E_CMD_GET_CAPABILITIES:
+		h = handle_get_capabilities;
+		break;
 	/* OTA firmware update (v0.2). */
 	case ALP_CC3501E_CMD_OTA_BEGIN:
 		h = handle_ota_begin;

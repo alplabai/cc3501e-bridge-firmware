@@ -121,12 +121,22 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * gen_protocol_vectors.py --check gates in the meantime -- the atomicity cost
  * the README already documents for the repo split, not a regression to chase
  * here.  This is the same sequence v8 itself went through. */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL 9
+/* The wire version is MAJOR.MINOR since ADR 0033.  Both halves are asserted
+ * separately so a mismatch names WHICH half drifted: a MAJOR disagreement means
+ * the two binaries would misread each other's frames, a MINOR one means the
+ * header carries additive opcodes this firmware does not implement (or the
+ * reverse). */
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR 3
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MINOR 1
 
-_Static_assert(ALP_CC3501E_PROTOCOL_VERSION == CC3501E_FW_IMPLEMENTS_PROTOCOL,
-               "<alp/protocol/cc3501e.h> is not the protocol version this firmware "
+_Static_assert(ALP_CC3501E_PROTOCOL_MAJOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR,
+               "<alp/protocol/cc3501e.h> MAJOR is not the wire major this firmware "
                "implements -- the build is pointed at the wrong (or a stale) alp-sdk "
                "checkout; pass -AlpSdkRoot / ALP_SDK_ROOT at the right one");
+_Static_assert(ALP_CC3501E_PROTOCOL_MINOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MINOR,
+               "<alp/protocol/cc3501e.h> MINOR is not the wire minor this firmware "
+               "implements -- same cause as the MAJOR assert above, but additive: the "
+               "header and this firmware disagree about which optional opcodes exist");
 
 /* GET_VERSION (0x01): wire-protocol compatibility gate.  Returns the
  * 16-bit ALP_CC3501E_PROTOCOL_VERSION (LE); the host refuses to talk
@@ -150,6 +160,72 @@ alp_cc3501e_resp_t handle_get_version(const uint8_t *req,
 	if (reply_cap < 2u) return ALP_CC3501E_RESP_ERR_NO_MEM;
 	put_le16(reply_data, (uint16_t)ALP_CC3501E_PROTOCOL_VERSION);
 	*reply_data_len = 2u;
+	return ALP_CC3501E_RESP_OK;
+}
+
+/* GET_CAPABILITIES (0x06, wire 3.1): which opcode families THIS BUILD really
+ * implements.
+ *
+ * Composed from the same compile-time switches that decide which HAL bodies
+ * link, so it reports the truth rather than the opcode table.  That is the
+ * whole point (ADR 0033): a build without CC3501E_WIFI still carries the socket
+ * opcodes, and they all answer NOTIMPL -- a host that inferred "wire 3.1,
+ * therefore listening sockets" from the version number would be wrong about
+ * exactly that build.  Asking gets a true answer; inferring does not.
+ *
+ * Bits are FOREVER: a bit that ships can never be reused for another feature,
+ * because a host in the field decides what to send from it. */
+static uint32_t cc3501e_build_capabilities(void)
+{
+	uint32_t caps = 0u;
+
+	/* Silicon-free in every backend: the event ring is a plain FIFO compiled
+	 * into all builds, and the frame counters are incremented by the dispatch
+	 * itself, so both are honestly present even on the stub. */
+	caps |= (uint32_t)ALP_CC3501E_CAP_EVENTS;
+	caps |= (uint32_t)ALP_CC3501E_CAP_DIAG_STATS;
+
+#ifndef CC3501E_HAL_STUB
+	/* HAL-backed families: real on the ti backend, NOTIMPL on the stub. */
+	caps |= (uint32_t)ALP_CC3501E_CAP_OTA;
+	caps |= (uint32_t)ALP_CC3501E_CAP_GPIO_PROXY;
+	caps |= (uint32_t)ALP_CC3501E_CAP_CAMERA;
+	caps |= (uint32_t)ALP_CC3501E_CAP_POWER_POLICY;
+#endif
+
+#ifdef CC3501E_WIFI
+	caps |= (uint32_t)ALP_CC3501E_CAP_WIFI_STA;
+	caps |= (uint32_t)ALP_CC3501E_CAP_WIFI_AP;
+	caps |= (uint32_t)ALP_CC3501E_CAP_SOCK_CLIENT;
+	caps |= (uint32_t)ALP_CC3501E_CAP_SOCK_LISTEN;
+	/* SPI1 host passthrough links its real master only in the -WifiHostDriver
+	 * image; the default links cc3501e_hw_ti_spi_master_notimpl.c, which
+	 * answers NOT_READY.  Same switch, so the bit tracks it. */
+	caps |= (uint32_t)ALP_CC3501E_CAP_SPI1_MASTER;
+#endif
+
+#ifdef CC3501E_BLE
+	caps |= (uint32_t)ALP_CC3501E_CAP_BLE;
+#endif
+
+	return caps;
+}
+
+alp_cc3501e_resp_t handle_get_capabilities(const uint8_t *req,
+                                           size_t         req_len,
+                                           uint8_t       *reply_data,
+                                           size_t         reply_cap,
+                                           size_t        *reply_data_len)
+{
+	(void)req;
+	*reply_data_len = 0u;
+	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
+	if (reply_cap < sizeof(alp_cc3501e_capabilities_t)) return ALP_CC3501E_RESP_ERR_NO_MEM;
+
+	/* alp_cc3501e_capabilities_t { caps(LE32) | reserved(LE32) }. */
+	put_le32(reply_data, cc3501e_build_capabilities());
+	put_le32(&reply_data[4], 0u);
+	*reply_data_len = sizeof(alp_cc3501e_capabilities_t);
 	return ALP_CC3501E_RESP_OK;
 }
 
