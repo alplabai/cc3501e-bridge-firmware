@@ -311,7 +311,7 @@ void cc3501e_hw_sock_accept_pump(void)
 		 * sockets, where the host chooses the peer; a listening socket hands the
 		 * trigger to whoever can reach the AP.  Bounding it needs either
 		 * LWIP_SO_SNDTIMEO in the vendor lwipopts or a chunked non-blocking
-		 * send, neither of which belongs in this change -- tracked separately. */
+		 * send, neither of which belongs in this change -- tracked in #107. */
 		struct timeval tv = { .tv_sec  = CC3501E_SOCK_RCVTIMEO_MS / 1000,
 			                  .tv_usec = (CC3501E_SOCK_RCVTIMEO_MS % 1000) * 1000 };
 		(void)lwip_setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
