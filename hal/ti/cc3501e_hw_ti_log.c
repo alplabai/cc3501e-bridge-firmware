@@ -27,6 +27,7 @@
 #include "alp/protocol/cc3501e.h"
 
 #include "../cc3501e_hw.h"
+#include "cc3501e_hw_ti_internal.h"
 
 /* Requested firmware log verbosity.  RECORDED, not yet consumed.
  *
@@ -90,6 +91,18 @@ uint8_t cc3501e_hw_reset_cause(void)
 		return latched;
 	}
 
+	/* The firmware's own record beats the silicon's, because the silicon does not
+	 * keep one: PowerWFF3_getResetReason() answers PowerWFF3_RESET_PIN_POR after a
+	 * SYSRESETREQ, so a CMD_RESET reboot was indistinguishable from a cold power-on
+	 * (#111).  Checked FIRST -- and unconditionally, so the marker is consumed on
+	 * every boot rather than only on the boots that happen to fall through to it. */
+	const bool from_soft_reset = cc3501e_hw_take_soft_reset_mark();
+	if (from_soft_reset) {
+		latched      = (uint8_t)ALP_CC3501E_RESET_SOFT;
+		have_latched = true;
+		return latched;
+	}
+
 	const PowerWFF3_ResetReason reason = PowerWFF3_getResetReason();
 
 	/* Order is deliberate: the SDK's enum values OVERLAP (PowerWFF3_RESET_M33WD
@@ -135,13 +148,42 @@ uint8_t cc3501e_hw_reset_cause(void)
 	return latched;
 }
 
+/* Tick count at THIS boot, so uptime is time-since-boot rather than
+ * time-since-power-on.  See the note in cc3501e_hw_uptime_ms(). */
+static uint32_t s_boot_ticks;
+static bool     s_boot_ticks_valid;
+
+void cc3501e_hw_uptime_mark_boot(void)
+{
+	s_boot_ticks       = (uint32_t)ClockP_getSystemTicks();
+	s_boot_ticks_valid = true;
+}
+
 uint32_t cc3501e_hw_uptime_ms(void)
 {
 	/* Real uptime from the DPL clock (TI Drivers, RTOS-backed -- no radio
 	 * needed).  getSystemTicks() is a 32-bit tick count; getSystemTickPeriod()
 	 * is microseconds-per-tick.  Compute in 64-bit to avoid the ticks*us
-	 * overflow, then return milliseconds (wraps after ~49 days, documented). */
-	const uint64_t ticks     = (uint64_t)ClockP_getSystemTicks();
+	 * overflow, then return milliseconds (wraps after ~49 days, documented).
+	 *
+	 * SUBTRACT THE BOOT TICK (#111).  This used to return the raw tick count,
+	 * and on this silicon that clock SURVIVES a warm NVIC_SystemReset() -- so
+	 * `uptime` counted from power-on and advanced straight through a genuine
+	 * reboot.  A host therefore could not use it to notice the companion had
+	 * restarted underneath it, which is the obvious thing to use it for, and it
+	 * is not a theoretical cost: it produced a confident, wrong bug report
+	 * (#110, retracted) claiming CMD_RESET never reboots.  DIAG_GET_STATS'
+	 * frames_ok, a plain RAM counter, was the only honest reboot signal, and
+	 * that is a side effect rather than a contract.
+	 *
+	 * The baseline is taken in cc3501e_hw_init(); the lazy capture here only
+	 * covers a caller that somehow runs first, so the field can never report a
+	 * pre-boot span.  Unsigned subtraction is correct across the 32-bit tick
+	 * wrap. */
+	if (!s_boot_ticks_valid) {
+		cc3501e_hw_uptime_mark_boot();
+	}
+	const uint64_t ticks     = (uint64_t)(uint32_t)(ClockP_getSystemTicks() - s_boot_ticks);
 	const uint64_t period_us = (uint64_t)ClockP_getSystemTickPeriod();
 	return (uint32_t)((ticks * period_us) / 1000u);
 }

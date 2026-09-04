@@ -64,9 +64,23 @@ int cc3501e_hw_ble_enable(void)
 	 * the host retries, and the retry double-inits.  A clean boot never retries
 	 * (bridge stays synced), so it never hit this. */
 	if (cc3501e_nimble_host_is_enabled()) {
-		cc3501e_bridge_busy(); /* #1691: never reinit with the host free to clock */
-		bridge_transport_spi_hw_reinit();
-		cc3501e_bridge_ready();
+		/* NOTHING IS TORN DOWN ON THIS PATH, SO NOTHING IS RE-ESTABLISHED (#82).
+		 *
+		 * This used to cc3501e_bridge_busy() + bridge_transport_spi_hw_reinit() +
+		 * cc3501e_bridge_ready() before returning.  That is a full SPI slave
+		 * teardown and re-open -- re-rolling the 12-attempt SPI_open, with the
+		 * host's polls failing IO across the whole window -- performed for a call
+		 * that does no work at all.  worker_run_pending() then does a SECOND
+		 * reinit after the body, because BLE_ENABLE is not on its exempt list, so
+		 * an already-enabled BLE_ENABLE cost TWO teardowns.
+		 *
+		 * Bench-measured on an E1M-AEN801: `ble enable` against an already-enabled
+		 * host took over 120 s and repeatedly left the link wedged (`ping FAIL`,
+		 * cleared only by a 20 s power cycle).  The reinits exist to recover the
+		 * bridge after a radio op perturbs the shared HIF/DMA -- see the ones
+		 * around cc3501e_nimble_host_start() below, which are still there and
+		 * still needed.  This branch makes no Wlan_* call and does not touch the
+		 * HIF, so there is nothing for a reinit to recover. */
 		return CC3501E_HW_OK;
 	}
 

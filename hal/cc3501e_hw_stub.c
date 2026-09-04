@@ -580,6 +580,12 @@ uint32_t cc3501e_hw_uptime_ms(void)
 	return 0u;
 }
 
+void cc3501e_hw_uptime_mark_boot(void)
+{
+	/* No clock on the stub -- uptime is a constant 0, which is already
+	 * "since boot". */
+}
+
 uint32_t cc3501e_hw_free_heap_bytes(void)
 {
 	return 0u;
