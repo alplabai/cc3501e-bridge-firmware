@@ -201,17 +201,31 @@ jobs:
       # ALP_CC3501E_PROTOCOL_VERSION, and src/protocol_meta.c's compile-time
       # assert must agree too.  A mismatch is how a build answers GET_VERSION
       # with one number while behaving like another.
+      # The wire version is MAJOR.MINOR since ADR 0033, and
+      # ALP_CC3501E_PROTOCOL_VERSION is now the COMPOSED expression
+      # `(MAJOR << 8) | MINOR` rather than a literal -- so the two halves are
+      # read separately.  (A grep for digits after the old define name now
+      # matches nothing, which would have made this gate pass vacuously.)
       - name: compare protocol-version.txt with the canonical header
         run: |
           set -euo pipefail
+          hdr_file=alp-sdk/include/alp/protocol/cc3501e.h
           fw=$(tr -d '[:space:]' < firmware/protocol-version.txt)
-          hdr=$(grep -oP '#define\s+ALP_CC3501E_PROTOCOL_VERSION\s+\K[0-9]+' \
-                  alp-sdk/include/alp/protocol/cc3501e.h)
+          major=$(grep -oP '#define\s+ALP_CC3501E_PROTOCOL_MAJOR\s+\K[0-9]+' "$hdr_file" || true)
+          minor=$(grep -oP '#define\s+ALP_CC3501E_PROTOCOL_MINOR\s+\K[0-9]+' "$hdr_file" || true)
+          if [ -z "$major" ] || [ -z "$minor" ]; then
+            echo "::error::cannot read ALP_CC3501E_PROTOCOL_MAJOR/_MINOR from $hdr_file."
+            echo "A header carrying only a flat ALP_CC3501E_PROTOCOL_VERSION literal predates"
+            echo "ADR 0033 and cannot be paired with this firmware."
+            exit 1
+          fi
+          hdr="${major}.${minor}"
           echo "firmware/protocol-version.txt = $fw"
-          echo "alp-sdk ALP_CC3501E_PROTOCOL_VERSION = $hdr"
+          echo "alp-sdk ALP_CC3501E_PROTOCOL_MAJOR.MINOR = $hdr"
           if [ "$fw" != "$hdr" ]; then
             echo "::error::protocol version mismatch: this tree says $fw, alp-sdk says $hdr."
             echo "Bump BOTH, in the same change, or the host and the companion disagree on the wire."
+            echo "MAJOR moves only when an unchanged host would be MISREAD; additive changes are MINOR."
             exit 1
           fi
 

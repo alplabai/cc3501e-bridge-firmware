@@ -84,6 +84,13 @@ set(CC3501E_BRIDGE_SOURCES
 
 if(CC3501E_HAL_BACKEND STREQUAL "stub")
     list(APPEND CC3501E_BRIDGE_SOURCES hal/cc3501e_hw_stub.c)
+    # Tell the SOURCES which backend they are, so CMD_GET_CAPABILITIES can
+    # report what this build actually implements instead of what the opcode
+    # table suggests.  The stub HAL answers NOTIMPL to every hardware body, so
+    # a bitmap that claimed OTA/GPIO/camera here would be lying to whoever asks
+    # -- and the whole point of the capability query (ADR 0033) is that it is
+    # the one answer a host can trust without knowing the build flags.
+    add_compile_definitions(CC3501E_HAL_STUB=1)
 elseif(CC3501E_HAL_BACKEND STREQUAL "ti")
     # The real TI SimpleLink / driverlib hooks (bench build).
     list(APPEND CC3501E_BRIDGE_SOURCES

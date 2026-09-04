@@ -403,6 +403,11 @@ alp_cc3501e_resp_t handle_get_pending_events(const uint8_t *req,
                                              uint8_t       *reply_data,
                                              size_t         reply_cap,
                                              size_t        *reply_data_len);
+alp_cc3501e_resp_t handle_get_capabilities(const uint8_t *req,
+                                           size_t         req_len,
+                                           uint8_t       *reply_data,
+                                           size_t         reply_cap,
+                                           size_t        *reply_data_len);
 
 /* protocol_ota.c: OTA firmware update (0x40..0x46). */
 alp_cc3501e_resp_t handle_ota_begin(const uint8_t *req,
