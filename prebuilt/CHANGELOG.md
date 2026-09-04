@@ -7,6 +7,77 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.7.0
+
+Three landings since v0.6.0, none of which were in a shipped artifact until now.
+
+**Listening sockets** (#104, PR #108). `SOCK_BIND` (0x64), `SOCK_LISTEN` (0x65)
+and the `EVT_SOCK_ACCEPTED` event, so a host can serve over the soft-AP instead
+of only dialling out. The accept slot is reserved before the socket goes
+passive, so an inbound connection cannot arrive with nowhere to land.
+
+**The wire is versioned MAJOR.MINOR** (PR #109, alp-sdk ADR 0033). This replaces
+the flat counter that went 5 -> 9 in a week and told a customer nothing about
+whether their host still worked. MAJOR gates the link; MINOR is additive and
+never refuses. `protocol-version.txt` reads `3.1`, and `GET_VERSION` answers
+`0x0301`. `CMD_GET_CAPABILITIES` (0x06) reports which opcode families this build
+actually implements as a 12-bit map, so a host discovers features instead of
+inferring them from a version number.
+
+**Two defects fixed** (PR #112):
+
+- `ble enable` on an already-enabled NimBLE host tore the bridge SPI slave down
+  and re-opened it *twice* — `worker_run_pending()` adds a second reinit after
+  the body — for a call that does no work at all. Not a rare path:
+  `cc3501e_nimble_host_disable()` never stops the host stack, so after the first
+  enable in a boot **every** later one took it. Measured on the v0.6.0 image:
+  over 120 s, and repeatedly a wedged link. Now the idempotent branch returns
+  without touching the HIF. (`alplabai/alp-sdk#82`.)
+- `GET_DIAG_INFO` could not tell a host the companion had rebooted. `uptime_ms`
+  came from `ClockP_getSystemTicks()`, which survives a warm `NVIC_SystemReset()`
+  on this silicon, so it counted from power-on and ran straight through a reboot;
+  `reset_cause` said `power-on` after a software reset, because
+  `PowerWFF3_getResetReason()` answers `PowerWFF3_RESET_PIN_POR` for a
+  `SYSRESETREQ`. `uptime_ms` now subtracts a boot baseline taken in
+  `cc3501e_hw_init()`, and the reset path records an address-guarded
+  magic/inverse marker in `.TI.noinit` that `cc3501e_hw_reset_cause()` reads and
+  clears once per boot. No wire change. (`alplabai/alp-sdk#111`.)
+
+**Requires a wire-3.x host.** `cc3501e_reset()` reads `GET_VERSION` on every cold
+boot and refuses a MAJOR mismatch, so flashing this blob under a host older than
+the ADR 0033 change takes the companion link down by design. The paired host
+work is on alp-sdk `dev`.
+
+- `cc3501e-v0.7.0.bin`        -- wrapped TI `flash-images-builder` vendor image,
+  signed in-band with the Alp Lab VALIDATION key. 1103236 bytes.
+- `cc3501e-v0.7.0.bin.sha256` -- `2d7cdb515a7cc7fff2089eb90ade9dc91ec00b9d3fec8f15649865e61f07a27e`
+- `cc3501e-v0.7.0.bin.sig`    -- detached **ECDSA-P256/SHA-256** signature,
+  verify with `openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem
+  -signature prebuilt/cc3501e-v0.7.0.bin.sig prebuilt/cc3501e-v0.7.0.bin`
+- GPE stamp: **`0.149.92.0`** (major 0, every field <= 255).  Bench work for
+  `#82`/`#111` flashed the E1M-AEN801 at `0.149.90.0` and then `0.149.91.0`, which
+  left the v0.6.0 artifact (stamped `0.149.90.0`) unflashable on our own hardware
+  — the same situation v0.6.0 itself hit and records below. `gpe-floor:` in
+  `prebuilt/BUILT_FROM` moved `0.149.90.0` -> `0.149.92.0` in the same commit,
+  because raising the floor without re-wrapping reddens
+  `check_prebuilt_kind.py` on the newest blob.
+- stage-1 raw image sha256: `baa8a7b723435328fdc855267fa128e3e87d66f901c6fa233d61e5fc311dda90`, 1097572 bytes
+- built from `e5aac7ff992d52802f63be576e8aeada82f8f95a` (`main`)
+
+Three distinct version numbers, still not interchangeable: app SemVer **0.7.0**,
+wire protocol **3.1**, GPE image stamp **0.149.92.0**. `GET_DIAG_INFO` reports
+`fw_version=0x0700`; `GET_VERSION` answers `0x0301`.
+
+> **NOT YET FLASH-VERIFIED AS AN ARTIFACT.** The source at
+> `e5aac7ff992d52802f63be576e8aeada82f8f95a` is bench-proven on an E1M-AEN801 — the
+> `#82` and `#111` evidence in PR #112 was taken from that exact tree, wrapped at
+> `0.149.91.0`. This *artifact*, wrapped at `0.149.92.0` with
+> `firmware-version.txt` bumped to 0.7.0, has **not** been written to a part: the
+> XDS110 was disconnected from the bench before the programming run started (no
+> `programming_report.txt` was produced, and the unit was confirmed still running
+> the previous image at `uptime: 2576174 ms`). The outstanding check is one flash
+> plus a cold cycle, confirming `fw 0.7.0` / `fw: 0x0700 (v7.0)` and `wire 3.1`.
+
 ## v0.6.0
 
 Wire **protocol 8**: request identity for every worker-routed opcode
