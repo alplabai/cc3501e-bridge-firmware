@@ -65,7 +65,11 @@ _HEADER = (
 )
 _PROTOCOL_VERSION_TXT = pathlib.Path(__file__).parent.parent / "protocol-version.txt"
 
-_DEFINE_RE = re.compile(r"^#define\s+ALP_CC3501E_PROTOCOL_VERSION\s+(\d+)", re.MULTILINE)
+# The wire version is MAJOR.MINOR since ADR 0033; ALP_CC3501E_PROTOCOL_VERSION
+# is now the COMPOSED expression `(MAJOR << 8) | MINOR`, not a literal, so the
+# two halves are parsed instead and composed here the same way the header does.
+_MAJOR_RE = re.compile(r"^#define\s+ALP_CC3501E_PROTOCOL_MAJOR\s+(\d+)", re.MULTILINE)
+_MINOR_RE = re.compile(r"^#define\s+ALP_CC3501E_PROTOCOL_MINOR\s+(\d+)", re.MULTILINE)
 
 
 def _read_protocol_version() -> int:
@@ -85,16 +89,33 @@ def _read_protocol_version() -> int:
             "    ALP_SDK_ROOT=<path-to-alp-sdk> python3 tests/gen_protocol_vectors.py --check"
             % _HEADER
         )
-    match = _DEFINE_RE.search(_HEADER.read_text(encoding="utf-8"))
-    if not match:
-        sys.exit(f"cannot find #define ALP_CC3501E_PROTOCOL_VERSION in {_HEADER}")
-    header_version = int(match.group(1))
+    text = _HEADER.read_text(encoding="utf-8")
+    major_m = _MAJOR_RE.search(text)
+    minor_m = _MINOR_RE.search(text)
+    if not major_m or not minor_m:
+        sys.exit(
+            f"cannot find #define ALP_CC3501E_PROTOCOL_MAJOR / _MINOR in {_HEADER}.\n"
+            "The wire version has been MAJOR.MINOR since ADR 0033; a header that\n"
+            "still carries only a flat ALP_CC3501E_PROTOCOL_VERSION literal is from\n"
+            "before that and cannot be paired with this firmware."
+        )
+    major = int(major_m.group(1))
+    minor = int(minor_m.group(1))
+    if major < 1 or major > 255 or minor > 255:
+        sys.exit(
+            f"illegal wire version {major}.{minor} in {_HEADER}: each half must fit a "
+            "byte, and MAJOR 0 is reserved to mean 'firmware predates the scheme'."
+        )
+    header_version = (major << 8) | minor
 
+    # protocol-version.txt carries the HUMAN form "MAJOR.MINOR" -- the same
+    # string a release note and `alp companion ver` show -- not the composed
+    # integer, so the file stays readable by whoever is holding a board.
     txt_version = _PROTOCOL_VERSION_TXT.read_text(encoding="utf-8").strip()
-    if txt_version != str(header_version):
+    if txt_version != f"{major}.{minor}":
         sys.exit(
             f"DRIFT: {_PROTOCOL_VERSION_TXT} says {txt_version!r} but "
-            f"{_HEADER} defines ALP_CC3501E_PROTOCOL_VERSION {header_version} -- "
+            f"{_HEADER} defines ALP_CC3501E_PROTOCOL_MAJOR.MINOR {major}.{minor} -- "
             "update protocol-version.txt to match."
         )
     return header_version
@@ -117,6 +138,21 @@ CMD_SOCK_BIND = 0x25  # listening path (proto v9)
 CMD_SOCK_LISTEN = 0x26
 EVT_SOCK_ACCEPTED = 0x2C  # async: a client connected to a listening socket
 CMD_WIFI_GET_IP = 0x17
+CMD_GET_CAPABILITIES = 0x06  # wire 3.1: which opcode families this build implements
+
+# alp_cc3501e_capability_t bits (keep aligned with the header; bits are FOREVER).
+CAP_WIFI_STA = 0x00000001
+CAP_WIFI_AP = 0x00000002
+CAP_SOCK_CLIENT = 0x00000004
+CAP_SOCK_LISTEN = 0x00000008
+CAP_BLE = 0x00000010
+CAP_OTA = 0x00000020
+CAP_GPIO_PROXY = 0x00000040
+CAP_SPI1_MASTER = 0x00000080
+CAP_CAMERA = 0x00000100
+CAP_POWER_POLICY = 0x00000200
+CAP_DIAG_STATS = 0x00000400
+CAP_EVENTS = 0x00000800
 CMD_SPI1_TRANSFER = 0x56  # SPI1 host passthrough (0x55..0x57); only TRANSFER is pinned here
 
 FLAG_SOLICITED = 0x00
@@ -185,11 +221,39 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
 
     out.append(("get_version_request", frame(CMD_GET_VERSION, 0).hex().upper(),
                 "cmd=GET_VERSION | flags=0 | len=0"))
+    # The reply is the COMPOSED (MAJOR << 8) | MINOR, LE16 -- so wire 3.1 is
+    # bytes 01 03, not 09.  Naming the vector after the human form keeps the
+    # file readable by whoever is holding a board (ADR 0033).
+    _major, _minor = PROTOCOL_VERSION >> 8, PROTOCOL_VERSION & 0xFF
     out.append((
-        f"get_version_reply_proto{PROTOCOL_VERSION}",
+        f"get_version_reply_wire{_major}_{_minor}",
         reply(CMD_GET_VERSION, RESP_OK,
               bytes([PROTOCOL_VERSION & 0xFF, (PROTOCOL_VERSION >> 8) & 0xFF])).hex().upper(),
-        f"cmd=GET_VERSION | len=3 | status=OK | version={PROTOCOL_VERSION} (LE16)",
+        f"cmd=GET_VERSION | len=3 | status=OK | wire={_major}.{_minor} "
+        f"= 0x{PROTOCOL_VERSION:04X} (LE16)",
+    ))
+    # A firmware from BEFORE ADR 0033 answers with its raw v1..v9 integer, which
+    # decodes to MAJOR 0 -- pinned here because the host relies on that being
+    # distinguishable to say "older than the scheme" instead of "corrupt".
+    out.append((
+        "get_version_reply_legacy_raw_v9",
+        reply(CMD_GET_VERSION, RESP_OK, bytes([0x09, 0x00])).hex().upper(),
+        "cmd=GET_VERSION | status=OK | legacy pre-ADR-0033 firmware: raw 9 -> major 0",
+    ))
+
+    # GET_CAPABILITIES (0x06, wire 3.1): reply DATA is
+    # alp_cc3501e_capabilities_t { caps(LE32) | reserved(LE32) }.
+    out.append(("get_capabilities_request", frame(CMD_GET_CAPABILITIES, 0).hex().upper(),
+                "cmd=GET_CAPABILITIES | flags=0 | len=0"))
+    # The STUB build's honest answer: EVENTS | DIAG_STATS only -- no HAL, so no
+    # OTA/GPIO/camera/power, and no CC3501E_WIFI/BLE so no radio families.
+    _stub_caps = CAP_EVENTS | CAP_DIAG_STATS
+    out.append((
+        "get_capabilities_reply_stub_build",
+        reply(CMD_GET_CAPABILITIES, RESP_OK,
+              _stub_caps.to_bytes(4, "little") + (0).to_bytes(4, "little")).hex().upper(),
+        f"cmd=GET_CAPABILITIES | status=OK | caps=0x{_stub_caps:08X} "
+        "(EVENTS|DIAG_STATS -- the stub backend implements nothing else)",
     ))
 
     out.append(("get_mac_request", frame(CMD_GET_MAC, 0).hex().upper(),
