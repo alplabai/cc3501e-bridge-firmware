@@ -121,11 +121,11 @@ installed and on the right paths -- a long toolchain to require of anyone who
 just wants a working companion.  The signed blob in `prebuilt/` is already
 built and signed:
 
-> **`cc3501e-v0.6.0.bin` is built from this tree's v0.6.0 release commit,
-> which is current `main`.**  `cc3501e-v0.5.1.bin` and older are kept only for
+> **`cc3501e-v0.7.0.bin` is built from this tree's v0.7.0 release commit,
+> which is current `main`.**  `cc3501e-v0.6.0.bin` and older are kept only for
 > traceability, and note they are not all the same KIND of artifact: 0.2.0,
-> 0.3.0 and 0.5.0 are raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1 and
-> this 0.6.0 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
+> 0.3.0 and 0.5.0 are raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1,
+> 0.6.0 and this 0.7.0 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
 > kind can be dropped straight into `primary_vendor_image.sign.bin` by the
 > recipe below (#96).  `prebuilt/BUILD_RECIPE.md` records which is which and CI
 > machine-checks it (#97).
@@ -142,28 +142,34 @@ built and signed:
 > `fw_version` marker unique -- it reads **`0x0501`**, where reusing 0.5.0 would
 > have made a third distinct build report `0x0500`.
 >
-> **What this adds over 0.5.0:** request identity on `CMD_SOCK_SEND` (#89 +
-> alp-sdk#1872), which bumps the wire protocol to **7**.  A host built against
-> an older protocol is refused by `GET_VERSION`; pair this blob with alp-sdk at
-> or after the matching host driver.  Bench-verified on the E1M-AEN801 serial
-> `2617-0001`: `sock tcp-get` **10 of 10** end-to-end against a bare `accept()`
-> listener with zero `send failed`, once the host-side phase settle was widened
-> in alp-sdk#1873.
+> **What v0.7.0 adds over v0.6.0:** listening sockets -- `SOCK_BIND` (0x64),
+> `SOCK_LISTEN` (0x65) and `EVT_SOCK_ACCEPTED`, so a host can serve over the
+> soft-AP rather than only dial out (#104, PR #108); a wire version that is
+> **MAJOR.MINOR** rather than a flat counter, with `CMD_GET_CAPABILITIES`
+> (0x06) reporting which opcode families the build implements (PR #109,
+> alp-sdk ADR 0033); and two fixes (PR #112) -- an already-enabled
+> `ble enable` no longer tears the bridge SPI down twice for a no-op
+> (alp-sdk#82), and `GET_DIAG_INFO` can now show a host that the companion
+> rebooted, via a per-boot `uptime_ms` baseline and a `reset_cause` that
+> reports `soft` after a `CMD_RESET` (alp-sdk#111).
 >
-> **Two limits still open**, neither fixed here: socket **RX** stalls at
-> roughly 2 kB, and the 250 us host phase settle is an empirical upper bound
-> paid per payload phase, so it taxes anything that streams (alp-sdk#1677).
+> **Three limits still open**, none fixed here: socket **RX** stalls at
+> roughly 2 kB; the 250 us host phase settle is an empirical upper bound paid
+> per payload phase, so it taxes anything that streams (alp-sdk#1677); and
+> `poll_by_repeat()` on the host charges only its back-off sleeps against the
+> caller's timeout, making it a floor on wall time rather than a bound
+> (alp-sdk#1953).
 
 ```sh
 # 1. Verify what you are about to flash (never skip this).
 openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
-    -signature prebuilt/cc3501e-v0.6.0.bin.sig prebuilt/cc3501e-v0.6.0.bin
-sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.6.0.bin.sha256)  prebuilt/cc3501e-v0.6.0.bin"
+    -signature prebuilt/cc3501e-v0.7.0.bin.sig prebuilt/cc3501e-v0.7.0.bin
+sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.7.0.bin.sha256)  prebuilt/cc3501e-v0.7.0.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
-#    THIS artifact's stamp (0.149.74.0) -- see the warning below.  An existing
+#    THIS artifact's stamp (0.149.92.0) -- see the warning below.  An existing
 #    flash-set built at another version will NOT do; regenerate it:
-#      VERSION=0.149.74.0 ti/regen_flashset.sh
+#      VERSION=0.149.92.0 ti/regen_flashset.sh
 #
 # 3. Drop the blob in as the primary vendor image, and remove any stale
 #    pre-flattened image -- a leftover *.flashready.bin is used in preference
@@ -174,7 +180,7 @@ sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.6.0.bin.sha256)  prebuilt/cc3501e-v0.
 #    table, not a signed container, and installing one here is a different file
 #    format, not a different build (#96).  prebuilt/BUILD_RECIPE.md records
 #    which release is which, and CI machine-checks it (#97).
-cp prebuilt/cc3501e-v0.6.0.bin <flashset>/primary_vendor_image.sign.bin
+cp prebuilt/cc3501e-v0.7.0.bin <flashset>/primary_vendor_image.sign.bin
 rm -f <flashset>/*.flashready.bin
 
 # 4. Program over XDS110/SWD (~18 s).
@@ -195,26 +201,26 @@ expensive trap on this part.  `programming_instructions` is built from
 *same* `--version` as the vendor image (`ti/regen_flashset.sh`).
 
 Verify the flash took by asking the device, not by trusting the programmer:
-`GET_VERSION` must answer wire protocol **8**, and `GET_DIAG_INFO` must report
-`fw_version=0x0600`.
+`GET_VERSION` must answer **`0x0301`** (wire 3.1), and `GET_DIAG_INFO` must
+report `fw_version=0x0700`.
 
-For this release `GET_VERSION` *is* discriminating, because v0.6.0 is the first
-image to answer **8** -- every earlier release answers 7 or lower. That is a
-property of this particular bump, not a rule: v0.5.1 and the withdrawn v0.6.0
-artifact it replaced both answered protocol **7**, so a part running either
-looked identical on that field. `fw_version` remains the reliable
-discriminator -- `0x0600` for this release, `0x0501` / `0x0500` for older.
+`GET_VERSION` is discriminating for this release, because v0.7.0 is the first
+image to answer a MAJOR.MINOR value at all -- every earlier release answers a
+flat 5..9. `fw_version` remains the reliable discriminator in general --
+`0x0700` for this release, `0x0600` / `0x0501` / `0x0500` for older.
 
-**A protocol-8 image needs a protocol-8 host.** `cc3501e_reset()` reads
-`GET_VERSION` on every cold boot and returns `ALP_ERR_VERSION` on a mismatch,
-so flashing this blob under a pre-v8 alp-sdk takes the companion link down by
-design. The paired host change is alplabai/alp-sdk#1891.
+**A wire-3.x image needs a wire-3.x host.** `cc3501e_reset()` reads
+`GET_VERSION` on every cold boot and returns `ALP_ERR_VERSION` on a **MAJOR**
+mismatch, so flashing this blob under an alp-sdk older than the ADR 0033 change
+takes the companion link down by design. A MINOR difference is additive and
+does not refuse -- that is the point of the scheme. The paired host work is on
+alp-sdk `dev`.
 
 Three distinct version numbers are in play here and they are **not**
-interchangeable -- app SemVer (`0.5.1`), wire protocol (`7`), and the GPE
-image stamp (`0.149.74.0`).  `prebuilt/CHANGELOG.md` has the table.
+interchangeable -- app SemVer (`0.7.0`), wire protocol (`3.1`), and the GPE
+image stamp (`0.149.92.0`).  `prebuilt/CHANGELOG.md` has the table.
 
-> **STOP -- check the unit's flash history before using this artifact's `0.149.74.0`
+> **STOP -- check the unit's flash history before using this artifact's `0.149.92.0`
 > stamp.**  The CC35 SBL enforces GPE-version **monotonicity against the last-seen
 > version on that part**, and it does so **even when every `*_rollback_protection_*`
 > fuse reads `0`**.  A warm programming run burns no fuses, so the report will show
@@ -222,12 +228,12 @@ image stamp (`0.149.74.0`).  `prebuilt/CHANGELOG.md` has the table.
 > stamp LOWER than anything ever flashed on the unit and it streams clean (exit 0,
 > the full ~1.09 MB) and then the SBL refuses to boot it: **dead link**, with an
 > empty XDS110 `query` image table.  Bench units used for OTA or flash iteration sit
-> at or above `0.149.74.0`.  The bench part here was last seen at `0.149.73.0`.
-> For a unit above this artifact's stamp,
+> at or above `0.149.92.0`.  The bench part here was last seen at `0.149.91.0`.
+> For a unit at or above this artifact's stamp,
 > re-wrap this same image at a legal stamp instead:
 >
 > ```sh
-> VERSION=0.149.67.0 ti/regen_flashset.sh   # > the unit's last-seen version, major MUST be 0
+> VERSION=0.149.93.0 ti/regen_flashset.sh   # > the unit's last-seen version, major MUST be 0
 > ```
 >
 > `major` must be `0`: a GPE major `>= 1` fails BL2 secure-boot with `AUTH_ERROR`.
@@ -340,7 +346,7 @@ release blob is version-pinned at `prebuilt/cc3501e-vX.Y.Z.bin`.
 validates that blob (relaying the image to the CC3501E over the
 inter-chip link) -- it is not a customer-facing utility, and lives
 in `alp-sdk-internal`, not this public tree.
-`prebuilt/` holds the signed release blob; `cc3501e-v0.6.0.bin` is the
+`prebuilt/` holds the signed release blob; `cc3501e-v0.7.0.bin` is the
 current one (wire protocol **7**).  Every older blob answers a DIFFERENT
 protocol and a host built from this tree refuses all of them:
 `cc3501e-v0.5.0.bin` answers **6**, `cc3501e-v0.4.1.bin` and

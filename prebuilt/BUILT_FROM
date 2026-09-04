@@ -56,9 +56,9 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   3c88f77a4e87f6d9157946a3668573baac71e607
-image-sha256: 51e78dc4f9a3285c4a046b2f866188dfd790902879330fc0a4c2091c4de0272d
-raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
+built-from:   e5aac7ff992d52802f63be576e8aeada82f8f95a
+image-sha256: 2d7cdb515a7cc7fff2089eb90ade9dc91ec00b9d3fec8f15649865e61f07a27e
+raw-sha256:   baa8a7b723435328fdc855267fa128e3e87d66f901c6fa233d61e5fc311dda90
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -78,15 +78,24 @@ raw-sha256:   973879585648343b13f726069c553661679d316a479f4a4d00ee7e53f339fa42
 # etc.) and an earlier cut of 0.5.1 did the same.  That convention is broken by
 # construction -- every bench or OTA-iterated unit climbs into 0.149.x through
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
-gpe-floor:    0.149.90.0
+gpe-floor:    0.149.92.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
 # compares against `raw-sha256`, not `image-sha256`.
 #   (none -- the v0.6.0 cut supersedes them.)
 #
-# built-from now names 3c88f77, the squash commit #103 actually landed as on
-# main -- NOT the pre-squash branch SHA, which this repo's history shows becomes
-# unreachable and reddens every later PR (see this file's header).  It carried
-# the placeholder PENDING-SQUASH-SHA through the release PR precisely so
-# `prebuilt freshness` would fail closed until this repoint happened.
+# built-from now names e5aac7f, the squash commit #112 landed as on main -- NOT
+# a pre-squash branch SHA, which this repo's history shows becomes unreachable
+# and reddens every later PR (see this file's header).  v0.7.0 is cut from the
+# tip that carries all three post-v0.6.0 landings: c4f3129 (listening sockets,
+# #108), 6ae0596 (MAJOR.MINOR wire + CMD_GET_CAPABILITIES, #109) and e5aac7f
+# itself (the BLE-enable teardown + reboot-detection fixes, #112).
+#
+# The gpe-floor moved 0.149.90.0 -> 0.149.92.0 in this same commit, and it had
+# to: bench work for #82/#111 flashed the E1M-AEN801 at 0.149.90.0 and then
+# 0.149.91.0, so the v0.6.0 artifact (stamped 0.149.90.0) can no longer be
+# flashed on that unit.  Raising the floor WITHOUT re-wrapping would have turned
+# check_prebuilt_kind.py red on the newest blob, which is why the two move
+# together -- the same pairing the v0.6.0 entry in prebuilt/CHANGELOG.md
+# records for its own 0.149.76.0 -> 0.149.90.0 re-wrap.
