@@ -514,6 +514,13 @@ int cc3501e_hw_set_log_level(uint8_t level);
  * backend has no source yet).  reset_cause is an alp_cc3501e_reset_cause_t. */
 uint8_t  cc3501e_hw_reset_cause(void);
 uint32_t cc3501e_hw_uptime_ms(void);
+
+/* Take the boot baseline cc3501e_hw_uptime_ms() subtracts (#111).  Called once
+ * from cc3501e_hw_init().  Needed because the DPL clock behind the uptime read
+ * SURVIVES a warm NVIC_SystemReset() on this silicon, so without a per-boot
+ * baseline `uptime` counts from power-on and a host cannot tell the companion
+ * rebooted underneath it. */
+void     cc3501e_hw_uptime_mark_boot(void);
 uint32_t cc3501e_hw_free_heap_bytes(void);
 
 /* WI-FI role currently up, as an alp_cc3501e_role_t: ROLE_OFF, ROLE_WIFI_STA or

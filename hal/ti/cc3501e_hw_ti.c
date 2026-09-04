@@ -143,6 +143,12 @@ void cc3501e_hw_init(void)
 	 * driven (root-caused 2026-06-17 via deep analysis). */
 	Board_init();
 
+	/* Baseline for cc3501e_hw_uptime_ms() (#111).  Taken as early as the clock
+	 * is usable: the DPL tick source survives a warm reset on this silicon, so
+	 * without a per-boot baseline `uptime` reports time-since-POWER-ON and a
+	 * host cannot see that the companion rebooted. */
+	cc3501e_hw_uptime_mark_boot();
+
 	/* Drive READY (GPIO17) LOW *here*, right after Board_init()'s GPIO_init(),
 	 * rather than lazily on the first arm_transfer().  GPIO17's RESET state is
 	 * output-disabled with an internal PULL-UP -- SWRS343A Table 5-1 pin 29
@@ -527,6 +533,55 @@ void cc3501e_hw_tick(void)
 	}
 }
 
+/* Software-reset marker, retained across the warm reset (#111).
+ *
+ * PowerWFF3_getResetReason() answers PowerWFF3_RESET_PIN_POR for a SYSRESETREQ on
+ * this part, so the SDK accessor reports `power-on` after a CMD_RESET (bench-
+ * measured on GPE 0.149.89.0 and again on 0.149.90.0).  The firmware does know it
+ * asked for the reset, so it records that in RAM the reset does not clear and
+ * cc3501e_hw_reset_cause() reads it back.
+ *
+ * .TI.noinit is the section the transport's wedge-recovery state already uses --
+ * placed into DRAM_NON_SECURE by ti/build_ti.ps1's linker patch, and never
+ * cleared by the C startup.  A magic/inverse pair rather than a single word so
+ * uninitialised RAM cannot pass for an armed marker.
+ *
+ * ADDRESS-GUARDED for the same reason bridge_transport_spi_polled() guards its
+ * struct: every RAM range in the vendor linker.cmd starts at or above
+ * 0x20000000, so a marker that landed below it is in flash, and storing there
+ * would BusFault -> hard fault -> boot loop.  A skipped marker only costs the
+ * old, wrong `power-on` answer.
+ *
+ * The one misreport this can produce is a power cut in the microseconds between
+ * arming and NVIC_SystemReset(), if that RAM then survives the outage: the next
+ * cold boot would claim `soft`.  Consuming the marker on the first read keeps it
+ * to that single boot. */
+#define CC3501E_SOFT_RESET_MAGIC 0x5253464Cu /* "LFSR" LE -- Left From Software Reset */
+
+static struct {
+	uint32_t magic;
+	uint32_t magic_inv;
+} g_soft_reset_mark __attribute__((section(".TI.noinit")));
+
+static bool soft_reset_mark_writable(void)
+{
+	return (uintptr_t)&g_soft_reset_mark >= 0x20000000u;
+}
+
+bool cc3501e_hw_take_soft_reset_mark(void)
+{
+	if (!soft_reset_mark_writable()) {
+		return false;
+	}
+	const bool armed = (g_soft_reset_mark.magic == CC3501E_SOFT_RESET_MAGIC) &&
+	                   (g_soft_reset_mark.magic_inv == ~CC3501E_SOFT_RESET_MAGIC);
+	/* READ-AND-CLEAR: the marker describes THIS boot only.  Left armed, every
+	 * later power-on would keep reporting `soft`. */
+	g_soft_reset_mark.magic     = 0u;
+	g_soft_reset_mark.magic_inv = 0u;
+	return armed;
+}
+
 void cc3501e_hw_request_reset(void)
 {
 	/* Clear reply_drained FIRST so only this command's own ack (the next
@@ -534,6 +589,10 @@ void cc3501e_hw_request_reset(void)
 	 * a stale drained flag from an earlier reply must not reset early. */
 	reply_drained = false;
 	reset_pending = true;
+	if (soft_reset_mark_writable()) {
+		g_soft_reset_mark.magic     = CC3501E_SOFT_RESET_MAGIC;
+		g_soft_reset_mark.magic_inv = ~CC3501E_SOFT_RESET_MAGIC;
+	}
 }
 
 void cc3501e_hw_notify_reply_sent(void)

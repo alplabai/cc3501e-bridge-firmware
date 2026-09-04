@@ -78,6 +78,15 @@ void     bridge_transport_spi_probe_xfer(void);
 uint32_t bridge_transport_spi_probe_read(void);
 #endif
 
+/* Consume the software-reset marker armed by cc3501e_hw_request_reset() before
+ * NVIC_SystemReset() (#111).  True EXACTLY ONCE, on the first call after a reset
+ * this firmware asked for; false after a power-on, a pin reset or a watchdog.
+ * Needed because PowerWFF3_getResetReason() reports PowerWFF3_RESET_PIN_POR for a
+ * SYSRESETREQ on this part -- bench-measured: `reset: power-on (1)` after every
+ * CMD_RESET -- so the SDK accessor alone cannot tell the host that the companion
+ * rebooted on its own request.  Lives in the ti backend, not on the wire. */
+bool cc3501e_hw_take_soft_reset_mark(void);
+
 /* False when the last TASK-side radio apply failed while a role was up. */
 bool cc3501e_hw_power_radio_ok(void);
 
