@@ -327,7 +327,7 @@ Three independent axes (same model as the gd32-bridge):
 | Axis | Where | Bumps when |
 |------|-------|-----------|
 | Firmware release | `firmware-version.txt` | each firmware release -- names the tag + the `prebuilt/cc3501e-vX.Y.Z.bin` blob |
-| Wire protocol | `ALP_CC3501E_PROTOCOL_VERSION` (`<alp/protocol/cc3501e.h>`) + `protocol-version.txt` | the wire format changes; the host refuses a mismatched version via GET_VERSION |
+| Wire protocol | `ALP_CC3501E_PROTOCOL_VERSION` (`<alp/protocol/cc3501e.h>`) + `protocol-version.txt` -- MAJOR.MINOR since ADR 0033; wire 4.0 (#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE trailer to every frame and moves `RESP_OK` off `0x00` to `0x5A` (this firmware requires the CRC unconditionally except on `GET_VERSION`, the one opcode a host may still send CRC-less before it knows the peer's major -- see `DESIGN.md`) | the wire format changes; the host refuses a **MAJOR** mismatch via GET_VERSION (a MINOR difference is additive and does not refuse) |
 | Build / signature | the signed binary's `.sha256` in `prebuilt/` | every build |
 
 ## Firmware updates

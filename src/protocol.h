@@ -40,17 +40,44 @@
  * On-wire reply frame mirrors the request shape (see the frame
  * diagram in <alp/protocol/cc3501e.h>):
  *
- *   +--------+--------+--------+--------+===========================+
- *   |  cmd   | flags  |  payload_len (LE)| payload (status+data+pad) |
- *   +--------+--------+--------+--------+===========================+
+ *   +--------+--------+--------+--------+===================================+
+ *   |  cmd   | flags  |  payload_len (LE)| payload (status+data+pad+crc)     |
+ *   +--------+--------+--------+--------+===================================+
  *
  * Per the protocol header's stated convention -- "Response status
  * codes carried in the first byte of every response payload" -- the
- * reply payload is [status:u8][data...][zero pad].  protocol_dispatch()
- * writes only the DATA bytes (after the status) and RETURNS the status;
- * the transport prepends the status byte and builds the 4-byte header.
- * payload_len COUNTS THE PAD -- see protocol_build_reply() below before
- * adding any variable-length reply.
+ * reply payload is [status:u8][data...][zero pad][crc:u16 LE].
+ * protocol_dispatch() writes only the DATA bytes (after the status) and
+ * RETURNS the status; the transport prepends the status byte and builds
+ * the 4-byte header.  payload_len COUNTS THE PAD AND THE CRC -- see
+ * protocol_build_reply() below before adding any variable-length reply.
+ *
+ * WIRE MAJOR 4 (#2035): every request AND every reply now carries a
+ * mandatory 2-byte CRC-16/CCITT-FALSE trailer (@ref ALP_CC3501E_CRC_BYTES,
+ * <alp/protocol/cc3501e.h>), covering the frame's 4 header bytes plus every
+ * payload byte except the trailing 2 CRC bytes themselves.  This firmware is
+ * the STRICT side of the migration: it requires the CRC on every incoming
+ * request unconditionally (a 3.1-shaped, CRC-less request is rejected with
+ * ALP_CC3501E_RESP_ERR_PROTOCOL, never executed) and emits the new
+ * CRC-bearing reply shape unconditionally -- there is no dual-mode firmware.
+ *
+ * ONE NORMATIVE EXCEPTION: CMD_GET_VERSION (0x01) is accepted WITH OR
+ * WITHOUT the CRC trailer -- see protocol_build_reply()'s implementation
+ * comment.  A host does not know a peer's wire major until GET_VERSION
+ * answers it, and it appends a request CRC only once that major is already
+ * negotiated, so the FIRST GET_VERSION any host sends a fresh peer is, by
+ * construction, the zero-payload 3.1 shape.  Requiring a CRC on it
+ * unconditionally would mean no host could ever discover a MAJOR-4 peer at
+ * all, and OTA -- the only path from 3.1 to 4.0 firmware -- rides this same
+ * gated request path, making that failure mode permanent.  Every other
+ * opcode keeps the unconditional requirement.
+ *
+ * The HOST is the bilingual side of the migration (chips/cc3501e/cc3501e_core.c
+ * in alp-sdk); see the MAJOR-4 paragraph above ALP_CC3501E_PROTOCOL_MAJOR in
+ * <alp/protocol/cc3501e.h> for the full migration order.  NEVER ship a host
+ * that refuses wire MAJOR 3 before every coprocessor in the fleet has been
+ * OTA'd to 4.0 -- OTA is the only path from 3.1 to 4.0 firmware, and it needs
+ * a host that can still talk to a 3.1 board.
  *
  * WIRE FRAMING (current E1M-AEN HW rev): the Alif dwc-ssi master drives
  * hardware SS0 around each protocol phase while the CC3501E SPI slave
@@ -68,9 +95,11 @@
  */
 
 /* Maximum reply DATA bytes a handler may emit (after the status byte).
- * The reply payload is status(1) + data; the whole payload stays within
- * the protocol's ALP_CC3501E_MAX_PAYLOAD ceiling. */
-#define CC3501E_REPLY_DATA_MAX (ALP_CC3501E_MAX_PAYLOAD - 1u)
+ * The reply payload is status(1) + data + the mandatory 2-byte CRC trailer
+ * (wire MAJOR 4); the whole payload stays within the protocol's
+ * ALP_CC3501E_MAX_PAYLOAD ceiling, so the CRC costs 2 bytes of headroom a
+ * handler could use for DATA before MAJOR 4. */
+#define CC3501E_REPLY_DATA_MAX (ALP_CC3501E_MAX_PAYLOAD - 1u - ALP_CC3501E_CRC_BYTES)
 
 /* Whole-frame sizes (header + max payload), shared by every transport. */
 #define CC3501E_FRAME_MAX_BYTES (ALP_CC3501E_HEADER_BYTES + ALP_CC3501E_MAX_PAYLOAD)
@@ -80,11 +109,42 @@
 #define CC3501E_REPLY_STATUS_OFF (ALP_CC3501E_HEADER_BYTES) /* index 4 */
 
 /* Reply payloads are padded up to a multiple of this so the HOST can DMA them as
- * one burst-aligned chunk, and the declared payload_len INCLUDES the pad (see
- * protocol_build_reply).  8 = the host's default DW SSI burst, fifo_depth/2 with
- * fifo_depth 16. */
+ * one burst-aligned chunk, and the declared payload_len INCLUDES the pad AND
+ * the wire-MAJOR-4 CRC trailer (see protocol_build_reply).  8 = the host's
+ * default DW SSI burst, fifo_depth/2 with fifo_depth 16. */
 #define CC3501E_REPLY_PAD      8u
 #define CC3501E_REPLY_DATA_OFF (ALP_CC3501E_HEADER_BYTES + 1u) /* index 5 */
+
+/* --------------------------------------------------------------- */
+/* Wire MAJOR 4: the CRC trailer's 2-byte sizing tax (#2035)         */
+/* --------------------------------------------------------------- */
+/*
+ * <alp/protocol/cc3501e.h>'s ALP_CC3501E_SPI1_MAX_XFER (4088) and
+ * ALP_CC3501E_OTA_MAX_CHUNK (ALP_CC3501E_MAX_PAYLOAD - 4) are pinned by that
+ * header's own _Static_asserts against the PRE-CRC framing, where a
+ * request's declared wire payload_len WAS its logical (opcode-struct +
+ * data) payload.  Wire MAJOR 4 appends a mandatory 2-byte CRC trailer
+ * INSIDE that same payload_len (protocol_build_reply() strips it back off
+ * before handing the logical payload to protocol_dispatch()), so it costs 2
+ * bytes of the identical ALP_CC3501E_MAX_PAYLOAD ceiling every other
+ * request payload already has to fit in.
+ *
+ * A maxed-out request built against the PRE-CRC constants would therefore
+ * be 2 bytes too long to declare a legal wire payload_len at all: the
+ * transport clamps a request header claiming more than
+ * ALP_CC3501E_MAX_PAYLOAD (hal/ti/transport_hw_ti_spi.c's on_transfer()),
+ * so the last 2 bytes of such a request -- which is exactly where the CRC
+ * trailer lives -- would never be clocked, and the frame fails the CRC
+ * check as silent, un-diagnosable corruption instead of a clean chunk-size
+ * rejection.  This firmware reports AND enforces 2 bytes less than the
+ * header's constants so a maxed-out chunk saturates the wire ceiling
+ * exactly again, the same way ALP_CC3501E_SPI1_MAX_XFER and
+ * ALP_CC3501E_OTA_MAX_CHUNK did before MAJOR 4.  The header itself is not
+ * changed here (it is canonical, and this firmware does not edit it) --
+ * only what THIS firmware reports (CMD_SPI1_CONFIGURE's max_xfer, worker.c)
+ * and enforces (protocol_spi.c, protocol_ota.c) shrinks. */
+#define CC3501E_SPI1_MAX_XFER_V4 (ALP_CC3501E_SPI1_MAX_XFER - ALP_CC3501E_CRC_BYTES)
+#define CC3501E_OTA_MAX_CHUNK_V4 (ALP_CC3501E_OTA_MAX_CHUNK - ALP_CC3501E_CRC_BYTES)
 
 /* --------------------------------------------------------------- */
 /* Dispatcher                                                        */
@@ -123,24 +183,37 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 /*
  * protocol_build_reply -- the transport-agnostic framing wrapper.
  *
- * Parses a complete request FRAME (4-byte header + payload), validates
- * the framing, runs protocol_dispatch(), and writes a complete reply
- * FRAME (header + status + data + PAD) into @p reply_frame.  Every
- * transport (SPI, SDIO) calls this so the on-wire framing is
+ * Parses a complete request FRAME (4-byte header + payload + the mandatory
+ * wire-MAJOR-4 CRC trailer), verifies the CRC, validates the framing, runs
+ * protocol_dispatch() with the CRC stripped back off, and writes a complete
+ * reply FRAME (header + status + data + PAD + CRC) into @p reply_frame.
+ * Every transport (SPI, SDIO) calls this so the on-wire framing is
  * byte-identical regardless of which link the customer selected.
  *
- *   req_frame / req_len  -- the received request frame.  A frame too
- *                           short to hold a header, or whose declared
- *                           payload_len doesn't match req_len, yields a
- *                           RESP_ERR_PROTOCOL reply frame.
+ *   req_frame / req_len  -- the received request frame.  A frame too short
+ *                           to hold a header, whose declared payload_len
+ *                           doesn't match req_len, too short to even hold
+ *                           the mandatory CRC trailer (a 3.1-shaped,
+ *                           CRC-less request), or whose CRC does not
+ *                           verify, yields a RESP_ERR_PROTOCOL reply frame
+ *                           -- never executed.  This firmware is the STRICT
+ *                           side of the wire-MAJOR-4 migration: the CRC is
+ *                           required unconditionally, with no dual-mode
+ *                           fallback (see the MAJOR-4 paragraph in this
+ *                           header's top comment).
  *   reply_frame          -- output buffer; MUST be at least
  *                           CC3501E_FRAME_MAX_BYTES.
  *   reply_cap            -- capacity of reply_frame.
  *
  * PADDING -- read this before adding a variable-length reply.  The reply
- * payload (status + data) is rounded UP to a multiple of
- * CC3501E_REPLY_PAD with ZERO bytes, and the declared payload_len
- * INCLUDES that pad, so payload_len is NOT status + data.  The host
+ * payload (status + data + the 2-byte CRC trailer) is rounded UP to a
+ * multiple of CC3501E_REPLY_PAD with ZERO bytes, and the declared
+ * payload_len INCLUDES that pad AND the CRC, so payload_len is NOT
+ * status + data.  The CRC itself always occupies the LAST 2 bytes of the
+ * padded span (<alp/protocol/cc3501e.h>'s ALP_CC3501E_REPLY_PAD doc), so a
+ * bare-status reply (1 byte) still pads to CC3501E_REPLY_PAD exactly as
+ * before MAJOR 4 -- the CRC simply consumes 2 of what used to be 7 pad
+ * bytes, costing zero extra wire bytes on the common case.  The host
  * clocks the padded length as one burst-aligned DMA chunk; that is the
  * whole point of it.  The pad is skipped only when it would not fit
  * @p reply_cap.

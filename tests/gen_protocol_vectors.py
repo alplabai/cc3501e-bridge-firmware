@@ -10,10 +10,19 @@ wire frames, shared by the firmware transport tests
 under tests/zephyr/chips/cc3501e/.
 
 The cc3501e frame is a 4-byte little-endian header + payload, with NO
-start-of-frame byte and NO CRC (a short hardwired point-to-point link):
+start-of-frame byte (a short hardwired point-to-point link).  Wire MAJOR 4
+(#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE trailer to every frame,
+both directions, INSIDE the declared payload_len -- covering the header
+plus every payload byte except the trailing 2 CRC bytes.  This firmware is
+the strict side of that migration (CRC required unconditionally, no
+dual-mode fallback) with ONE exception: CMD_GET_VERSION is accepted with or
+without the trailer, because a host cannot know to send one before
+GET_VERSION has told it the peer's wire major -- see
+src/protocol.c's protocol_build_reply() and this file's
+get_version_request_no_crc / get_version_request_crc vectors below.
 
-    REQUEST : cmd | flags | payload_len(LE16) | payload[payload_len]
-    REPLY   : cmd | flags | payload_len(LE16) | status | data[...]
+    REQUEST : cmd | flags | payload_len(LE16) | payload[payload_len-2] | crc(LE16)
+    REPLY   : cmd | flags | payload_len(LE16) | status | data[...] | pad | crc(LE16)
 
 The reply echoes the request cmd, uses flags=0 (solicited), and carries
 the response status (ALP_CC3501E_RESP_*) as the first payload byte.
@@ -157,43 +166,130 @@ CMD_SPI1_TRANSFER = 0x56  # SPI1 host passthrough (0x55..0x57); only TRANSFER is
 
 FLAG_SOLICITED = 0x00
 
-RESP_OK = 0x00
+# RESP_* and CRC_BYTES below are DUPLICATED from <alp/protocol/cc3501e.h> /
+# <alp/protocol/crc16.h> (same discipline as the CMD_* opcodes above: "keep
+# aligned with the header") -- they must move together with the header, by
+# hand, the same change that bumps ALP_CC3501E_PROTOCOL_MAJOR/_MINOR.  There
+# is no automated cross-check for these values the way _read_protocol_version()
+# cross-checks the MAJOR.MINOR pair; a future drift-catcher belongs there too.
+#
+# Wire MAJOR 4 (#2035) moves the success status off 0x00 -- indistinguishable
+# from a dead SPI phase clocking back nothing (#1378) -- to 0x5A.
+# RESP_OK_LEGACY (0x00) survives only to describe the PRE-MAJOR-4 wire shape a
+# real 4.0 firmware never emits (see get_version_reply_legacy_raw_v9 below,
+# which models a firmware that predates the MAJOR.MINOR scheme entirely).
+RESP_OK = 0x5A
+RESP_OK_LEGACY = 0x00
 RESP_ERR_INVALID = 0x01
 RESP_ERR_BUSY = 0x02
 RESP_ERR_NOT_READY = 0x05
 RESP_ERR_PROTOCOL = 0x07
+
+# <alp/protocol/cc3501e.h>'s ALP_CC3501E_CRC_BYTES: the wire MAJOR 4 trailer
+# size, both directions.
+CRC_BYTES = 2
 
 # Wire-protocol version GET_VERSION reports (ALP_CC3501E_PROTOCOL_VERSION).
 # Sourced from the header, not hardcoded -- see _read_protocol_version().
 PROTOCOL_VERSION = _read_protocol_version()
 
 
+def crc16_ccitt_false(data: bytes, crc: int = 0xFFFF) -> int:
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, non-reflected, no final
+    XOR) -- the SAME algorithm <alp/protocol/crc16.h>'s alp_crc16_ccitt_false()
+    implements, reimplemented here in Python because this generator has no C
+    toolchain to call into.  Chainable: pass a prior call's return as `crc` to
+    CRC a second buffer as if concatenated (mirrors alp_crc16_ccitt_false_update()).
+    """
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
 def frame(cmd: int, flags: int, payload: bytes = b"") -> bytes:
-    """Build a cc3501e frame: cmd | flags | payload_len(LE16) | payload."""
-    return bytes([cmd, flags, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF]) + payload
+    """Build a wire-MAJOR-4 REQUEST frame: header + payload + the mandatory
+    2-byte CRC-16/CCITT-FALSE trailer (LE), covering the header + payload.
+
+    Every call site below passes the opcode's actual (pre-MAJOR-4-shaped)
+    payload; this appends the trailer and folds its 2 bytes into the
+    declared payload_len, matching what src/protocol.c's protocol_build_reply()
+    requires of every request except CMD_GET_VERSION (see
+    get_version_request_no_crc for that one deliberate exception).
+    """
+    wire_len = len(payload) + CRC_BYTES
+    header = bytes([cmd, flags, wire_len & 0xFF, (wire_len >> 8) & 0xFF])
+    crc = crc16_ccitt_false(header + payload)
+    return header + payload + crc.to_bytes(2, "little")
 
 
-# src/protocol.h:80.  Reply payloads are padded up to a multiple of this so the
-# host DW SSI can move one burst-aligned chunk; an odd length collapses its DMA
-# burst to one transaction per byte.
+# src/protocol.h:CC3501E_REPLY_PAD.  Reply payloads are padded up to a
+# multiple of this so the host DW SSI can move one burst-aligned chunk; an
+# odd length collapses its DMA burst to one transaction per byte.
 REPLY_PAD = 8
 
 
 def reply(cmd: int, status: int, data: bytes = b"") -> bytes:
-    """Build a solicited reply frame (payload = status + data, zero-padded).
+    """Build a wire-MAJOR-4 solicited REPLY frame: payload = status + data,
+    zero-padded up to a multiple of REPLY_PAD, with the mandatory 2-byte
+    CRC-16/CCITT-FALSE trailer occupying the LAST 2 bytes of that padded
+    span (<alp/protocol/cc3501e.h>'s ALP_CC3501E_CRC_BYTES doc) -- so a
+    bare-status reply, which already padded from 1 to REPLY_PAD bytes before
+    MAJOR 4, costs zero extra wire bytes: the CRC simply consumes 2 of what
+    used to be 7 pad bytes.
 
     The padding is NOT cosmetic and omitting it made these vectors describe
-    frames the firmware never emits: src/protocol.c:470-473 rounds every reply
-    payload up to a multiple of CC3501E_REPLY_PAD, so ping_reply_ok was pinned
-    at payload_len=1 while the firmware sends 8 (#11).  Pad bytes are never
-    interpreted -- every reply carries its own length -- but they ARE on the
-    wire, and a vector file that disagrees with the wire pins nothing.
+    frames the firmware never emits: src/protocol.c's protocol_build_reply()
+    rounds every reply payload up to a multiple of CC3501E_REPLY_PAD, so
+    ping_reply_ok was pinned at payload_len=1 while the firmware sends 8
+    (#11).  Pad bytes are never interpreted -- every reply carries its own
+    length -- but they ARE on the wire, and a vector file that disagrees
+    with the wire pins nothing.
     """
+    body = bytes([status]) + data
+    unpadded = len(body) + CRC_BYTES
+    rem = unpadded % REPLY_PAD
+    pad = 0 if rem == 0 else REPLY_PAD - rem
+    body_padded = body + bytes(pad)
+    crc = crc16_ccitt_false(frame_header(cmd, FLAG_SOLICITED, len(body_padded) + CRC_BYTES) + body_padded)
+    return frame_header(cmd, FLAG_SOLICITED, len(body_padded) + CRC_BYTES) + body_padded + crc.to_bytes(
+        2, "little"
+    )
+
+
+def frame_header(cmd: int, flags: int, payload_len: int) -> bytes:
+    """The bare 4-byte LE header, split out so reply() can build it once to
+    CRC and once to prepend without duplicating the packing arithmetic."""
+    return bytes([cmd, flags, payload_len & 0xFF, (payload_len >> 8) & 0xFF])
+
+
+def legacy_reply(cmd: int, status: int, data: bytes = b"") -> bytes:
+    """Build a PRE-MAJOR-4 (wire <= 3.1) solicited reply: payload = status +
+    data, zero-padded, NO CRC trailer -- what a firmware from before this
+    bump (or before the MAJOR.MINOR scheme existed at all) actually emits.
+    Only get_version_reply_legacy_raw_v9 uses this: it models a DIFFERENT,
+    older firmware's reply, not something this repo's current firmware ever
+    sends, so it must NOT gain a wire-MAJOR-4 CRC trailer the way reply()
+    would give it."""
     payload = bytes([status]) + data
     rem = len(payload) % REPLY_PAD
     if rem:
         payload += bytes(REPLY_PAD - rem)
-    return frame(cmd, FLAG_SOLICITED, payload)
+    return frame_header(cmd, FLAG_SOLICITED, len(payload)) + payload
+
+
+def request_no_crc(cmd: int, flags: int, payload: bytes = b"") -> bytes:
+    """Build a PRE-MAJOR-4-shaped (wire 3.1) request: header + payload, NO
+    CRC trailer.  Used only for the deliberate CMD_GET_VERSION exception
+    (get_version_request_no_crc) and to show what a rejected legacy request
+    looks like -- see src/protocol.c's protocol_build_reply() for exactly
+    which opcode accepts this shape and which reject it with
+    RESP_ERR_PROTOCOL."""
+    return frame_header(cmd, flags, len(payload)) + payload
 
 
 HEADER = """\
@@ -203,8 +299,14 @@ HEADER = """\
 # (tests/zephyr/cc3501e_bridge_transport/) and any future host-driver
 # tests (tests/zephyr/chips/cc3501e/), so the two sides cannot diverge.
 #
-# Frame: 4-byte LE header [cmd | flags | payload_len(LE16)] + payload.
-# No SOF, no CRC.  Reply payload[0] is the response status.
+# Frame: 4-byte LE header [cmd | flags | payload_len(LE16)] + payload.  No
+# SOF.  Wire MAJOR 4 (#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE
+# trailer to every frame, both directions, INSIDE payload_len -- see
+# src/protocol.c's protocol_build_reply().  CMD_GET_VERSION is the ONE
+# opcode accepted with or without that trailer (a host cannot know to send
+# one before GET_VERSION has told it the peer's wire major); every other
+# opcode requires it unconditionally.  Reply payload[0] is the response
+# status; RESP_OK is 0x5A as of wire MAJOR 4 (was 0x00).
 #
 # Format: one `<name> = <hex>` vector per non-comment line; `#` comments.
 # Regenerate with `python3 firmware/cc3501e/tests/gen_protocol_vectors.py`.
@@ -219,10 +321,28 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
     out.append(("ping_reply_ok", reply(CMD_PING, RESP_OK).hex().upper(),
                 "cmd=PING | flags=0 | len=1 | status=OK"))
 
-    out.append(("get_version_request", frame(CMD_GET_VERSION, 0).hex().upper(),
-                "cmd=GET_VERSION | flags=0 | len=0"))
-    # The reply is the COMPOSED (MAJOR << 8) | MINOR, LE16 -- so wire 3.1 is
-    # bytes 01 03, not 09.  Naming the vector after the human form keeps the
+    # THE single most important request vector in this file (wire MAJOR 4,
+    # #2035): CMD_GET_VERSION is the ONE opcode accepted WITHOUT a CRC
+    # trailer, because a host cannot know this firmware's major -- and
+    # therefore cannot know to append a request CRC at all -- before
+    # GET_VERSION has told it.  A host's very first request to a fresh peer
+    # is exactly this zero-payload, no-trailer 3.1 shape; requiring a CRC on
+    # it unconditionally, like every other opcode, would make it impossible
+    # for any host to ever discover a MAJOR-4 peer (and OTA, the only path
+    # from 3.1 to 4.0 firmware, rides this identical gated request path, so
+    # that failure would be permanent).  See src/protocol.c's
+    # protocol_build_reply() for exactly where this carve-out lives.
+    out.append(("get_version_request_no_crc", request_no_crc(CMD_GET_VERSION, 0).hex().upper(),
+                "cmd=GET_VERSION | flags=0 | len=0 -- the CRC-less bootstrap shape every host "
+                "sends before it knows the peer's wire major; accepted, not rejected"))
+    # A host that has ALREADY negotiated MAJOR 4 (e.g. a console `ver` after
+    # the initial handshake) sends the ordinary CRC'd shape instead, which
+    # this firmware also accepts (payload_len=2, logical payload empty).
+    out.append(("get_version_request_crc", frame(CMD_GET_VERSION, 0).hex().upper(),
+                "cmd=GET_VERSION | flags=0 | len=2 (CRC only, no logical payload) -- the ordinary "
+                "MAJOR-4-negotiated shape; also accepted"))
+    # The reply is the COMPOSED (MAJOR << 8) | MINOR, LE16 -- so wire 4.0 is
+    # bytes 00 04, not 09.  Naming the vector after the human form keeps the
     # file readable by whoever is holding a board (ADR 0033).
     _major, _minor = PROTOCOL_VERSION >> 8, PROTOCOL_VERSION & 0xFF
     out.append((
@@ -232,13 +352,17 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
         f"cmd=GET_VERSION | len=3 | status=OK | wire={_major}.{_minor} "
         f"= 0x{PROTOCOL_VERSION:04X} (LE16)",
     ))
-    # A firmware from BEFORE ADR 0033 answers with its raw v1..v9 integer, which
-    # decodes to MAJOR 0 -- pinned here because the host relies on that being
-    # distinguishable to say "older than the scheme" instead of "corrupt".
+    # A firmware from BEFORE ADR 0033 (and before wire MAJOR 4's CRC trailer)
+    # answers with its raw v1..v9 integer over the LEGACY (no-CRC, RESP_OK_LEGACY
+    # 0x00) shape, which decodes to MAJOR 0 -- pinned here because the host
+    # relies on that being distinguishable to say "older than the scheme"
+    # instead of "corrupt".  legacy_reply(), not reply(): this models a
+    # DIFFERENT, older firmware's wire shape, not what THIS firmware emits.
     out.append((
         "get_version_reply_legacy_raw_v9",
-        reply(CMD_GET_VERSION, RESP_OK, bytes([0x09, 0x00])).hex().upper(),
-        "cmd=GET_VERSION | status=OK | legacy pre-ADR-0033 firmware: raw 9 -> major 0",
+        legacy_reply(CMD_GET_VERSION, RESP_OK_LEGACY, bytes([0x09, 0x00])).hex().upper(),
+        "cmd=GET_VERSION | status=OK(legacy 0x00) | pre-MAJOR-4, pre-ADR-0033 firmware: raw 9 -> "
+        "major 0, no CRC trailer",
     ))
 
     # GET_CAPABILITIES (0x06, wire 3.1): reply DATA is
@@ -386,10 +510,33 @@ def build_vectors() -> list[tuple[str, str, str | None]]:
     ))
 
     # Framing error: declared payload_len doesn't match the captured bytes.
+    # Unchanged by wire MAJOR 4 -- this check runs BEFORE the CRC check, so a
+    # frame that fails it never reaches CRC verification at all.
     out.append((
         "ping_bad_len_reply_protocol",
         reply(CMD_PING, RESP_ERR_PROTOCOL).hex().upper(),
         "reply to a frame whose payload_len mismatches the byte count -> PROTOCOL error",
+    ))
+
+    # Wire MAJOR 4 CRC contract (#2035), the two request-side rejection vectors
+    # the migration adds.  Both produce the SAME reply as ping_bad_len_reply_protocol
+    # above (RESP_ERR_PROTOCOL) -- the host cannot and need not tell "no CRC" apart
+    # from "corrupted CRC" apart from "bad length" on the wire; all three mean
+    # "this request was never executed".
+    out.append((
+        "ping_request_no_crc_reply_protocol",
+        request_no_crc(CMD_PING, 0).hex().upper(),
+        "cmd=PING | flags=0 | len=0 -- a 3.1-shaped (no-CRC) request to a NON-GET_VERSION "
+        "opcode; rejected with RESP_ERR_PROTOCOL, never executed (contrast "
+        "get_version_request_no_crc above, the one opcode this DOES accept)",
+    ))
+    _corrupt_hdr = frame_header(CMD_PING, 0, CRC_BYTES)
+    _corrupt_crc = crc16_ccitt_false(_corrupt_hdr) ^ 0xFFFF  # flip every bit -> guaranteed wrong
+    out.append((
+        "ping_request_corrupted_crc",
+        (_corrupt_hdr + _corrupt_crc.to_bytes(2, "little")).hex().upper(),
+        "cmd=PING | flags=0 | len=2 | crc=deliberately wrong -- a PRESENT but corrupted CRC "
+        "(link corruption, not a missing trailer); also rejected with RESP_ERR_PROTOCOL",
     ))
 
     return out

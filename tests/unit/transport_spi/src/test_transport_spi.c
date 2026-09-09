@@ -10,28 +10,47 @@
  *
  * Wire framing (see <alp/protocol/cc3501e.h>): 4-byte LE header
  * [cmd | flags | payload_len(LE16)] + payload; the reply payload's
- * first byte is the response status (ALP_CC3501E_RESP_*).  No SOF, no
- * CRC -- the link is a short hardwired point-to-point bus.
- */
+ * first byte is the response status (ALP_CC3501E_RESP_*).  No SOF.
+ *
+ * Wire MAJOR 4 (#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE trailer to
+ * every frame, both directions, INSIDE that declared payload_len -- see
+ * protocol.c's protocol_build_reply().  Every call site below builds a
+ * LOGICAL request (header + the opcode's actual payload, byte-identical to
+ * the pre-MAJOR-4 wire shape); transaction() reframes that into the real
+ * MAJOR-4 wire frame (recomputed payload_len + a correct CRC trailer)
+ * rather than every one of the ~50 call sites hand-computing its own CRC.
+ * transaction_raw() sends bytes exactly as given, unmodified, for the
+ * handful of tests that need a genuinely malformed or CRC-less frame on the
+ * wire (a declared-vs-captured length mismatch, a deliberately corrupted
+ * CRC, or the CRC-less GET_VERSION bootstrap request -- see
+ * test_get_version_accepts_crc_less_bootstrap_request, the single most
+ * important acceptance case in this file: GET_VERSION is the ONE opcode
+ * this firmware accepts without a CRC trailer, because a host cannot know
+ * to send one before GET_VERSION has told it the peer's major).
+ * test_wire_major4_crc_contract independently verifies that the firmware's
+ * table-driven CRC (protocol.c's crc16_table_update()) agrees byte-for-byte
+ * with the canonical bitwise alp_crc16_ccitt_false() this file computes
+ * expected values with -- the one runnable check that the table stays a
+ * faithful, lookup-accelerated view of the single-source algorithm. */
 
 #include <string.h>
 #include <zephyr/ztest.h>
 
 #include "alp/protocol/cc3501e.h"
-#include "cc3501e_hw.h" /* diag sources GET_DIAG_INFO must actually read (#1562) */
-#include "protocol.h"   /* CC3501E_REPLY_PAD -- replies are burst-aligned */
+#include "alp/protocol/crc16.h" /* alp_crc16_ccitt_false[_update] -- the canonical algorithm */
+#include "cc3501e_hw.h"         /* diag sources GET_DIAG_INFO must actually read (#1562) */
+#include "protocol.h" /* CC3501E_REPLY_PAD / CC3501E_FRAME_MAX_BYTES -- replies are burst-aligned */
 #include "transport.h"
 #include "worker.h" /* worker_init -- the worker `job` is a static; reset it per test */
 
-/* Replays one request CS transaction through the seams, the way the TI
- * HAL backend's ISR path does: reset staging, feed the bytes, decode. */
 /* Expected WIRE length of a reply carrying @p data_len bytes of data.
  *
- * protocol_build_reply() pads every reply payload up to a multiple of
- * CC3501E_REPLY_PAD so the host's DW SSI can move it as ONE burst-aligned DMA
- * chunk.  The pad bytes are never interpreted -- each reply carries its own
- * length -- but they DO change the byte count these tests observe, so the
- * expectations are expressed as "header + padded(status + data)" instead of a
+ * protocol_build_reply() pads every reply payload (status + data + the
+ * mandatory MAJOR-4 CRC trailer) up to a multiple of CC3501E_REPLY_PAD so
+ * the host's DW SSI can move it as ONE burst-aligned DMA chunk.  The pad
+ * bytes are never interpreted -- each reply carries its own length -- but
+ * they DO change the byte count these tests observe, so the expectations
+ * are expressed as "header + padded(status + data + crc)" instead of a
  * hardcoded number that silently encodes the pre-padding layout.
  *
  * Deriving it from CC3501E_REPLY_PAD rather than restating the arithmetic keeps
@@ -40,7 +59,9 @@
  * 12, which reddened the whole suite. */
 static inline size_t reply_padded_payload(size_t payload)
 {
-	return ((payload + CC3501E_REPLY_PAD - 1u) / CC3501E_REPLY_PAD) * CC3501E_REPLY_PAD;
+	const size_t with_crc = payload + (size_t)ALP_CC3501E_CRC_BYTES;
+
+	return ((with_crc + CC3501E_REPLY_PAD - 1u) / CC3501E_REPLY_PAD) * CC3501E_REPLY_PAD;
 }
 
 static inline size_t reply_wire(size_t data_len)
@@ -48,13 +69,57 @@ static inline size_t reply_wire(size_t data_len)
 	return (size_t)ALP_CC3501E_HEADER_BYTES + reply_padded_payload(1u + data_len);
 }
 
-static void transaction(const uint8_t *bytes, size_t len)
+/* Sends @p bytes exactly as given, byte-for-byte, through the SPI-slave
+ * seams -- no CRC, no reframing.  See this file's top comment for when to
+ * reach for this instead of transaction(). */
+static void transaction_raw(const uint8_t *bytes, size_t len)
 {
 	spi_slave_cs_low();
 	for (size_t i = 0; i < len; i++) {
 		spi_slave_rx_byte(bytes[i]);
 	}
 	spi_slave_cs_high();
+}
+
+/* v4.0 (#2035): reframes a LEGACY-shaped [cmd|flags|len(payload)|payload]
+ * array -- what every call site in this file already builds -- into the
+ * real wire-MAJOR-4 frame: payload_len is recomputed to include the
+ * mandatory 2-byte CRC trailer, and a correct CRC is appended, computed
+ * with the SAME canonical <alp/protocol/crc16.h> algorithm the firmware
+ * itself uses (protocol.c's crc16_table_update() is a lookup-accelerated
+ * view of the identical bitwise routine -- see
+ * test_crc16_table_matches_bitwise).  Safe to do MECHANICALLY (rather than
+ * hand-editing every call site) because every one of them already builds a
+ * SELF-CONSISTENT array (declared header length == actual trailing byte
+ * count) -- the one place that is not true
+ * (test_bad_payload_len_is_protocol_error) uses transaction_raw() instead. */
+static void transaction(const uint8_t *bytes, size_t len)
+{
+	if (len == 0u) {
+		transaction_raw(bytes, len);
+		return;
+	}
+
+	uint8_t        framed[CC3501E_FRAME_MAX_BYTES];
+	const size_t   payload_len = len - (size_t)ALP_CC3501E_HEADER_BYTES;
+	const uint16_t wire_len    = (uint16_t)(payload_len + (size_t)ALP_CC3501E_CRC_BYTES);
+
+	framed[0] = bytes[0];
+	framed[1] = bytes[1];
+	framed[2] = (uint8_t)(wire_len & 0xFFu);
+	framed[3] = (uint8_t)((wire_len >> 8) & 0xFFu);
+	if (payload_len > 0u) {
+		memcpy(&framed[ALP_CC3501E_HEADER_BYTES], &bytes[ALP_CC3501E_HEADER_BYTES], payload_len);
+	}
+
+	uint16_t crc = alp_crc16_ccitt_false(framed, ALP_CC3501E_HEADER_BYTES);
+	if (payload_len > 0u) {
+		crc = alp_crc16_ccitt_false_update(crc, &framed[ALP_CC3501E_HEADER_BYTES], payload_len);
+	}
+	framed[ALP_CC3501E_HEADER_BYTES + payload_len]      = (uint8_t)(crc & 0xFFu);
+	framed[ALP_CC3501E_HEADER_BYTES + payload_len + 1u] = (uint8_t)((crc >> 8) & 0xFFu);
+
+	transaction_raw(framed, (size_t)ALP_CC3501E_HEADER_BYTES + wire_len);
 }
 
 /* Drains the staged reply the way the HAL clocks the host's read FIFO. */
@@ -271,16 +336,119 @@ ZTEST(cc3501e_bridge_transport, test_ping_with_payload_is_invalid)
 ZTEST(cc3501e_bridge_transport, test_bad_payload_len_is_protocol_error)
 {
 	/* Header declares a 5-byte payload but the transaction carried none
-     * -> framing mismatch. */
+     * -> framing mismatch.  transaction_raw(): this is a DELIBERATELY
+     * inconsistent frame (declared len != captured bytes), so it must go on
+     * the wire exactly as written -- transaction()'s reframe derives the
+     * declared length FROM the captured bytes and would silently repair it,
+     * defeating the point of the test. */
 	const uint8_t bad[] = { ALP_CC3501E_CMD_PING, 0x00u, 0x05u, 0x00u };
 	uint8_t       reply[32];
 
 	transport_spi_init();
-	transaction(bad, sizeof bad);
+	transaction_raw(bad, sizeof bad);
 	size_t n = drain(reply, sizeof reply);
 
 	zassert_equal(n, reply_wire(0u), "reply is header + status");
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_PROTOCOL, "length mismatch -> PROTOCOL error");
+}
+
+ZTEST(cc3501e_bridge_transport, test_get_version_accepts_crc_less_bootstrap_request)
+{
+	/* THE single most important acceptance case in the wire-MAJOR-4 change.
+	 * A host does not know a peer's wire major until GET_VERSION answers it,
+	 * and it appends a request CRC ONLY once that major is already
+	 * negotiated (chips/cc3501e/cc3501e_core.c's want_req_crc, alp-sdk) --
+	 * so the FIRST GET_VERSION any host ever sends a fresh MAJOR-4 peer is,
+	 * by construction, this exact zero-payload, no-trailer 3.1 shape.
+	 * protocol_build_reply() special-cases GET_VERSION to accept it anyway;
+	 * every OTHER opcode still requires the CRC unconditionally (see
+	 * test_bad_payload_len_is_protocol_error and the CRC contract test
+	 * below).  Getting this wrong -- requiring a CRC here too -- would mean
+	 * no host could ever discover a MAJOR-4 peer, and OTA (the only path
+	 * from 3.1 to 4.0 firmware) rides this identical gated request path, so
+	 * the failure would be permanent. */
+	const uint8_t gv[] = { ALP_CC3501E_CMD_GET_VERSION, 0x00u, 0x00u, 0x00u };
+	uint8_t       reply[32];
+
+	transport_spi_init();
+	transaction_raw(gv, sizeof gv);
+	size_t n = drain(reply, sizeof reply);
+
+	zassert_equal(
+	    n, reply_wire(2u), "CRC-less GET_VERSION still gets the full reply, not PROTOCOL");
+	assert_reply_header(reply, ALP_CC3501E_CMD_GET_VERSION, 3u);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "CRC-less GET_VERSION -> RESP_OK, not rejected");
+	const uint16_t version = (uint16_t)reply[5] | ((uint16_t)reply[6] << 8);
+	zassert_equal(version,
+	              (uint16_t)ALP_CC3501E_PROTOCOL_VERSION,
+	              "still answers the real wire-protocol version");
+}
+
+ZTEST(cc3501e_bridge_transport, test_wire_major4_crc_contract)
+{
+	/* The other three cases <alp/protocol/cc3501e.h>'s MAJOR-4 paragraph
+	 * promises, beyond the GET_VERSION carve-out above: a valid CRC'd
+	 * request is accepted, a reply's own CRC verifies independently, and a
+	 * request with a CORRUPTED (present but wrong) CRC is rejected exactly
+	 * like a CRC-less one -- ALP_CC3501E_RESP_ERR_PROTOCOL, never executed. */
+	uint8_t reply[32];
+	size_t  n;
+
+	transport_spi_init();
+
+	/* (a) A normal, valid CRC'd request -- every other test in this file
+	 * already exercises this path via transaction(), but make it explicit
+	 * here as the "accepted" half of the contract. */
+	const uint8_t ping[] = { ALP_CC3501E_CMD_PING, 0x00u, 0x00u, 0x00u };
+	transaction(ping, sizeof ping);
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "valid CRC'd PING reply is header + status + pad/crc");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "a valid CRC'd request -> RESP_OK, executed");
+
+	/* (b) That reply's own CRC verifies over header + payload up to (not
+	 * including) the trailing 2 CRC bytes -- the same span the firmware's
+	 * own crc16_table_update() covers in protocol_build_reply(). */
+	{
+		const size_t covered = n - (size_t)ALP_CC3501E_HEADER_BYTES - (size_t)ALP_CC3501E_CRC_BYTES;
+		uint16_t     crc     = alp_crc16_ccitt_false(reply, ALP_CC3501E_HEADER_BYTES);
+		crc = alp_crc16_ccitt_false_update(crc, &reply[ALP_CC3501E_HEADER_BYTES], covered);
+		const uint16_t wire_crc = (uint16_t)reply[ALP_CC3501E_HEADER_BYTES + covered] |
+		                          (uint16_t)(reply[ALP_CC3501E_HEADER_BYTES + covered + 1u] << 8);
+		zassert_equal(crc, wire_crc, "the reply's own CRC trailer verifies");
+	}
+
+	/* (c) A request with a CORRUPTED CRC (present, right length, wrong
+	 * value) -- link corruption, distinct from "no CRC at all" -- is
+	 * rejected the same way. */
+	{
+		uint8_t        framed[16];
+		const uint16_t wire_len = (uint16_t)ALP_CC3501E_CRC_BYTES;
+
+		framed[0]          = ALP_CC3501E_CMD_PING;
+		framed[1]          = 0x00u;
+		framed[2]          = (uint8_t)(wire_len & 0xFFu);
+		framed[3]          = (uint8_t)((wire_len >> 8) & 0xFFu);
+		const uint16_t crc = alp_crc16_ccitt_false(framed, ALP_CC3501E_HEADER_BYTES);
+		framed[4]          = (uint8_t)(crc & 0xFFu);
+		framed[5] = (uint8_t)(((crc >> 8) & 0xFFu) ^ 0xFFu); /* flip every bit -> corrupt */
+
+		transaction_raw(framed, (size_t)ALP_CC3501E_HEADER_BYTES + wire_len);
+	}
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "rejected reply is still header + status + pad/crc");
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_PROTOCOL,
+	              "a corrupted (present but wrong) CRC is rejected, not executed");
+
+	/* (d) A CRC-less (3.1-shaped) request to a non-GET_VERSION opcode is
+	 * rejected too -- the strict default every opcode except GET_VERSION
+	 * keeps. */
+	transaction_raw(ping, sizeof ping);
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "rejected reply is still header + status + pad/crc");
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_PROTOCOL,
+	              "a 3.1-shaped (no-CRC) PING is rejected, not executed (unlike GET_VERSION)");
 }
 
 /* An empty transaction (CS toggled, no bytes) must rewind the drain
@@ -1138,8 +1306,9 @@ ZTEST(cc3501e_bridge_transport, test_spi1_configure_then_transfer_loops_back)
 	              10000000u,
 	              "the reply reports the ACTUAL rate (the stub has no divider, so it matches)");
 	zassert_equal((uint16_t)reply[9] | ((uint16_t)reply[10] << 8),
-	              (uint16_t)ALP_CC3501E_SPI1_MAX_XFER,
-	              "CONFIGURE hands the host this firmware's chunk size");
+	              (uint16_t)CC3501E_SPI1_MAX_XFER_V4,
+	              "CONFIGURE hands the host this firmware's chunk size (wire MAJOR 4: the "
+	              "header's ALP_CC3501E_SPI1_MAX_XFER minus the mandatory request CRC's 2 bytes)");
 	zassert_equal(reply[11], 0x08u, "the accepted bits_per_word echoes back");
 
 	/* len 4, flags 0 (single-shot), seq 1, then the TX bytes inline. */

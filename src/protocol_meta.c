@@ -121,13 +121,34 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * gen_protocol_vectors.py --check gates in the meantime -- the atomicity cost
  * the README already documents for the repo split, not a regression to chase
  * here.  This is the same sequence v8 itself went through. */
+/* v4.0 (#2035, ADR 0033's MAJOR.MINOR scheme): moves ALP_CC3501E_RESP_OK off
+ * 0x00 (see ALP_CC3501E_RESP_OK_LEGACY) to 0x5A and adds a mandatory 2-byte
+ * CRC-16/CCITT-FALSE trailer to every frame, both directions -- see
+ * protocol.c's protocol_build_reply() for the firmware-side mechanics and the
+ * MAJOR-4 paragraph above ALP_CC3501E_PROTOCOL_MAJOR in
+ * <alp/protocol/cc3501e.h> for the wire contract and the migration order.
+ *
+ * THIS FIRMWARE IS THE STRICT SIDE of that migration: it requires the CRC on
+ * every request unconditionally and emits the new CRC-bearing reply shape
+ * unconditionally.  There is no dual-mode firmware and no fallback to the
+ * 3.1 (no-CRC) shape here -- a 3.1-shaped request is rejected with
+ * ALP_CC3501E_RESP_ERR_PROTOCOL, never executed -- WITH ONE NORMATIVE
+ * EXCEPTION: CMD_GET_VERSION (below) is accepted with or without the CRC
+ * trailer, because a host cannot know this firmware's major (and therefore
+ * cannot know to append a request CRC at all) before GET_VERSION answers
+ * it -- see protocol.c's protocol_build_reply() for exactly where that
+ * carve-out lives.  The HOST is the bilingual side (alp-sdk's
+ * chips/cc3501e/cc3501e_core.c decodes both reply shapes, keyed off the
+ * negotiated firmware major); that asymmetry is the whole migration
+ * mechanism, so building dual-mode support into the firmware here would
+ * duplicate a decision the host already owns. */
 /* The wire version is MAJOR.MINOR since ADR 0033.  Both halves are asserted
  * separately so a mismatch names WHICH half drifted: a MAJOR disagreement means
  * the two binaries would misread each other's frames, a MINOR one means the
  * header carries additive opcodes this firmware does not implement (or the
  * reverse). */
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR 3
-#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MINOR 1
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR 4
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MINOR 0
 
 _Static_assert(ALP_CC3501E_PROTOCOL_MAJOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR,
                "<alp/protocol/cc3501e.h> MAJOR is not the wire major this firmware "
@@ -140,7 +161,24 @@ _Static_assert(ALP_CC3501E_PROTOCOL_MINOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MINO
 
 /* GET_VERSION (0x01): wire-protocol compatibility gate.  Returns the
  * 16-bit ALP_CC3501E_PROTOCOL_VERSION (LE); the host refuses to talk
- * to a firmware whose value != its compile-time ALP_CC3501E_PROTOCOL_VERSION.
+ * to a firmware whose MAJOR half differs from its own compile-time
+ * ALP_CC3501E_PROTOCOL_MAJOR (ADR 0033; a MINOR difference is additive and
+ * does not refuse the link).
+ *
+ * THE ONE OPCODE THIS FIRMWARE ACCEPTS WITHOUT A REQUEST CRC (wire MAJOR
+ * 4, #2035) -- protocol.c's protocol_build_reply() special-cases exactly
+ * this opcode.  A host's very first request to any peer is GET_VERSION
+ * sent BEFORE it knows that peer's major, so it is sent CRC-less by
+ * construction (chips/cc3501e/cc3501e_core.c's want_req_crc gates the
+ * request CRC on the major already being negotiated).  Requiring a CRC on
+ * it unconditionally, like every other opcode, would make it impossible
+ * for any host to ever discover a MAJOR-4 peer -- and OTA, the only way to
+ * MOVE a board from 3.1 to 4.0 firmware, rides this identical gated
+ * request path, so that failure would be permanent, not a one-time
+ * hiccup.  A request that DOES carry a valid CRC (e.g. a console `ver`
+ * issued by a host that already negotiated MAJOR 4) is still accepted --
+ * this handler itself only ever sees req_len 0 either way, since
+ * protocol_build_reply() strips a present CRC trailer before calling here.
  *
  * This returns the PROTOCOL version, not the firmware RELEASE version
  * (firmware-version.txt), matching the host driver's compatibility

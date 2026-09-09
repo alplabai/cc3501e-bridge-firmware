@@ -43,6 +43,50 @@ request `cmd`, uses `flags = 0`, and its payload is `[status][data...]`
 per the header.  Framing + dispatch is centralised in
 `protocol_build_reply()` so SPI and SDIO are byte-identical.
 
+**Wire MAJOR 4 (#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE trailer
+to every frame, both directions**, INSIDE the declared `payload_len` --
+covering the 4 header bytes plus every payload byte except the trailing 2
+CRC bytes themselves.  This firmware is the **strict** side of that
+migration: it requires the CRC on every request unconditionally and emits
+the CRC-bearing reply shape unconditionally, with no dual-mode fallback --
+a 3.1-shaped (no-CRC) request is rejected with `RESP_ERR_PROTOCOL`, never
+executed.
+
+**ONE normative exception: `CMD_GET_VERSION` (`0x01`) is accepted with or
+without the CRC trailer.** A host cannot know a peer's wire major -- and
+therefore cannot know whether to append a request CRC at all -- before
+`GET_VERSION` has told it, and the host only appends one once that major is
+already negotiated.  So the very first `GET_VERSION` any host ever sends a
+fresh peer is, by construction, the zero-payload, no-trailer 3.1 shape.
+Requiring a CRC on it unconditionally, like every other opcode, would mean
+no host could ever discover a MAJOR-4 peer at all -- and OTA, the only path
+from 3.1 to 4.0 firmware, rides this identical gated request path, so that
+failure would be permanent, not a one-time hiccup.  See
+`src/protocol.c`'s `protocol_build_reply()` for exactly where this
+carve-out lives, and
+`tests/unit/transport_spi/src/test_transport_spi.c`'s
+`test_get_version_accepts_crc_less_bootstrap_request` for the regression
+test.
+
+The host driver (`chips/cc3501e/cc3501e_core.c` in alp-sdk) is
+the **bilingual** side: it decodes both the legacy (no-CRC, `0x00`-is-OK)
+shape and the MAJOR-4 (CRC-required, `0x5A`-is-OK) shape, keyed off the
+firmware major it negotiates at `GET_VERSION`.  `ALP_CC3501E_RESP_OK` also
+moves off `0x00` to `0x5A` in the same bump -- `0x00` was indistinguishable
+from a dead SPI phase clocking back nothing (#1378); the CRC trailer is the
+structural fix for that, and the status-byte move is what makes the two
+wire shapes tell themselves apart.
+
+**Migration order (see the MAJOR-4 paragraph above
+`ALP_CC3501E_PROTOCOL_MAJOR` in `<alp/protocol/cc3501e.h>` for the full
+text):** the Alif host image rolls first (MCUboot + the ATOC, independent
+of the coprocessor); coprocessors are then OTA'd to 4.0 firmware *through*
+that already-bilingual host; only a release *after* the whole fleet is
+confirmed on 4.0 may drop the host's legacy decode branch.  Never ship a
+host that refuses wire MAJOR 3 before that OTA sweep completes -- OTA is
+the only path from 3.1 to 4.0 firmware, and it needs a host that can still
+talk to a 3.1 board.
+
 `ALP_CC3501E_FLAG_ASYNC_EVENT` is defined by the wire header but **no
 code in this firmware ever sets it**: every frame the CC3501E emits is a
 solicited reply with `flags = 0`.  Async events do not travel as their
@@ -61,21 +105,57 @@ next length from a header it already exchanged:
 | # | master clocks | direction | length |
 |---|---------------|-----------|--------|
 | 1 | request header | MOSI | 4 |
-| 2 | request payload | MOSI | `payload_len` (from #1) |
+| 2 | request payload | MOSI | `payload_len` (from #1) = data + 2-byte CRC |
 | 3 | reply header | MISO | 4 |
-| 4 | reply payload | MISO | reply `payload_len` (from #3) = status + data + zero pad |
+| 4 | reply payload | MISO | reply `payload_len` (from #3) = status + data + zero pad + 2-byte CRC |
 
 **Phase 4 is NOT `1 + data_len`.**  `protocol_build_reply()` rounds the
 reply payload up to a multiple of `CC3501E_REPLY_PAD` (8) with zero bytes,
-so the declared `payload_len` is `status + data + pad` and the host clocks
-the padded length.  The padding buys the host's DW SSI a burst-aligned DMA
-transfer; the cost is that **a variable-length reply payload must be
-self-delimiting**, because `payload_len` no longer delimits the data.  It
-was not, once: an empty `GET_PENDING_EVENTS` drain came back as 7 zero pad
-bytes and the host walked them as three `opcode 0x00, len 0` events, ~5.8
-phantom events per second forever (alp-sdk#1740, see `BRINGUP_STATUS.md`).
-Any NEW variable-length reply payload must carry its own count or its own
-terminator, or it walks into the same trap.
+so the declared `payload_len` is `status + data + pad + crc` and the host
+clocks the padded length.  The CRC trailer always occupies the LAST 2 bytes
+of that padded span, so a bare-status reply (which already padded from 1 to
+8 bytes before wire MAJOR 4) costs zero extra wire bytes: the CRC simply
+consumes 2 of what used to be 7 pad bytes.  The padding buys the host's DW
+SSI a burst-aligned DMA transfer; the cost is that **a variable-length
+reply payload must be self-delimiting**, because `payload_len` no longer
+delimits the data.  It was not, once: an empty `GET_PENDING_EVENTS` drain
+came back as 7 zero pad bytes and the host walked them as three
+`opcode 0x00, len 0` events, ~5.8 phantom events per second forever
+(alp-sdk#1740, see `BRINGUP_STATUS.md`).  Any NEW variable-length reply
+payload must carry its own count or its own terminator, or it walks into
+the same trap.
+
+**Sizing consequence of the request CRC (#2035):** a request's own
+`payload_len` now also counts its 2-byte CRC trailer, so a maxed-out
+`SPI1_TRANSFER` or `OTA_WRITE` chunk needs 2 fewer data bytes than
+`ALP_CC3501E_SPI1_MAX_XFER` / `ALP_CC3501E_OTA_MAX_CHUNK` (the canonical
+header's PRE-CRC constants) structurally allow, or the request's declared
+`payload_len` exceeds `ALP_CC3501E_MAX_PAYLOAD` and the transport clamps it,
+truncating exactly the CRC trailer at exactly the largest transfer size.
+`src/protocol.h`'s `CC3501E_SPI1_MAX_XFER_V4` / `CC3501E_OTA_MAX_CHUNK_V4`
+(each the header constant minus `ALP_CC3501E_CRC_BYTES`) are what this
+firmware reports (`CMD_SPI1_CONFIGURE`'s `max_xfer`) and enforces.
+
+**Both CRC directions run inside the SPI-slave ISR (#2035).**
+`protocol_build_reply()` -- which now verifies the request CRC and appends
+the reply CRC -- runs from `hal/ti/transport_hw_ti_spi.c`'s `on_transfer()`
+callback via `dispatch_frame()`, so a maximum-size (~4096-byte) frame's CRC
+work has to fit inside `CC3501E_PHASE_SETTLE_US` (250 us, `cc3501e_core.c`).
+`<alp/protocol/crc16.h>`'s bitwise, per-bit form -- the canonical
+single-source algorithm -- costs on the order of 50-65 cycles/byte (its own
+doc comment: ~640 cycles for an 8..16-byte reply), so 4096 bytes is
+~225,000 cycles, 4-11x OVER budget at any plausible CC3501E M33 clock
+(80-200 MHz).  `src/protocol.c` therefore builds a 256-entry, LE16
+table-driven equivalent (`crc16_table_update()`) -- GENERATED from the same
+canonical bitwise routine (`alp_crc16_ccitt_false_update()`) rather than a
+second, independently-typed implementation, so there is exactly one
+algorithm and the table is provably a lookup-accelerated view of it -- at
+3-4 cycles/byte, ~12,000-16,000 cycles for the same 4096-byte case, i.e.
+60-200 us: inside budget with margin across that whole clock range, where
+the bitwise form was not.  The 512-byte table (256 * `sizeof(uint16_t)`) is
+kept in DRAM (a plain non-const array, lazily filled once) rather than
+flash, so a lookup never waits on a flash access from inside the ISR --
+negligible against the firmware's 512 KB DRAM budget (`BRINGUP_STATUS.md`).
 
 The host waits for READY before the reply header and reply payload
 phases.  Firmware side: `hal/ti/transport_hw_ti_spi.c` (a `SPI_PERIPHERAL`
@@ -100,7 +180,7 @@ different thing and they must not be conflated:
 | Version | Source of truth | Surfaced by | Gates |
 |---|---|---|---|
 | **App SemVer** | `firmware-version.txt` (e.g. `0.2.0`) | `GET_DIAG_INFO.fw_version` (u16) | firmware release identity — human-facing "what's running" |
-| **Wire protocol version** | `ALP_CC3501E_PROTOCOL_VERSION` in `<alp/protocol/cc3501e.h>` (this tree targets `8` — see `protocol-version.txt`; v8 repurposes request-flags bits 3..7 as a 5-bit retry seq covering every worker-routed opcode, issue #102.  **alp-sdk's default branch still defines `7`** — the paired host-side bump is a separate PR in that repo and had not landed when this was written, so a stub build against a stock alp-sdk checkout fails the `protocol_meta.c` `_Static_assert` by design) | `GET_VERSION` (0x01) | host↔firmware wire compatibility (host refuses a mismatch — enforced by `cc3501e_reset()` in `chips/cc3501e/cc3501e_core.c`, which reads `GET_VERSION` once the cold boot completes and returns `ALP_ERR_VERSION` if the reply differs from the host's compile-time value; #1371) |
+| **Wire protocol version** | `ALP_CC3501E_PROTOCOL_VERSION` in `<alp/protocol/cc3501e.h>` — MAJOR.MINOR since ADR 0033; this tree targets `4.0` (`CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR`/`_MINOR`, `src/protocol_meta.c` — see `protocol-version.txt`).  v4.0 (#2035) moves `ALP_CC3501E_RESP_OK` off `0x00` to `0x5A` and adds a mandatory 2-byte CRC-16/CCITT-FALSE trailer to every frame, both directions; this firmware is the strict (CRC-required, no dual-mode) side, the host driver the bilingual side — see "Wire framing" above. | `GET_VERSION` (0x01) | host↔firmware wire compatibility (host refuses a **MAJOR** mismatch — enforced by `cc3501e_reset()` in `chips/cc3501e/cc3501e_core.c`, which reads `GET_VERSION` once the cold boot completes and returns `ALP_ERR_VERSION` on a MAJOR disagreement; a MINOR difference is additive and does not refuse the link; #1371, ADR 0033) |
 | **GPE flash/image version** | `--version`, supplied EXPLICITLY to `ti/deploy_validate.sh` / `ti/regen_flashset.sh` / `ti/validate_gpio_bench.ps1` (no default) | — (programmer only) | CC35 vendor-RoT anti-rollback (unit rejects `<=` the programmed value) |
 
 **App SemVer → `fw_version` marker.** The runtime u16 is *derived* from
