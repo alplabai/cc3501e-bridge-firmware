@@ -231,11 +231,30 @@ fi
 # App + silicon-free layer + ti HAL + SysConfig unity aggregates (see .ps1 149-165).
 sources=(
   "$fw/src/main.c" "$fw/src/protocol.c" "$fw"/src/protocol_*.c "$fw/src/worker.c" "$fw/src/event_ring.c" "$fw/src/transport_spi.c" "$fw/src/transport_sdio.c"
-  "$fw/hal/ti/cc3501e_hw_ti.c" "$fw"/hal/ti/cc3501e_hw_ti_*.c
+  "$fw/hal/ti/cc3501e_hw_ti.c" "$fw/hal/ti/cc3501e_hw_ti_ble.c" "$fw/hal/ti/cc3501e_hw_ti_gpio.c"
+  "$fw/hal/ti/cc3501e_hw_ti_log.c" "$fw/hal/ti/cc3501e_hw_ti_ota.c" "$fw/hal/ti/cc3501e_hw_ti_power.c"
+  "$fw/hal/ti/cc3501e_hw_ti_sock.c" "$fw/hal/ti/cc3501e_hw_ti_wifi.c"
   "$fw/hal/ti/transport_hw_ti_spi.c" "$fw/hal/ti/transport_hw_ti_sdio.c"
   "$out/ti_drivers_config.c" "$out/ti_freertos_config.c" "$out/ti_freertos_portable_config.c"
   "$out/memcfg/ti_flash_map_config.c"
 )
+# SPI1 host passthrough HAL body (protocol v6) -- mirrors build_ti.ps1's already-
+# correct selection (see its comment above the identical if/else).  CONFIG_SPI_1
+# only exists in the Wi-Fi board file (cc3501e_aen_wifi.syscfg), so the REAL HAL
+# (cc3501e_hw_ti_spi_master.c) #errors without CONFIG_SPI_1 and must never be
+# linked into the default (non --wifi) image; the image links the NOTIMPL
+# stand-in instead.  The glob this replaced ("$fw"/hal/ti/cc3501e_hw_ti_*.c)
+# linked BOTH files unconditionally -- a Linux-port parity gap from .ps1's
+# explicit list (see the block comment above this repo's #10 fix, which ported
+# four other such gaps but missed this one) -- which compiled fine (neither
+# object needs the other resolved yet) and then failed the LINK with duplicate
+# cc3501e_hw_spi1_{configure,transfer,release} symbols the moment both objects
+# existed in the same image, caught building --wifi --ble on 2026-09-09.
+if [ "$WIFI_HOST_DRIVER" = 1 ]; then
+  sources+=("$fw/hal/ti/cc3501e_hw_ti_spi_master.c")
+else
+  sources+=("$fw/hal/ti/cc3501e_hw_ti_spi_master_notimpl.c")
+fi
 # OTFDE flash-decryption driver (FWU.a references otfdeDriver_Config) -- linked
 # unconditionally now OTA-over-bridge ships. See .ps1 167-177.
 sources+=("$SDK_DIR/source/ti/drivers/net/wifi/wifi_platform/cc35xx/plat/otfde_driver.c")
