@@ -20,13 +20,13 @@
 ping_request                       = 00000200A2E2
 # cmd=PING | flags=0 | len=1 | status=OK
 ping_reply_ok                      = 000008005A00000000007509
-# cmd=GET_VERSION | flags=0 | len=0 -- the CRC-less bootstrap shape every host sends before it knows the peer's wire major; accepted, not rejected
+# cmd=GET_VERSION | flags=0 | len=0 -- the CRC-less bootstrap shape every host sends before it knows the peer's wire major; accepted, not rejected, in BOTH the CRC-on and CRC-off (legacy) builds
 get_version_request_no_crc         = 01000000
-# cmd=GET_VERSION | flags=0 | len=2 (CRC only, no logical payload) -- the ordinary MAJOR-4-negotiated shape; also accepted
+# cmd=GET_VERSION | flags=0 | len=2 (CRC only, no logical payload) -- the MAJOR-4-negotiated shape; ALSO accepted by a CRC-off (legacy) build, so a host with stale cached state can still rediscover a downgraded board
 get_version_request_crc            = 010002001694
 # cmd=GET_VERSION | len=3 | status=OK | wire=4.0 = 0x0400 (LE16)
 get_version_reply_wire4_0          = 010008005A0004000000C1AC
-# cmd=GET_VERSION | status=OK(legacy 0x00) | pre-MAJOR-4, pre-ADR-0033 firmware: raw 9 -> major 0, no CRC trailer
+# cmd=GET_VERSION | status=OK(legacy 0x00) | pre-ADR-0033 firmware (predates even the MAJOR.MINOR scheme, not just the CRC trailer): raw 9 -> major 0, no CRC trailer
 get_version_reply_legacy_raw_v9    = 010008000009000000000000
 # cmd=GET_CAPABILITIES | flags=0 | len=0
 get_capabilities_request           = 060002003BC5
@@ -82,7 +82,7 @@ spi1_transfer_request              = 56000E000400000100000000DEADBEEF3FC7
 spi1_transfer_reply_ok             = 560010005A04000001DEADBEEF0000000000846B
 # reply to a frame whose payload_len mismatches the byte count -> PROTOCOL error
 ping_bad_len_reply_protocol        = 00000800070000000000A237
-# cmd=PING | flags=0 | len=0 -- a 3.1-shaped (no-CRC) request to a NON-GET_VERSION opcode; rejected with RESP_ERR_PROTOCOL, never executed (contrast get_version_request_no_crc above, the one opcode this DOES accept)
+# cmd=PING | flags=0 | len=0 -- a 3.1-shaped (no-CRC) request to a NON-GET_VERSION opcode on a CRC-on build; rejected with RESP_ERR_PROTOCOL, never executed (contrast get_version_request_no_crc above, the one opcode this DOES accept, and the CRC-off build's ping_request, which is this exact shape and IS executed)
 ping_request_no_crc_reply_protocol = 00000000
 # cmd=PING | flags=0 | len=2 | crc=deliberately wrong -- a PRESENT but corrupted CRC (link corruption, not a missing trailer); also rejected with RESP_ERR_PROTOCOL
 ping_request_corrupted_crc         = 000002005D1D

@@ -60,6 +60,33 @@ set(CC3501E_HAL_BACKEND "stub" CACHE STRING "CC3501E HAL backend (stub | ti)")
 set(CC3501E_CONTROL_TRANSPORT "spi" CACHE STRING "Active host-control transport (spi | sdio)")
 
 # ----------------------------------------------------------------- #
+# Wire CRC trailer (customer-selectable)                             #
+# ----------------------------------------------------------------- #
+#
+# CC3501E_WIRE_CRC picks which wire shape this image speaks:
+#   * ON  -- DEFAULT.  Wire MAJOR 4 (#2035): a mandatory 2-byte
+#            CRC-16/CCITT-FALSE trailer on every frame, both directions.
+#            Exists because a dead SPI phase was observed on real silicon
+#            returning RESP_OK with a corrupted payload (#1378) -- the CRC
+#            is what makes that detectable instead of silently accepted.
+#   * OFF -- wire MAJOR 3 (@ref ALP_CC3501E_PROTOCOL_MAJOR_LEGACY): no
+#            trailer, byte-identical to the 3.1 wire.  For boards that will
+#            not pay the CRC's flash/cycle cost.  Turning this OFF removes
+#            the #1378 guard, which is why it is NOT the default -- opting
+#            out is a deliberate act, not an oversight.
+# This is a WIRE MAJOR selector, not a cosmetic toggle: a build with this
+# OFF reports ALP_CC3501E_PROTOCOL_MAJOR_LEGACY (3) from GET_VERSION, never
+# 4 -- see src/protocol_meta.c's CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR
+# _Static_assert.  Reporting 4 without actually emitting/requiring the CRC
+# would make a MAJOR-4 host append CRCs this firmware ignores and demand
+# CRCs it never sends: a silent, total link failure that looks like a
+# hardware fault.  The HOST needs no change either way -- alp-sdk's
+# chips/cc3501e/cc3501e_core.c is already bilingual (accepts fw_major 3 OR
+# 4) for exactly this migration window.  The choice is sourced from the
+# customer board.yaml in a full studio build; the firmware default is ON.
+set(CC3501E_WIRE_CRC ON CACHE BOOL "Emit/require the wire-MAJOR-4 CRC-16/CCITT-FALSE frame trailer")
+
+# ----------------------------------------------------------------- #
 # Source layout                                                      #
 # ----------------------------------------------------------------- #
 
@@ -122,6 +149,15 @@ elseif(NOT CC3501E_CONTROL_TRANSPORT STREQUAL "spi")
     message(FATAL_ERROR "Unknown CC3501E_CONTROL_TRANSPORT='${CC3501E_CONTROL_TRANSPORT}' (expected: spi | sdio).")
 endif()
 
+# Always defined (1 or 0), never merely #ifdef'd: src/protocol.c and
+# src/protocol_meta.c branch on its VALUE (#if CC3501E_WIRE_CRC) to select
+# between the two wire shapes, not just its presence.
+if(CC3501E_WIRE_CRC)
+    add_compile_definitions(CC3501E_WIRE_CRC=1)
+else()
+    add_compile_definitions(CC3501E_WIRE_CRC=0)
+endif()
+
 # Firmware *release* version (own semver; source of truth firmware-version.txt).
 # Parse the SemVer and pack MINOR/PATCH into the u16 marker reported by
 # GET_DIAG_INFO.fw_version, so the runtime value is DERIVED from this file and
@@ -134,7 +170,7 @@ if(NOT CC3501E_BRIDGE_FW_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
 endif()
 math(EXPR CC3501E_BRIDGE_FW_VERSION_U16 "(${CMAKE_MATCH_2} << 8) | ${CMAKE_MATCH_3}" OUTPUT_FORMAT HEXADECIMAL)
 message(STATUS "cc3501e-bridge firmware version: ${CC3501E_BRIDGE_FW_VERSION} (fw_version marker ${CC3501E_BRIDGE_FW_VERSION_U16})")
-message(STATUS "cc3501e-bridge HAL backend: ${CC3501E_HAL_BACKEND}; transport: ${CC3501E_CONTROL_TRANSPORT}")
+message(STATUS "cc3501e-bridge HAL backend: ${CC3501E_HAL_BACKEND}; transport: ${CC3501E_CONTROL_TRANSPORT}; wire CRC: ${CC3501E_WIRE_CRC}")
 
 add_executable(cc3501e-bridge ${CC3501E_BRIDGE_SOURCES})
 

@@ -33,6 +33,19 @@
  * when the header is not there). */
 #include "alp/protocol/cc3501e.h"
 
+/* CC3501E_WIRE_CRC (customer-selectable, CMakeLists.txt) picks which wire
+ * shape this image speaks: 1 (default) = wire MAJOR 4, the mandatory
+ * CRC-16/CCITT-FALSE trailer on every frame; 0 = wire MAJOR 3
+ * (@ref ALP_CC3501E_PROTOCOL_MAJOR_LEGACY), byte-identical to the 3.1 wire.
+ * Every real build defines this via the CMake option or ti/build_ti.sh's
+ * -DCC3501E_WIRE_CRC; this fallback exists so a build that has NOT picked
+ * that up (a raw ad-hoc compile, an IDE that has not re-run CMake) fails
+ * SAFE -- the strict, CRC-required wire -- rather than silently compiling
+ * out the #1378 corruption guard. */
+#ifndef CC3501E_WIRE_CRC
+#define CC3501E_WIRE_CRC 1
+#endif
+
 /* --------------------------------------------------------------- */
 /* Reply framing contract (firmware side)                            */
 /* --------------------------------------------------------------- */
@@ -99,7 +112,11 @@
  * (wire MAJOR 4); the whole payload stays within the protocol's
  * ALP_CC3501E_MAX_PAYLOAD ceiling, so the CRC costs 2 bytes of headroom a
  * handler could use for DATA before MAJOR 4. */
+#if CC3501E_WIRE_CRC
 #define CC3501E_REPLY_DATA_MAX (ALP_CC3501E_MAX_PAYLOAD - 1u - ALP_CC3501E_CRC_BYTES)
+#else
+#define CC3501E_REPLY_DATA_MAX (ALP_CC3501E_MAX_PAYLOAD - 1u)
+#endif
 
 /* Whole-frame sizes (header + max payload), shared by every transport. */
 #define CC3501E_FRAME_MAX_BYTES (ALP_CC3501E_HEADER_BYTES + ALP_CC3501E_MAX_PAYLOAD)
@@ -142,9 +159,22 @@
  * ALP_CC3501E_OTA_MAX_CHUNK did before MAJOR 4.  The header itself is not
  * changed here (it is canonical, and this firmware does not edit it) --
  * only what THIS firmware reports (CMD_SPI1_CONFIGURE's max_xfer, worker.c)
- * and enforces (protocol_spi.c, protocol_ota.c) shrinks. */
+ * and enforces (protocol_spi.c, protocol_ota.c) shrinks.
+ *
+ * CC3501E_WIRE_CRC=OFF (the customer-selectable no-CRC build, CMakeLists.txt)
+ * pays none of this: a request payload_len on that wire is still exactly the
+ * logical (opcode-struct + data) payload, no trailer riding inside it, so the
+ * 2-byte reservation above is not just unneeded there but WRONG -- reporting
+ * it from a no-CRC build silently wastes 2 bytes per transfer the host would
+ * otherwise use, and the two _V4 names below resolve to the header's raw,
+ * unreserved constants instead. */
+#if CC3501E_WIRE_CRC
 #define CC3501E_SPI1_MAX_XFER_V4 (ALP_CC3501E_SPI1_MAX_XFER - ALP_CC3501E_CRC_BYTES)
 #define CC3501E_OTA_MAX_CHUNK_V4 (ALP_CC3501E_OTA_MAX_CHUNK - ALP_CC3501E_CRC_BYTES)
+#else
+#define CC3501E_SPI1_MAX_XFER_V4 ALP_CC3501E_SPI1_MAX_XFER
+#define CC3501E_OTA_MAX_CHUNK_V4 ALP_CC3501E_OTA_MAX_CHUNK
+#endif
 
 /* --------------------------------------------------------------- */
 /* Dispatcher                                                        */
@@ -200,7 +230,15 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
  *                           side of the wire-MAJOR-4 migration: the CRC is
  *                           required unconditionally, with no dual-mode
  *                           fallback (see the MAJOR-4 paragraph in this
- *                           header's top comment).
+ *                           header's top comment).  ALL OF THIS IS THE
+ *                           CC3501E_WIRE_CRC=ON (default) SHAPE.  With
+ *                           CC3501E_WIRE_CRC=OFF this function instead
+ *                           builds the byte-identical-to-3.1 shape: no
+ *                           trailer required or verified on any request
+ *                           (GET_VERSION alone still tolerates one present,
+ *                           see protocol.c), no trailer appended to any
+ *                           reply, and @ref ALP_CC3501E_RESP_OK_LEGACY (not
+ *                           @ref ALP_CC3501E_RESP_OK) is the wire OK byte.
  *   reply_frame          -- output buffer; MUST be at least
  *                           CC3501E_FRAME_MAX_BYTES.
  *   reply_cap            -- capacity of reply_frame.

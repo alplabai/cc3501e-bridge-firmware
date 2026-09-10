@@ -146,7 +146,20 @@ alp_cc3501e_resp_t handle_ping(const uint8_t *req,
  * separately so a mismatch names WHICH half drifted: a MAJOR disagreement means
  * the two binaries would misread each other's frames, a MINOR one means the
  * header carries additive opcodes this firmware does not implement (or the
- * reverse). */
+ * reverse).
+ *
+ * CC3501E_WIRE_CRC (CMakeLists.txt, customer-selectable) makes WHICH major
+ * this build asserts against conditional too: this firmware does not merely
+ * choose to skip the CRC when it is OFF, it reports a DIFFERENT wire major
+ * (3, @ref ALP_CC3501E_PROTOCOL_MAJOR_LEGACY) -- see CC3501E_FW_WIRE_VERSION
+ * below and protocol.c's protocol_build_reply() #else arm.  Do NOT collapse
+ * this back to a single unconditional assert against
+ * ALP_CC3501E_PROTOCOL_MAJOR: that is exactly the drift this assert exists to
+ * catch, and the risk only grows with a build-time switch -- a no-CRC image
+ * that still asserted (and therefore still reported) MAJOR 4 would tell a
+ * MAJOR-4 host to append/expect CRCs this image neither emits nor checks, a
+ * silent, total link failure indistinguishable from a hardware fault. */
+#if CC3501E_WIRE_CRC
 #define CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR 4
 #define CC3501E_FW_IMPLEMENTS_PROTOCOL_MINOR 0
 
@@ -158,6 +171,26 @@ _Static_assert(ALP_CC3501E_PROTOCOL_MINOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MINO
                "<alp/protocol/cc3501e.h> MINOR is not the wire minor this firmware "
                "implements -- same cause as the MAJOR assert above, but additive: the "
                "header and this firmware disagree about which optional opcodes exist");
+
+/* Wire version reported by GET_VERSION on this (CRC-on) build: the composed
+ * MAJOR.MINOR the header defines. */
+#define CC3501E_FW_WIRE_VERSION ((uint16_t)ALP_CC3501E_PROTOCOL_VERSION)
+#else
+#define CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR 3
+
+_Static_assert(ALP_CC3501E_PROTOCOL_MAJOR_LEGACY == CC3501E_FW_IMPLEMENTS_PROTOCOL_MAJOR,
+               "<alp/protocol/cc3501e.h> ALP_CC3501E_PROTOCOL_MAJOR_LEGACY is not the wire "
+               "major this no-CRC build implements -- the build is pointed at the wrong (or "
+               "a stale) alp-sdk checkout; pass -AlpSdkRoot / ALP_SDK_ROOT at the right one");
+/* No MINOR assert on this arm: ALP_CC3501E_PROTOCOL_MINOR in the CANONICAL
+ * header describes MAJOR 4's additive feature set, not MAJOR 3's -- the
+ * header stopped carrying a legacy-minor constant once the 4.0 bump retired
+ * it, so there is nothing left there to cross-check a MAJOR-3 minor against.
+ * The .1 below is a firmware-local constant instead (the last minor wire 3.x
+ * actually held -- "v9 = 3.1", <alp/protocol/cc3501e.h>'s version history),
+ * pinned here rather than derived. */
+#define CC3501E_FW_WIRE_VERSION (uint16_t)(((uint16_t)ALP_CC3501E_PROTOCOL_MAJOR_LEGACY << 8) | 1u)
+#endif
 
 /* GET_VERSION (0x01): wire-protocol compatibility gate.  Returns the
  * 16-bit ALP_CC3501E_PROTOCOL_VERSION (LE); the host refuses to talk
@@ -186,7 +219,12 @@ _Static_assert(ALP_CC3501E_PROTOCOL_MINOR == CC3501E_FW_IMPLEMENTS_PROTOCOL_MINO
  * doc.  (The diag-struct comment in <alp/protocol/cc3501e.h> that says
  * GET_VERSION returns the release version is a documentation
  * discrepancy -- tracked in DESIGN.md; the release version is reported
- * separately via GET_DIAG_INFO.fw_version in v2 firmware.) */
+ * separately via GET_DIAG_INFO.fw_version in v2 firmware.)
+ *
+ * Reports CC3501E_FW_WIRE_VERSION, not the header's raw
+ * ALP_CC3501E_PROTOCOL_VERSION literal, because CC3501E_WIRE_CRC=OFF builds
+ * report a DIFFERENT major (see the macro's definition above): this is the
+ * one place a MAJOR-3 no-CRC image tells a host it is not MAJOR 4. */
 alp_cc3501e_resp_t handle_get_version(const uint8_t *req,
                                       size_t         req_len,
                                       uint8_t       *reply_data,
@@ -196,7 +234,7 @@ alp_cc3501e_resp_t handle_get_version(const uint8_t *req,
 	(void)req;
 	if (req_len != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
 	if (reply_cap < 2u) return ALP_CC3501E_RESP_ERR_NO_MEM;
-	put_le16(reply_data, (uint16_t)ALP_CC3501E_PROTOCOL_VERSION);
+	put_le16(reply_data, CC3501E_FW_WIRE_VERSION);
 	*reply_data_len = 2u;
 	return ALP_CC3501E_RESP_OK;
 }

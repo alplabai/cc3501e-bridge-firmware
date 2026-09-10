@@ -147,6 +147,23 @@ jobs:
       - name: build (SDIO transport)
         run: cmake --build build-sdio -j"$(nproc)"
 
+      # CC3501E_WIRE_CRC=OFF (customer-selectable, CMakeLists.txt): the
+      # byte-identical-to-3.1 build never got its own CI configure either --
+      # same class of gap #11 fixed for the SDIO transport above, and the
+      # same fix: a second cheap configure is the only thing that proves the
+      # #if CC3501E_WIRE_CRC #else arm actually compiles.
+      - name: configure (CC3501E_WIRE_CRC=OFF)
+        run: |
+          cmake -B build-no-crc -S firmware \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/firmware/toolchain/arm-none-eabi.cmake" \
+            -DCC3501E_HAL_BACKEND=stub \
+            -DALP_SDK_ROOT="$PWD/alp-sdk" \
+            -DCC3501E_WIRE_CRC=OFF \
+            -DCMAKE_C_FLAGS="-Werror"
+
+      - name: build (CC3501E_WIRE_CRC=OFF)
+        run: cmake --build build-no-crc -j"$(nproc)"
+
   protocol-vectors:
     name: wire vectors are regenerated
     runs-on: ubuntu-latest
@@ -181,6 +198,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/gen_protocol_vectors.py --check
+          # CC3501E_WIRE_CRC=OFF (CMakeLists.txt): a DIFFERENT wire shape
+          # (byte-identical to 3.1, not the MAJOR-4 shape minus its trailer),
+          # pinned separately so it cannot drift unnoticed either.
+          python3 tests/gen_protocol_vectors.py --legacy --check
 
   protocol-version-parity:
     name: protocol version parity

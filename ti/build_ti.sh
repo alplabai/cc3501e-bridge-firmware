@@ -22,6 +22,7 @@
 #   SDK_DIR=<ti-sdk>/simplelink_wifi_sdk_10_10_01_08 ./build_ti.sh --wifi
 #   ./build_ti.sh --wifi --ble                     # + WiFi host driver + NimBLE
 #   ./build_ti.sh --transport sdio --ota-selftest
+#   ./build_ti.sh --wifi --ble --no-crc            # wire MAJOR 3 (legacy), no CRC trailer
 #
 # The TI SDK / toolchain / SysConfig / toolbox locations are NOT bundled;
 # point at your staged copies via the env vars (or flags) below.
@@ -44,6 +45,7 @@ TRANSPORT="spi"          # spi | sdio
 OTA_SELFTEST=0
 WIFI_HOST_DRIVER=0
 BLE=0
+WIRE_CRC=1               # wire MAJOR 4 (mandatory CRC trailer) by default; --no-crc for legacy MAJOR 3
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --ota-selftest) OTA_SELFTEST=1; shift ;;
     --wifi) WIFI_HOST_DRIVER=1; shift ;;
     --ble) BLE=1; shift ;;
+    --no-crc) WIRE_CRC=0; shift ;;
     --sdk) SDK_DIR="$2"; shift 2 ;;
     --ticlang) TICLANG_ROOT="$2"; shift 2 ;;
     --sysconfig) SYSCONFIG_CLI="$2"; shift 2 ;;
@@ -80,7 +83,11 @@ if [ ! -f "$repo/include/alp/protocol/cc3501e.h" ]; then
   exit 3
 fi
 echo "== alp-sdk include root: $repo =="
+# Distinct output dir for --no-crc so a CRC-on and a CRC-off build can be run
+# back-to-back without one clobbering the other's artifacts -- needed to
+# compare their sizes, which is the whole point of the option existing.
 out="$fw/build/ti"
+[ "$WIRE_CRC" = 0 ] && out="$fw/build/ti-no-crc"
 tc="$TICLANG_ROOT/bin/tiarmclang"
 # Require the externally-staged TI tooling before touching it, so an
 # unset/empty var fails with a clear message instead of a confusing MISSING
@@ -177,7 +184,11 @@ fi
 echo "== fw_version marker: $fwver -> $fw_u16 (from firmware-version.txt) =="
 cflags+=("-DCC3501E_BRIDGE_FW_VERSION_U16=$fw_u16")
 
-txdef=()
+# Always defined (1 or 0), matching the top-level CMakeLists.txt CC3501E_WIRE_CRC
+# cache option -- see src/protocol.h's #ifndef fallback for why "merely absent"
+# is not good enough here (it would silently compile the strict/CRC-on shape,
+# not fail loudly, so this script defines it explicitly either way).
+txdef=(-DCC3501E_WIRE_CRC=$WIRE_CRC)
 [ "$TRANSPORT" = sdio ] && txdef+=(-DCC3501E_CONTROL_TRANSPORT_SDIO=1)
 [ "$OTA_SELFTEST" = 1 ] && txdef+=(-DCC3501E_OTA_SELFTEST)
 
