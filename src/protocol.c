@@ -111,15 +111,46 @@ static void crc16_table_init(void)
 	crc16_table_ready = true;
 }
 
+/* Build the table NOW, from the boot path, so the first frame's reply does
+ * not pay for it inside the SPI ISR.
+ *
+ * This exists because the lazy build was a REAL desync, root-caused on
+ * silicon 2026-09-10.  The table was built on first use, and first use is
+ * protocol_build_reply() servicing the very first request -- in SPI
+ * interrupt context.  256 iterations of the bitwise
+ * alp_crc16_ccitt_false_update() is ~100 us at this core's 160 MHz, not the
+ * "microseconds" the old comment here claimed; it was wrong by two orders.
+ *
+ * The host's reply-header gate is a BLIND fixed 200 us
+ * (chips/cc3501e/cc3501e_core.c, cc3501e_reply_gate) because READY is an
+ * open connection on the bench unit, and normal dispatch already consumes
+ * most of that budget.  So the extra ~100 us on frame one overshot it: the
+ * host clocked 4 bytes into a slave with nothing armed, those bytes sat in
+ * the RX FIFO, and every later transfer returned the PREVIOUS phase's TX
+ * bytes -- a permanent one-transfer lag on MISO that no retry clears.
+ * Symptom was every opcode returning -5 with a valid-looking reply header
+ * for the PREVIOUS request in the host's rx_scratch.
+ *
+ * Called unconditionally, on both CC3501E_WIRE_CRC arms: the OFF build
+ * still CRCs the payload_len==2 GET_VERSION shape, so it can reach the
+ * table too. */
+void protocol_crc16_table_init(void)
+{
+	if (!crc16_table_ready) {
+		crc16_table_init();
+	}
+}
+
 /* Table-driven equivalent of alp_crc16_ccitt_false_update() -- same
  * polynomial (0x1021), same non-reflected CCITT-FALSE convention, same
  * chained-call contract (start from ALP_CRC16_CCITT_FALSE_INIT, thread the
  * return value through a second call to CRC a second buffer as if
- * concatenated).  Lazily builds the table on first use rather than adding a
- * boot-sequence call: every caller of protocol_build_reply() (ISR and every
- * host-side unit test alike) reaches this before it reaches any CRC'd
- * frame, the build is ~256 cheap iterations (microseconds), and it runs
- * once regardless of which caller reaches it first. */
+ * concatenated).
+ *
+ * The lazy-build guard below is KEPT as a backstop for host-side unit tests,
+ * which call protocol_build_reply() directly and never run the firmware boot
+ * path.  On real silicon protocol_crc16_table_init() has already run and
+ * this branch is never taken -- do NOT rely on it there again. */
 static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
 {
 	if (!crc16_table_ready) {

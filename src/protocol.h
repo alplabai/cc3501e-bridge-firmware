@@ -291,4 +291,21 @@ size_t protocol_build_reply(const uint8_t *req_frame,
  */
 void protocol_reset_retry_latch(void);
 
+/**
+ * @brief Precompute the wire-CRC lookup table from the boot path.
+ *
+ * MUST be called before the SPI slave is armed for its first request frame.
+ * The table used to be built lazily on first use, and first use is
+ * protocol_build_reply() running in SPI interrupt context -- ~100 us at
+ * 160 MHz, against a host reply gate that is a blind fixed 200 us already
+ * mostly spent on normal dispatch.  Overshooting it once desyncs the link
+ * permanently: the host clocks into an unarmed slave, the stray bytes sit in
+ * the RX FIFO, and every later transfer returns the previous phase's TX
+ * bytes.  Root-caused on silicon 2026-09-10.
+ *
+ * Idempotent, and safe to call on either CC3501E_WIRE_CRC arm -- the OFF
+ * build still CRCs the payload_len==2 GET_VERSION shape.
+ */
+void protocol_crc16_table_init(void);
+
 #endif /* CC3501E_BRIDGE_PROTOCOL_H */

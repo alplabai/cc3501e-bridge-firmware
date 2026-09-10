@@ -964,6 +964,22 @@ static bool spi_open_and_arm(void)
 	 * again and stall the host's per-request READY gate (-3 BUSY).  Bench-proven. */
 
 	g_resync_count = 0u;
+
+	/* Build the wire-CRC table BEFORE the first frame can arrive.
+	 *
+	 * It used to be built lazily inside protocol_build_reply(), i.e. in SPI
+	 * interrupt context while servicing request one -- ~100 us at 160 MHz on
+	 * top of normal dispatch, against the host's BLIND fixed 200 us
+	 * reply-header gate.  Overshooting that gate once is permanent: the host
+	 * clocks 4 bytes into a slave with nothing armed, they sit in the RX FIFO,
+	 * and every later transfer then returns the PREVIOUS phase's TX bytes.
+	 * Root-caused on silicon 2026-09-10 -- every opcode returned -5 with the
+	 * previous request's reply header sitting in the host's rx_scratch.
+	 *
+	 * Must stay ahead of arm_request_header(): after that line the host may
+	 * clock at any moment. */
+	protocol_crc16_table_init();
+
 	return arm_request_header();
 }
 
