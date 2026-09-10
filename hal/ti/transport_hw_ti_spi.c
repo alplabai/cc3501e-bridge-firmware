@@ -910,11 +910,30 @@ static bool spi_open_and_arm(void)
 		 * terms must hold; WAIT_FOREVER means a polled transfer blocks until the
 		 * host clocks it, which is why only the dedicated update-mode loop may
 		 * drive this mode.  minDmaTransferSize is hard-emitted as 10 by SysConfig
-		 * with no property to override it, so ti/build_ti.ps1 patches the generated
-		 * ti_drivers_config.c to 1024 -- that ceiling must clear the largest frame
-		 * the protocol allows, ALP_CC3501E_HEADER_BYTES + ALP_CC3501E_MAX_PAYLOAD =
-		 * 4 + 512 = 516 B.  Never trim it toward the ~260 B that today's 256-byte
-		 * host OTA chunk happens to produce. */
+		 * with no property to override it, so ti/build_ti.{ps1,sh} patch the
+		 * generated ti_drivers_config.c to 1024.  Never trim that toward the
+		 * ~260 B that today's 256-byte host OTA chunk happens to produce.
+		 *
+		 * BUT 1024 NO LONGER CLEARS THE LARGEST LEGAL FRAME, and the arithmetic
+		 * that used to justify it here was stale.  It read "ALP_CC3501E_HEADER_BYTES
+		 * + ALP_CC3501E_MAX_PAYLOAD = 4 + 512 = 516 B" -- MAX_PAYLOAD is 4096 now,
+		 * so the real ceiling is 4 + 4096 = 4100 B, eight times the figure quoted.
+		 * frame_buf/reply_buf are sized from CC3501E_FRAME_MAX_BYTES and are
+		 * genuinely 4100, so nothing overruns; what is wrong is only the claim
+		 * that 1024 "clears" anything.
+		 *
+		 * The consequence is confined to THIS branch, update mode: any polled-boot
+		 * frame phase with count >= 1024 silently takes the DMA-blocking path
+		 * instead of the polling path this comment intends.  Measured 2026-08-26,
+		 * ~1070 OTA_WRITE payload phases of 1028 B completed that way, so it works
+		 * -- but it is not what the surrounding text says is happening.
+		 *
+		 * Do NOT read this as the cause of the normal-mode wedge at 1024-byte
+		 * STREAM_WRITE.  That was investigated and the link is refuted: outside
+		 * update mode the slave opens SPI_MODE_CALLBACK, and the polling branch
+		 * needs SPI_MODE_BLOCKING, so minDmaTransferSize selects nothing there --
+		 * the 4-byte headers and 8-byte replies that succeed in the same run would
+		 * otherwise be polled too.  The matching byte count is a coincidence. */
 		params.transferMode    = SPI_MODE_BLOCKING;
 		params.transferTimeout = SPI_WAIT_FOREVER;
 	} else {
