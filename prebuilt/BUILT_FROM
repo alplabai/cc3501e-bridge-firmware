@@ -56,7 +56,7 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   5d75e281a3e1d2159c0b991c9ac89db2434d70c8
+built-from:   d53a728cc6f9bea9073f349a4a39147f17412898
 image-sha256: 1928b7d89d22f53ac69c36843c2fec631499fa7bf88f9adaf7fde74c9af15182
 raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
 
@@ -91,12 +91,6 @@ gpe-floor:    0.149.200.0
 # blob, and naming a commit without it would be off by the one field a
 # consumer reads back over GET_DIAG_INFO to identify what it is running.
 # Measured on silicon after the bump: fw_version=0x0800.
-#
-# !! THIS IS A BRANCH SHA AND MUST BE REPOINTED AFTER THE SQUASH MERGE.
-# This repo squash-merges, and this file's own header records the incident
-# where a pre-squash SHA here reddened every later PR until it was repointed.
-# The moment this lands on main, replace it with the squash commit's SHA --
-# same blob, same hashes, just the SHA main actually has.
 #
 # The gpe-floor moved 0.149.92.0 -> 0.149.200.0 in this same commit, and it
 # had to: the wire-MAJOR-4 / CRC campaign flashed e1m-aen-evk-01 up through
