@@ -97,11 +97,12 @@ gpe-floor:    0.149.92.0
 # names as the failure mode that lets a real staleness get waved through. The two
 # have to move together, and moving the blob means RE-WRAPPING it.
 #
-# That re-wrap needs the production signing key, which is deliberately not on any
-# build host (keys/README.md: the validation keypair staged for bench work is
-# "Not a production root-of-trust anchor"). Re-wrapping the customer-facing
-# artifact with the VALIDATION key would swap a production blob for a bench-signed
-# one, so it was not done.
+# The re-wrap simply has not been done yet. An earlier revision of this note
+# gave a reason here that was wrong on the facts -- see keys/README.md's own
+# opening sentence and BUILD_RECIPE.md's stage 2 for how blobs in this
+# directory are actually produced. Nothing structural is in the way; the
+# re-wrap is waiting on the release being ready to cut, and on the bench
+# result that gates it.
 #
 # TO CLEAR THIS: cut a release -- re-wrap the shipped prebuilt at a stamp above
 # 0.149.200.0, update built-from / image-sha256 / raw-sha256, delete
