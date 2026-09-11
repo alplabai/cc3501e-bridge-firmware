@@ -355,6 +355,38 @@ jobs:
           done
           exit $rc
 
+      # The .sha256 sidecar above only proves the blob matches a number that
+      # sits beside it in the same commit, so anyone who can change the blob
+      # can change the number.  The .sig sidecar is the half that cannot be
+      # forged without the vendor VALIDATION private key, which is deliberately
+      # never on any build host -- and until #116 nothing checked it.  A
+      # re-wrap of v0.8.0 replaced the blob, updated the .sha256, and left the
+      # signature describing the previous bytes; the manifest check above went
+      # green on that pair, because it was consistent, and only a hand-run
+      # openssl caught the stale signature.  A signature nobody verifies is
+      # worse than no signature: it is a claim that reads as checked.
+      - name: verify each prebuilt's detached signature
+        run: |
+          set -euo pipefail
+          rc=0
+          pub=keys/alp_cc3501e_vendor_VALIDATION_public.pem
+          if [ ! -f "$pub" ]; then
+            echo "::error::$pub is missing -- no prebuilt signature can be checked"; exit 1
+          fi
+          for bin in prebuilt/cc3501e-*.bin; do
+            [ -e "$bin" ] || continue
+            sig="$bin.sig"
+            if [ ! -f "$sig" ]; then
+              echo "::error::$bin has no $sig"; rc=1; continue
+            fi
+            if openssl dgst -sha256 -verify "$pub" -signature "$sig" "$bin" >/dev/null 2>&1; then
+              echo "ok  $bin  signature verifies against $pub"
+            else
+              echo "::error::$bin signature does NOT verify against $pub -- the blob, the signature or both are wrong"; rc=1
+            fi
+          done
+          exit $rc
+
       # A blob's KIND matters as much as its hash.  prebuilt/ has shipped two
       # of them under one naming scheme -- a raw build_ti.ps1 image and a TI
       # flash-images-builder vendor_image -- and README's recipe copies the

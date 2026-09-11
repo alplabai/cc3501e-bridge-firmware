@@ -9,8 +9,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## v0.8.0
 
-GPE: `0.149.200.0`. Wire protocol: `4.0`. sha256
-`1928b7d89d22f53ac69c36843c2fec631499fa7bf88f9adaf7fde74c9af15182`.
+GPE: `0.149.222.0`. Wire protocol: `4.0`. sha256
+`c63fcbadf1e71a57ec9bf8282008140bd5e33ae9f50a46bb94467e0a9803d94f`.
+
+**Re-wrapped at `0.149.222.0`, up from the `0.149.200.0` this release was
+first cut at.** Bench unit `2026W36-0003` has since been flashed at
+`0.149.220.0`, and the CC35 secure boot loader enforces GPE monotonicity per
+part: the original blob would stream clean onto that unit, exit 0, and then
+refuse to boot -- a dead link, permanently, for that part. Only the four-byte
+version field, the SHA-256 TLV and the signature TLV differ; all 118 differing
+bytes are accounted for and the stage-1 raw image is byte-identical
+(`raw-sha256` unchanged, rebuilt and confirmed from `d53a728`). Same firmware,
+new stamp -- the same pairing v0.6.0's `0.149.76.0` -> `0.149.90.0` re-wrap
+records below.
 
 **The wire carries a CRC-16/CCITT-FALSE trailer on every frame, both
 directions** (MAJOR 4). It exists because a dead SPI phase was observed on real
