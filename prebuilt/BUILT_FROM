@@ -80,14 +80,15 @@ raw-sha256:   baa8a7b723435328fdc855267fa128e3e87d66f901c6fa233d61e5fc311dda90
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
 gpe-floor:    0.149.92.0
 
-# !! THIS FLOOR IS STALE AND CANNOT BE RAISED WITHOUT THE HSM. READ THIS BEFORE
+# !! THIS FLOOR IS STALE. READ THIS BEFORE
 # !! CHOOSING A VERSION FOR ANY FLASH.
 #
 # MEASURED bench reality, 2026-09-10: e1m-aen-evk-01 (E1M-AEN803, serial
-# 2026W36-0003) has been flashed up to 0.149.151.0 during the wire-MAJOR-4 /
+# 2026W36-0003) has been flashed up to 0.149.200.0 during the wire-MAJOR-4 /
 # CRC campaign -- the sequence ran 0.149.100.0, .101.0, .102.0, .110.0, .130.0,
-# .150.0, .151.0. So on THAT part the true floor is 0.149.151.0, and the
-# shipped prebuilt below (0.149.92.0) is already unflashable on it.
+# .150.0, .151.0 and .200.0 (the v0.8.0 release candidate). So on THAT part the
+# true floor is 0.149.200.0, and the shipped prebuilt below (0.149.92.0) is
+# already unflashable on it.
 #
 # Why the machine-read line above was NOT bumped to match: check_prebuilt_kind.py
 # asserts the newest WRAPPED blob clears this floor, and prebuilt/cc3501e-v0.7.0.bin
@@ -103,10 +104,10 @@ gpe-floor:    0.149.92.0
 # one, so it was not done.
 #
 # TO CLEAR THIS: cut a release -- re-wrap the shipped prebuilt at a stamp above
-# 0.149.151.0 with the HSM, update built-from / image-sha256 / raw-sha256, delete
+# 0.149.200.0, update built-from / image-sha256 / raw-sha256, delete
 # the inert: lines, and raise gpe-floor in the same change.
 #
-# UNTIL THEN, for anyone picking a VERSION: 0.149.151.0 is the number that
+# UNTIL THEN, for anyone picking a VERSION: 0.149.200.0 is the number that
 # matters for evk-01, not the 0.149.92.0 above. Anything at or below a part's
 # own last-seen stamp streams clean, exits 0, and then refuses to boot --
 # permanently, for that part.
