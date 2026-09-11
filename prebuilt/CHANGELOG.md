@@ -7,6 +7,54 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.8.0
+
+GPE: `0.149.200.0`. Wire protocol: `4.0`. sha256
+`1928b7d89d22f53ac69c36843c2fec631499fa7bf88f9adaf7fde74c9af15182`.
+
+**The wire carries a CRC-16/CCITT-FALSE trailer on every frame, both
+directions** (MAJOR 4). It exists because a dead SPI phase was observed on real
+silicon returning `RESP_OK` with a corrupted payload: the old `RESP_OK` of
+`0x00` is exactly what a dead phase clocks back for every byte it touches, so a
+total transport failure was indistinguishable from success. `RESP_OK` is now
+`0x5A` and the CRC makes corruption detectable rather than silently accepted.
+
+**`CC3501E_WIRE_CRC` makes that a build option, and it is a wire-major
+selector rather than a cosmetic toggle.** ON (default) is MAJOR 4. OFF reports
+MAJOR 3 and is byte-identical to the 3.1 wire — proven against a real pre-4.0
+build, 31 of 31 shared vectors matching. A `_Static_assert` enforces the
+pairing: an OFF build that still reported 4 would tell a MAJOR-4 host to append
+CRCs this firmware ignores and demand CRCs it never sends, which is a silent,
+total link failure that looks like a hardware fault. Turning it off removes the
+dead-phase guard, which is why it is not the default.
+
+**The fix that made 4.0 work at all.** The 256-entry CRC table was built lazily
+on first use, and first use is `protocol_build_reply()` servicing request one —
+inside the SPI interrupt handler. That is roughly 100 us at this core's 160 MHz,
+against a host reply-header gate that is a blind fixed 200 us already mostly
+spent on normal dispatch. Frame one overshot it: the host clocked into a slave
+with nothing armed, those bytes sat in the RX FIFO, and every later transfer
+returned the previous phase's bytes — a permanent one-transfer lag that no
+retry clears. The table is now built on the boot path, before the slave is
+armed. Without this, every opcode returned `-5` and the part looked dead while
+it was answering the whole time.
+
+Verified on an E1M-AEN803 (serial `2026W36-0003`) across 48 cold-cycled runs:
+`GET_VERSION` reports `protocol v4.0 ... match`, `fw_version=0x0800` read back
+over `GET_DIAG_INFO`, and `PING`, `GET_MAC`, `GET_CAPABILITIES`,
+`WIFI_SCAN_START` and `BLE_ENABLE` all return `0`.
+
+**Known limitation, not a regression from v0.7.0.** The link can wedge during a
+session: a transport desync after which every opcode fails until a cold cycle,
+observed at roughly 7 runs in 24 with default host settings. It is host-side and
+predates this release. alp-sdk provides two mitigations,
+`CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS` and
+`CONFIG_ALP_SDK_CC3501E_POST_SUCCESS_GUARD_MS`; with them at 50 and 20 the
+failure did not recur in 24 runs (Fisher one-sided p = 0.0047, 95% upper bound
+on the residual rate 11.7%). Both default to a no-op, so a host that wants the
+mitigation must opt in. A large `STREAM_WRITE` also wedges the link — 64 B and
+256 B pass, 1024 B and 4092 B do not — and that is still open.
+
 ## v0.7.0
 
 Three landings since v0.6.0, none of which were in a shipped artifact until now.
