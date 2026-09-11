@@ -44,6 +44,38 @@ Verified on an E1M-AEN803 (serial `2026W36-0003`) across 48 cold-cycled runs:
 over `GET_DIAG_INFO`, and `PING`, `GET_MAC`, `GET_CAPABILITIES`,
 `WIFI_SCAN_START` and `BLE_ENABLE` all return `0`.
 
+**`WIFI_CONNECT_STA` (0x12) IS NOT VERIFIED IN THIS RELEASE. Do not assume it
+works.** The verification list above is exhaustive — `PING`, `GET_VERSION`,
+`GET_MAC`, `GET_CAPABILITIES`, `WIFI_SCAN_START`, `BLE_ENABLE` — and station
+association is deliberately absent from it.
+
+Seven cold-booted attempts against a WPA3 AP at -79 dBm on 2026-09-11 never
+completed an association, and no bridge exchange succeeded for 95 seconds
+afterwards, while `PING` had answered on the first attempt moments earlier.
+The radio's own verdict was never readable, so whether the association itself
+would have succeeded is still unknown.
+
+Two structural findings from that investigation, neither fixed here:
+
+- This image does not call `cc3501e_hw_wifi_boot_start()` (see `src/main.c`),
+  so the STA role is NOT brought up at boot. A `WIFI_CONNECT_STA` issued as
+  the first radio operation therefore carries `Wlan_Start`, a `Wlan_Set` and a
+  10 s `Wlan_RoleUp` *inside* the connect body, on top of the 30 s association
+  wait and 10 s DHCP. Bounded pieces alone exceed 50 s, and four of those
+  calls have no bound in our source at all.
+- `cc3501e_hw_wifi_connect_sta()` skips the `bridge_transport_spi_hw_suspend()`
+  bracket that the boot path uses around `Wlan_RoleUp`, on the stated premise
+  that the role is "pre-cached at boot" — which the point above makes false on
+  this image.
+
+Also note `Wlan_Disconnect()` now runs on every connect failure exit. It was
+added after the last time station association was bench-proven, and it takes
+no timeout parameter.
+
+If you need station mode, call `GET_MAC` and `WIFI_SCAN_START` first — both
+are verified — which moves `Wlan_Start` and the role transition out of the
+connect body, and budget well beyond 40 s for the connect itself.
+
 **Known limitation, not a regression from v0.7.0.** The link can wedge during a
 session: a transport desync after which every opcode fails until a cold cycle,
 observed at roughly 7 runs in 24 with default host settings. It is host-side and
