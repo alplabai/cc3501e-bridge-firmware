@@ -4,73 +4,85 @@
 # (tests/zephyr/cc3501e_bridge_transport/) and any future host-driver
 # tests (tests/zephyr/chips/cc3501e/), so the two sides cannot diverge.
 #
-# Frame: 4-byte LE header [cmd | flags | payload_len(LE16)] + payload.
-# No SOF, no CRC.  Reply payload[0] is the response status.
+# Frame: 4-byte LE header [cmd | flags | payload_len(LE16)] + payload.  No
+# SOF.  Wire MAJOR 4 (#2035) adds a mandatory 2-byte CRC-16/CCITT-FALSE
+# trailer to every frame, both directions, INSIDE payload_len -- see
+# src/protocol.c's protocol_build_reply().  CMD_GET_VERSION is the ONE
+# opcode accepted with or without that trailer (a host cannot know to send
+# one before GET_VERSION has told it the peer's wire major); every other
+# opcode requires it unconditionally.  Reply payload[0] is the response
+# status; RESP_OK is 0x5A as of wire MAJOR 4 (was 0x00).
 #
 # Format: one `<name> = <hex>` vector per non-comment line; `#` comments.
 # Regenerate with `python3 firmware/cc3501e/tests/gen_protocol_vectors.py`.
 
 # cmd=PING | flags=0 | len=0
-ping_request                       = 00000000
+ping_request                       = 00000200A2E2
 # cmd=PING | flags=0 | len=1 | status=OK
-ping_reply_ok                      = 000008000000000000000000
-# cmd=GET_VERSION | flags=0 | len=0
-get_version_request                = 01000000
-# cmd=GET_VERSION | len=3 | status=OK | wire=3.1 = 0x0301 (LE16)
-get_version_reply_wire3_1          = 010008000001030000000000
-# cmd=GET_VERSION | status=OK | legacy pre-ADR-0033 firmware: raw 9 -> major 0
+ping_reply_ok                      = 000008005A00000000007509
+# cmd=GET_VERSION | flags=0 | len=0 -- the CRC-less bootstrap shape every host sends before it knows the peer's wire major; accepted, not rejected, in BOTH the CRC-on and CRC-off (legacy) builds
+get_version_request_no_crc         = 01000000
+# cmd=GET_VERSION | flags=0 | len=2 (CRC only, no logical payload) -- the MAJOR-4-negotiated shape; ALSO accepted by a CRC-off (legacy) build, so a host with stale cached state can still rediscover a downgraded board
+get_version_request_crc            = 010002001694
+# cmd=GET_VERSION | len=3 | status=OK | wire=4.0 = 0x0400 (LE16)
+get_version_reply_wire4_0          = 010008005A0004000000C1AC
+# cmd=GET_VERSION | status=OK(legacy 0x00) | pre-ADR-0033 firmware (predates even the MAJOR.MINOR scheme, not just the CRC trailer): raw 9 -> major 0, no CRC trailer
 get_version_reply_legacy_raw_v9    = 010008000009000000000000
 # cmd=GET_CAPABILITIES | flags=0 | len=0
-get_capabilities_request           = 06000000
+get_capabilities_request           = 060002003BC5
 # cmd=GET_CAPABILITIES | status=OK | caps=0x00000C00 (EVENTS|DIAG_STATS -- the stub backend implements nothing else)
-get_capabilities_reply_stub_build  = 0600100000000C00000000000000000000000000
+get_capabilities_reply_stub_build  = 060010005A000C0000000000000000000000D880
 # cmd=GET_MAC | flags=0 | len=0
-get_mac_request                    = 03000000
+get_mac_request                    = 030002007E79
 # cmd=GET_MAC | len=1 | status=BUSY -- job submitted, host re-issues
-get_mac_reply_busy_submitted       = 030008000200000000000000
+get_mac_reply_busy_submitted       = 030008000200000000006CC5
 # cmd=GET_MAC | len=1 | status=NOT_READY -- re-issued; stub has no radio
-get_mac_reply_not_ready_stub       = 030008000500000000000000
+get_mac_reply_not_ready_stub       = 030008000500000000002D0D
 # cmd=RESET | flags=0 | len=0
-reset_request                      = 02000000
+reset_request                      = 02000200CA0F
 # cmd=RESET | len=1 | status=OK -- firmware reboots after the ack is read
-reset_reply_ok                     = 020008000000000000000000
+reset_reply_ok                     = 020008005A0000000000FFD7
 # cmd=WIFI_SCAN_START | len=1 | status=INVALID -- v1 opcode not implemented in v0.1
-wifi_scan_start_reply_invalid      = 100008000100000000000000
+wifi_scan_start_reply_invalid      = 10000800010000000000D52E
 # cmd=SOCK_OPEN | len=4 | family=IPV4 type=STREAM proto=0
-sock_open_tcp_request              = 2000040000000000
+sock_open_tcp_request              = 2000060000000000B7C7
 # cmd=SOCK_OPEN | len=1 | status=BUSY -- job submitted, host re-issues
-sock_open_reply_busy_submitted     = 200008000200000000000000
+sock_open_reply_busy_submitted     = 20000800020000000000AE4D
 # cmd=SOCK_OPEN | len=1 | status=NOT_READY -- re-issued; stub has no IP stack
-sock_open_reply_not_ready_stub     = 200008000500000000000000
+sock_open_reply_not_ready_stub     = 20000800050000000000EF85
 # cmd=SOCK_CLOSE | len=4 | handle=1
-sock_close_request                 = 2400040001000000
+sock_close_request                 = 24000600010000006EBE
 # cmd=SOCK_OPEN | len=1 | status=INVALID -- payload length != sizeof(sock_open_t)
-sock_open_bad_len_reply_invalid    = 200008000100000000000000
+sock_open_bad_len_reply_invalid    = 200008000100000000004E83
 # cmd=SOCK_BIND | len=24 | handle=1 family=IPV4 port=80 addr=INADDR_ANY
-sock_bind_request                  = 25001800010000000000500000000000000000000000000000000000
+sock_bind_request                  = 25001A0001000000000050000000000000000000000000000000000028EA
 # cmd=SOCK_BIND | len=1 | status=BUSY -- job submitted, host re-issues
-sock_bind_reply_busy_submitted     = 250008000200000000000000
+sock_bind_reply_busy_submitted     = 25000800020000000000DE8F
 # cmd=SOCK_LISTEN | len=4 | handle=1 backlog=4
-sock_listen_request                = 2600040001000400
+sock_listen_request                = 26000600010004000CFD
 # cmd=SOCK_LISTEN | len=1 | status=NOT_READY -- re-issued; stub has no IP stack
-sock_listen_reply_not_ready_stub   = 260008000500000000000000
+sock_listen_reply_not_ready_stub   = 2600080005000000000050F6
 # cmd=SOCK_LISTEN | len=1 | status=INVALID -- handle 0 is never valid
-sock_listen_handle_zero_reply_invalid = 260008000100000000000000
+sock_listen_handle_zero_reply_invalid = 26000800010000000000F1F0
 # cmd=WIFI_GET_IP | len=0 | pre-v9 form, still means STA
-wifi_get_ip_request_sta_legacy     = 17000000
+wifi_get_ip_request_sta_legacy     = 1700020028A8
 # cmd=WIFI_GET_IP | len=1 | iface=AP (v9)
-wifi_get_ip_request_ap             = 1700010001
+wifi_get_ip_request_ap             = 1700030001F33B
 # cmd=GET_PENDING_EVENTS | flags=0 | len=0
-get_pending_events_request         = 05000000
+get_pending_events_request         = 05000200E75E
 # cmd=GET_PENDING_EVENTS | len=1 | status=OK | no events queued
-get_pending_events_reply_empty     = 050008000000000000000000
+get_pending_events_reply_empty     = 050008005A000000000005CB
 # cmd=GET_PENDING_EVENTS | status=OK | [WIFI_CONNECTED len0][WIFI_DISCONNECTED len0]
-get_pending_events_reply_wifi_conn_disc = 050008000019001A00000000
+get_pending_events_reply_wifi_conn_disc = 050008005A19001A000081E3
 # cmd=GET_PENDING_EVENTS | status=OK | [SOCK_ACCEPTED len12 listen=1 handle=2 port=54321 192.168.1.14]
-get_pending_events_reply_sock_accepted = 05001000002C0C0100020031D40000C0A8010E00
+get_pending_events_reply_sock_accepted = 050018005A2C0C0100020031D40000C0A8010E000000000000009A2C
 # cmd=SPI1_TRANSFER | len=4 flags=0 seq=1 tx_fill=0 | tx=DEADBEEF packed inline, no padding
-spi1_transfer_request              = 56000C000400000100000000DEADBEEF
+spi1_transfer_request              = 56000E000400000100000000DEADBEEF3FC7
 # cmd=SPI1_TRANSFER | status=OK | rx_len=4 flags=0 seq=1 | rx=DEADBEEF, self-delimiting before the REPLY_PAD padding
-spi1_transfer_reply_ok             = 560010000004000001DEADBEEF00000000000000
+spi1_transfer_reply_ok             = 560010005A04000001DEADBEEF0000000000846B
 # reply to a frame whose payload_len mismatches the byte count -> PROTOCOL error
-ping_bad_len_reply_protocol        = 000008000700000000000000
+ping_bad_len_reply_protocol        = 00000800070000000000A237
+# cmd=PING | flags=0 | len=0 -- a 3.1-shaped (no-CRC) request to a NON-GET_VERSION opcode on a CRC-on build; rejected with RESP_ERR_PROTOCOL, never executed (contrast get_version_request_no_crc above, the one opcode this DOES accept, and the CRC-off build's ping_request, which is this exact shape and IS executed)
+ping_request_no_crc_reply_protocol = 00000000
+# cmd=PING | flags=0 | len=2 | crc=deliberately wrong -- a PRESENT but corrupted CRC (link corruption, not a missing trailer); also rejected with RESP_ERR_PROTOCOL
+ping_request_corrupted_crc         = 000002005D1D

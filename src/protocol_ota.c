@@ -40,7 +40,14 @@ alp_cc3501e_resp_t handle_ota_write(const uint8_t *req,
 	(void)reply_data;
 	(void)reply_cap;
 	*reply_data_len = 0u;
-	if (req_len < 5u || req_len > (size_t)(4u + ALP_CC3501E_OTA_MAX_CHUNK)) {
+	/* CC3501E_OTA_MAX_CHUNK_V4 (protocol.h), not the header's
+	 * ALP_CC3501E_OTA_MAX_CHUNK -- wire MAJOR 4's mandatory 2-byte request CRC
+	 * trailer rides inside the same ALP_CC3501E_MAX_PAYLOAD-bounded payload_len
+	 * a maxed-out chunk already saturates.  Not the binding case in practice
+	 * (the host streams OTA_WRITE in fixed 256-byte chunks -- chips/cc3501e/
+	 * cc3501e_ota.c), but the bound is wrong by 2 bytes without this, same as
+	 * SPI1_TRANSFER's, so it moves in lockstep for defence in depth. */
+	if (req_len < 5u || req_len > (size_t)(4u + CC3501E_OTA_MAX_CHUNK_V4)) {
 		return ALP_CC3501E_RESP_ERR_INVALID;
 	}
 	const uint32_t offset = get_le32(&req[0]);

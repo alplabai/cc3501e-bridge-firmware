@@ -70,8 +70,12 @@ target_include_directories(ztest_shim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # a silent conversion warning in the firmware sources is exactly that class.
 set(TEST_FLAGS -std=c11 -Wall -Wextra -Werror)
 
-add_executable(test_transport_spi
-    transport_spi/src/test_transport_spi.c
+# Shared by both configurations below -- CC3501E_WIRE_CRC (CMakeLists.txt,
+# customer-selectable) is a #if branch INSIDE these same sources
+# (src/protocol.c, src/protocol_meta.c), not a different set of files, so
+# both targets compile this identical list and differ only in which value
+# they define it to and which test file drives them.
+set(FW_SOURCES
     ${FW}/src/transport_spi.c
     ${FW}/src/transport_sdio.c
     ${FW}/src/protocol.c
@@ -89,13 +93,46 @@ add_executable(test_transport_spi
     ${FW}/src/event_ring.c
     ${FW}/hal/cc3501e_hw_stub.c
 )
+
+add_executable(test_transport_spi
+    transport_spi/src/test_transport_spi.c
+    ${FW_SOURCES}
+)
 target_include_directories(test_transport_spi PRIVATE
     ${FW}/src
     ${FW}/hal
     ${ALP_SDK_ROOT}/include
 )
 target_compile_definitions(test_transport_spi PRIVATE
-    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16})
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    # Explicit, not left to src/protocol.h's #ifndef fallback, so this
+    # target keeps exercising the default (CRC-on) shape even if that
+    # fallback's default is ever changed.
+    CC3501E_WIRE_CRC=1)
 target_compile_options(test_transport_spi PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_transport_spi PRIVATE ztest_shim)
 add_test(NAME transport_spi COMMAND test_transport_spi)
+
+# CC3501E_WIRE_CRC=OFF coverage: the byte-identical-to-3.1 shape.  A separate
+# executable (ztest's shim registers cases as file-scope constructors --
+# tests/unit/transport_spi/src/test_transport_spi.c's ~50 CRC-on-shaped
+# cases cannot also run against CC3501E_WIRE_CRC=0 sources without a full
+# rewrite of every transaction(), which is out of proportion to what this
+# build option needs proving); this one is deliberately small and pins only
+# the behaviour that is DIFFERENT under CC3501E_WIRE_CRC=0 -- see the test
+# file's own top comment.
+add_executable(test_transport_spi_no_crc
+    transport_spi/src/test_transport_spi_no_crc.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_transport_spi_no_crc PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_transport_spi_no_crc PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=0)
+target_compile_options(test_transport_spi_no_crc PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_transport_spi_no_crc PRIVATE ztest_shim)
+add_test(NAME transport_spi_no_crc COMMAND test_transport_spi_no_crc)

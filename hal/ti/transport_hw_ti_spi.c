@@ -910,11 +910,30 @@ static bool spi_open_and_arm(void)
 		 * terms must hold; WAIT_FOREVER means a polled transfer blocks until the
 		 * host clocks it, which is why only the dedicated update-mode loop may
 		 * drive this mode.  minDmaTransferSize is hard-emitted as 10 by SysConfig
-		 * with no property to override it, so ti/build_ti.ps1 patches the generated
-		 * ti_drivers_config.c to 1024 -- that ceiling must clear the largest frame
-		 * the protocol allows, ALP_CC3501E_HEADER_BYTES + ALP_CC3501E_MAX_PAYLOAD =
-		 * 4 + 512 = 516 B.  Never trim it toward the ~260 B that today's 256-byte
-		 * host OTA chunk happens to produce. */
+		 * with no property to override it, so ti/build_ti.{ps1,sh} patch the
+		 * generated ti_drivers_config.c to 1024.  Never trim that toward the
+		 * ~260 B that today's 256-byte host OTA chunk happens to produce.
+		 *
+		 * BUT 1024 NO LONGER CLEARS THE LARGEST LEGAL FRAME, and the arithmetic
+		 * that used to justify it here was stale.  It read "ALP_CC3501E_HEADER_BYTES
+		 * + ALP_CC3501E_MAX_PAYLOAD = 4 + 512 = 516 B" -- MAX_PAYLOAD is 4096 now,
+		 * so the real ceiling is 4 + 4096 = 4100 B, eight times the figure quoted.
+		 * frame_buf/reply_buf are sized from CC3501E_FRAME_MAX_BYTES and are
+		 * genuinely 4100, so nothing overruns; what is wrong is only the claim
+		 * that 1024 "clears" anything.
+		 *
+		 * The consequence is confined to THIS branch, update mode: any polled-boot
+		 * frame phase with count >= 1024 silently takes the DMA-blocking path
+		 * instead of the polling path this comment intends.  Measured 2026-08-26,
+		 * ~1070 OTA_WRITE payload phases of 1028 B completed that way, so it works
+		 * -- but it is not what the surrounding text says is happening.
+		 *
+		 * Do NOT read this as the cause of the normal-mode wedge at 1024-byte
+		 * STREAM_WRITE.  That was investigated and the link is refuted: outside
+		 * update mode the slave opens SPI_MODE_CALLBACK, and the polling branch
+		 * needs SPI_MODE_BLOCKING, so minDmaTransferSize selects nothing there --
+		 * the 4-byte headers and 8-byte replies that succeed in the same run would
+		 * otherwise be polled too.  The matching byte count is a coincidence. */
 		params.transferMode    = SPI_MODE_BLOCKING;
 		params.transferTimeout = SPI_WAIT_FOREVER;
 	} else {
@@ -956,6 +975,74 @@ static bool spi_open_and_arm(void)
 	}
 	g_spi_open_failed = 0u;
 
+	/* Discard everything the host clocked while the slave was DOWN.
+	 *
+	 * Every caller of bridge_transport_spi_hw_reinit() closes the SPI and
+	 * re-opens it here, and the host is NOT held off across that window: the
+	 * cc3501e_bridge_busy() fence upstream drives READY, which is an OPEN
+	 * CONNECTION on the bench unit (0 edges in 20000 samples during live
+	 * traffic -- see chips/cc3501e/cc3501e_core.c). So the host keeps clocking
+	 * straight through the teardown, and those bytes are stale by definition.
+	 *
+	 * Without this flush they sit in the RX FIFO and satisfy the FIRST armed
+	 * transfer below without the host clocking it, which arms the next phase
+	 * behind bytes still in the TX FIFO -- from then on every host transceive
+	 * returns the PREVIOUS phase's bytes. That is the same permanent
+	 * one-transfer MISO lag the lazy CRC-table build caused, reached by a
+	 * different door.
+	 *
+	 * It is not hypothetical. BLE_ENABLE does a pre-op reinit (see
+	 * cc3501e_hw_ti_ble.c) that lands 1-15 ms after the host's request, inside
+	 * its densest poll window where frames are ~1 ms long -- so it collides
+	 * intermittently. Measured on an E1M-AEN801 2026-09-10: 1 of 3 cold-booted
+	 * runs failed with BLE_ENABLE -> -4 and a following PING -> -5. GET_MAC and
+	 * WIFI_SCAN_START reinit only AFTER seconds of radio work, when the host has
+	 * backed off to a 50 ms cadence, which is why they never showed this.
+	 *
+	 * The polled path already does exactly this at its frame boundary (see
+	 * bridge_transport_spi_poll_service()); the callback path had no equivalent.
+	 * Safe here specifically because this is worker/boot context with nothing in
+	 * flight -- do NOT move it into on_transfer()/arm_request_header(), which run
+	 * in the SPI ISR where the added latency would recreate the very overshoot
+	 * this is cleaning up after.
+	 *
+	 * spi_fifo_reset() leaves the IP DISABLED (FIFORST only takes while it is),
+	 * and its own comment establishes that SPI_transfer re-enables it only for
+	 * the POLLING path. Re-enable explicitly rather than assume the callback/DMA
+	 * path does the same -- isSPIEnabled reads the register, so the driver cannot
+	 * be holding a stale "already on". */
+	/* DO NOT flush the FIFOs or touch CTL1.EN here.  Both were tried on
+	 * 2026-09-10 and the enable was a REGRESSION; the premise behind them was
+	 * simply false.
+	 *
+	 * The premise was that host bytes clocked while the slave is down survive
+	 * in the RX FIFO across bridge_transport_spi_hw_reinit()'s close/re-open
+	 * and then satisfy the first armed transfer.  They cannot: SPIWFF3DMA_close
+	 * disables the IP as its first act, and SPIWFF3DMA_open -> initHw runs
+	 * flushFifos() and disableSPI() again.  The IP is OFF from the close
+	 * through to the DMA prime, so those bytes are dropped at the pad, not
+	 * latched.  A flush here is dead code -- it even re-reads an RXOVF latch
+	 * initHw just cleared, so it can never count anything.
+	 *
+	 * Setting CTL1.EN here is actively harmful.  The driver enables the IP
+	 * inside SPI_transfer -> primeTransfer, AFTER configNextTransfer and
+	 * immediately before startDmaTransaction, under HwiP_disable.  Pre-enabling
+	 * leaves the slave LIVE with no DMA primed across arm_transfer's alignment
+	 * checks, the power constraint, the interrupt setup and two DMA channel
+	 * connects -- and primeTransfer's own enableSPI() is then a no-op because it
+	 * reads the register first.  READY is an open connection on this unit, so
+	 * the host free-runs straight into that window; the bytes it clocks are
+	 * drained the instant RX DMA starts, the header transfer "completes"
+	 * without the host clocking it, and the slave is left permanently one phase
+	 * ahead.  Measured: the failure moved four calls upstream to the GET_MAC
+	 * re-read and became reproducible rather than intermittent.
+	 *
+	 * The genuinely vulnerable window is elsewhere and is NOT fixable here: the
+	 * driver keeps the peripheral enabled after a completed transfer with
+	 * nothing queued, so bytes clocked between completion and on_transfer()'s
+	 * re-arm do land in the FIFO.  That is a per-phase SWI-latency window --
+	 * shrinking ISR work (see protocol_crc16_table_init) is what helps it. */
+
 	/* RETURN_PARTIAL is intentionally NOT enabled.  With hardware SS0 (the Alif master
 	 * drives the per-transfer chip-select) each phase's transfer completes on its byte
 	 * count -- on_transfer advances on SPI_TRANSFER_COMPLETED before the SS0 deasserts.
@@ -964,6 +1051,22 @@ static bool spi_open_and_arm(void)
 	 * again and stall the host's per-request READY gate (-3 BUSY).  Bench-proven. */
 
 	g_resync_count = 0u;
+
+	/* Build the wire-CRC table BEFORE the first frame can arrive.
+	 *
+	 * It used to be built lazily inside protocol_build_reply(), i.e. in SPI
+	 * interrupt context while servicing request one -- ~100 us at 160 MHz on
+	 * top of normal dispatch, against the host's BLIND fixed 200 us
+	 * reply-header gate.  Overshooting that gate once is permanent: the host
+	 * clocks 4 bytes into a slave with nothing armed, they sit in the RX FIFO,
+	 * and every later transfer then returns the PREVIOUS phase's TX bytes.
+	 * Root-caused on silicon 2026-09-10 -- every opcode returned -5 with the
+	 * previous request's reply header sitting in the host's rx_scratch.
+	 *
+	 * Must stay ahead of arm_request_header(): after that line the host may
+	 * clock at any moment. */
+	protocol_crc16_table_init();
+
 	return arm_request_header();
 }
 

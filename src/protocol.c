@@ -47,6 +47,120 @@
 #include <stdbool.h>
 #include <string.h>
 #include "protocol_internal.h"
+#include "alp/protocol/crc16.h"
+
+/* --------------------------------------------------------------- */
+/* Wire MAJOR 4 (#2035): table-driven CRC-16/CCITT-FALSE              */
+/* --------------------------------------------------------------- */
+/*
+ * protocol_build_reply() below runs from the SPI-slave callback (ISR
+ * context; hal/ti/transport_hw_ti_spi.c's on_transfer() -> dispatch_frame()
+ * -> protocol_build_reply()), and it now CRCs BOTH the incoming request and
+ * the outgoing reply on every single frame.  A maximum-size frame -- a full
+ * ALP_CC3501E_SPI1_MAX_XFER chunk, ~4096 bytes -- would run the bitwise
+ * per-bit loop in <alp/protocol/crc16.h> (the canonical, single-source
+ * algorithm both this firmware and the alp-sdk host driver share) roughly
+ * 4096 * 8 conditional shift/xor iterations.  Measured on comparable
+ * Cortex-M cores that inner loop costs on the order of 6-8 cycles per BIT
+ * once the compare/branch/shift chain is accounted for, i.e. ~50-65 cycles
+ * per byte -- crc16.h's own comment gives ~640 cycles for an 8..16-byte
+ * reply, which is consistent (640 / 12 =~ 53 cycles/byte).  At ~55
+ * cycles/byte, 4096 bytes is ~225,000 cycles: at ANY plausible CC3501E
+ * M33 core clock (80..200 MHz) that is 1.1..2.8 ms -- 4x to 11x OVER the
+ * CC3501E_PHASE_SETTLE_US 250 us inter-phase settle budget the host's
+ * cc3501e_core.c gates every phase on.  Bitwise is fine for the crc16.h
+ * comment's "typical 8..16-byte reply" case, silently wrong for the SPI1
+ * chunk case this same ISR is now on the hook for.
+ *
+ * A standard 256-entry, LE16 lookup table turns that into one table lookup
+ * + one xor + one 8-bit shift per byte -- 3-4 cycles/byte on a
+ * single-cycle-SRAM load -- so the same 4096-byte worst case costs
+ * ~12,000-16,000 cycles, i.e. 60-200 us even at the low end of the clock
+ * range: comfortably inside the 250 us budget with margin, where the
+ * bitwise form was not.  512 bytes (256 entries * sizeof(uint16_t)) is
+ * negligible against this firmware's 512 KB DRAM budget (BRINGUP_STATUS.md
+ * -- multiple existing MAX_PAYLOAD-sized (4096 B) buffers already fit
+ * comfortably; see e.g. worker.c's job.req/result and
+ * transport_hw_ti_spi.c's dummy_tx_zero) and is kept in DRAM (plain
+ * non-const array, filled once at first use rather than linked into flash)
+ * specifically so a table lookup never waits on a flash access cycle from
+ * inside the ISR.
+ *
+ * GENERATED, NOT HAND-DERIVED, from the SAME canonical bitwise routine --
+ * crc16_table_init() below calls alp_crc16_ccitt_false_update() itself, so
+ * there is exactly one algorithm in this codebase (the shared header's) and
+ * the table is provably a lookup-accelerated view of it, not a second,
+ * independently-typed implementation that could silently drift.  See
+ * tests/unit/transport_spi's test_wire_major4_crc_contract for the one
+ * runnable check that this firmware's table-driven output and the
+ * canonical bitwise alp_crc16_ccitt_false() agree on the same reply. */
+static uint16_t crc16_table[256];
+static bool     crc16_table_ready;
+
+static void crc16_table_init(void)
+{
+	for (unsigned i = 0; i < 256u; i++) {
+		const uint8_t b = (uint8_t)i;
+		/* Standard CRC table construction: table[i] is the CRC of the single
+		 * byte i run through the bitwise algorithm from a ZERO register (not
+		 * ALP_CRC16_CCITT_FALSE_INIT) -- crc16_table_update()'s per-byte step
+		 * below folds that starting-from-zero entry against the CALLER's
+		 * running register, which is what makes the two forms equivalent. */
+		crc16_table[i] = alp_crc16_ccitt_false_update(0u, &b, 1u);
+	}
+	crc16_table_ready = true;
+}
+
+/* Build the table NOW, from the boot path, so the first frame's reply does
+ * not pay for it inside the SPI ISR.
+ *
+ * This exists because the lazy build was a REAL desync, root-caused on
+ * silicon 2026-09-10.  The table was built on first use, and first use is
+ * protocol_build_reply() servicing the very first request -- in SPI
+ * interrupt context.  256 iterations of the bitwise
+ * alp_crc16_ccitt_false_update() is ~100 us at this core's 160 MHz, not the
+ * "microseconds" the old comment here claimed; it was wrong by two orders.
+ *
+ * The host's reply-header gate is a BLIND fixed 200 us
+ * (chips/cc3501e/cc3501e_core.c, cc3501e_reply_gate) because READY is an
+ * open connection on the bench unit, and normal dispatch already consumes
+ * most of that budget.  So the extra ~100 us on frame one overshot it: the
+ * host clocked 4 bytes into a slave with nothing armed, those bytes sat in
+ * the RX FIFO, and every later transfer returned the PREVIOUS phase's TX
+ * bytes -- a permanent one-transfer lag on MISO that no retry clears.
+ * Symptom was every opcode returning -5 with a valid-looking reply header
+ * for the PREVIOUS request in the host's rx_scratch.
+ *
+ * Called unconditionally, on both CC3501E_WIRE_CRC arms: the OFF build
+ * still CRCs the payload_len==2 GET_VERSION shape, so it can reach the
+ * table too. */
+void protocol_crc16_table_init(void)
+{
+	if (!crc16_table_ready) {
+		crc16_table_init();
+	}
+}
+
+/* Table-driven equivalent of alp_crc16_ccitt_false_update() -- same
+ * polynomial (0x1021), same non-reflected CCITT-FALSE convention, same
+ * chained-call contract (start from ALP_CRC16_CCITT_FALSE_INIT, thread the
+ * return value through a second call to CRC a second buffer as if
+ * concatenated).
+ *
+ * The lazy-build guard below is KEPT as a backstop for host-side unit tests,
+ * which call protocol_build_reply() directly and never run the firmware boot
+ * path.  On real silicon protocol_crc16_table_init() has already run and
+ * this branch is never taken -- do NOT rely on it there again. */
+static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
+{
+	if (!crc16_table_ready) {
+		crc16_table_init();
+	}
+	for (size_t i = 0; i < len; i++) {
+		crc = (uint16_t)((crc << 8) ^ crc16_table[(uint8_t)((crc >> 8) ^ buf[i])]);
+	}
+	return crc;
+}
 
 /* Diagnostics state (firmware-side): last_error = the most recent non-OK
  * response emitted; the frame counters feed DIAG_GET_STATS.  All are
@@ -711,6 +825,207 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 /* Transport-agnostic framing                                        */
 /* --------------------------------------------------------------- */
 
+#if CC3501E_WIRE_CRC
+
+/* CC3501E_WIRE_CRC=ON (default): the wire-MAJOR-4 shape.  See the #else arm
+ * below for the byte-identical-to-3.1, CC3501E_WIRE_CRC=OFF shape. */
+size_t protocol_build_reply(const uint8_t *req_frame,
+                            size_t         req_len,
+                            uint8_t       *reply_frame,
+                            size_t         reply_cap)
+{
+	/* The caller guarantees a full-size reply buffer; guard anyway.  Wire
+	 * MAJOR 4 (#2035) raises the floor by ALP_CC3501E_CRC_BYTES: even a bare
+	 * status-only reply MUST have room for its mandatory 2-byte CRC trailer,
+	 * and every write below this point stays within reply_cap because of it. */
+	if (reply_cap < CC3501E_REPLY_DATA_OFF + (size_t)ALP_CC3501E_CRC_BYTES) {
+		return 0u;
+	}
+
+	const uint8_t      cmd_echo = (req_len >= 1u) ? req_frame[0] : 0u;
+	alp_cc3501e_resp_t status   = ALP_CC3501E_RESP_ERR_PROTOCOL;
+	size_t             data_len = 0u;
+
+	if (req_len >= (size_t)ALP_CC3501E_HEADER_BYTES) {
+		const uint8_t  flags       = req_frame[1];
+		const uint16_t payload_len = (uint16_t)req_frame[2] | ((uint16_t)req_frame[3] << 8);
+
+		/* Captured byte count must match the declared payload exactly -- unchanged
+		 * from wire MAJOR 3.1. */
+		if ((size_t)ALP_CC3501E_HEADER_BYTES + (size_t)payload_len == req_len) {
+			/* Wire MAJOR 4 (#2035): every request now carries a MANDATORY 2-byte
+			 * CRC-16/CCITT-FALSE trailer inside that same payload_len, covering
+			 * the header plus every payload byte except the trailing 2.  This
+			 * firmware is the STRICT side of the migration (see this file's doc
+			 * comment and the MAJOR-4 paragraph in <alp/protocol/cc3501e.h>): a
+			 * payload too short to even hold the trailer, or one whose trailer
+			 * does not verify, is a 3.1-shaped (no-CRC) request or link
+			 * corruption -- either way RESP_ERR_PROTOCOL, and protocol_dispatch()
+			 * is never called, so a bad frame can never reach a handler.
+			 *
+			 * ONE NORMATIVE EXCEPTION: CMD_GET_VERSION (0x01) is accepted WITH OR
+			 * WITHOUT the CRC trailer.  The host does not know a peer's wire
+			 * major until GET_VERSION answers it, and per <alp/protocol/cc3501e.h>
+			 * (chips/cc3501e/cc3501e_core.c's want_req_crc) it appends a request
+			 * CRC ONLY once fw_proto_major is already negotiated -- so the FIRST
+			 * GET_VERSION any host ever sends a fresh peer is, by construction,
+			 * the zero-payload, no-trailer 3.1 shape.  Requiring a CRC on it
+			 * unconditionally would mean no host can ever learn this firmware is
+			 * on MAJOR 4 in the first place, and OTA -- the only path from 3.1 to
+			 * 4.0 firmware -- rides this exact same gated request path, so that
+			 * failure mode is permanent, not a one-time hiccup.  Every OTHER
+			 * opcode keeps the unconditional requirement above; a
+			 * MAJOR-4-negotiated host's later GET_VERSION calls (e.g. `ver` on
+			 * the console) still carry a valid CRC and take the normal path
+			 * below, since a 2-byte payload_len also satisfies this test. */
+			if (cmd_echo == (uint8_t)ALP_CC3501E_CMD_GET_VERSION && payload_len == 0u) {
+				status = protocol_dispatch(cmd_echo,
+				                           flags,
+				                           NULL,
+				                           0u,
+				                           &reply_frame[CC3501E_REPLY_DATA_OFF],
+				                           reply_cap - CC3501E_REPLY_DATA_OFF -
+				                               (size_t)ALP_CC3501E_CRC_BYTES,
+				                           &data_len);
+			} else if (payload_len >= (uint16_t)ALP_CC3501E_CRC_BYTES) {
+				const uint16_t logical_len =
+				    (uint16_t)(payload_len - (uint16_t)ALP_CC3501E_CRC_BYTES);
+				const uint8_t *req =
+				    (logical_len > 0u) ? &req_frame[ALP_CC3501E_HEADER_BYTES] : NULL;
+				const uint8_t *crc_trailer = &req_frame[ALP_CC3501E_HEADER_BYTES + logical_len];
+
+				uint16_t crc = crc16_table_update(
+				    ALP_CRC16_CCITT_FALSE_INIT, req_frame, ALP_CC3501E_HEADER_BYTES);
+				if (logical_len > 0u) {
+					crc = crc16_table_update(crc, req, logical_len);
+				}
+				const uint16_t wire_crc =
+				    (uint16_t)crc_trailer[0] | ((uint16_t)crc_trailer[1] << 8);
+
+				if (crc == wire_crc) {
+					status = protocol_dispatch(cmd_echo,
+					                           flags,
+					                           req,
+					                           logical_len,
+					                           &reply_frame[CC3501E_REPLY_DATA_OFF],
+					                           reply_cap - CC3501E_REPLY_DATA_OFF -
+					                               (size_t)ALP_CC3501E_CRC_BYTES,
+					                           &data_len);
+				}
+			}
+		}
+	}
+
+	/* Defence-in-depth: a handler must never report more data than the reply
+	 * buffer holds -- for status + data + the mandatory 2-byte CRC trailer, wire
+	 * MAJOR 4 -- but if one did, (uint16_t)(1u + data_len) would TRUNCATE the
+	 * length silently and frame a corrupt reply.  Clamp + fail closed instead. */
+	const size_t reply_data_cap =
+	    (reply_cap > CC3501E_REPLY_DATA_OFF + (size_t)ALP_CC3501E_CRC_BYTES)
+	        ? (reply_cap - CC3501E_REPLY_DATA_OFF - (size_t)ALP_CC3501E_CRC_BYTES)
+	        : 0u;
+	if (data_len > reply_data_cap) {
+		data_len = 0u;
+		status   = ALP_CC3501E_RESP_ERR_NO_MEM;
+	}
+
+	/* Diagnostics bookkeeping: count OK vs error replies and latch the last
+	 * non-OK status, for GET_DIAG_INFO / DIAG_GET_STATS.  Runs AFTER the clamp so
+	 * a clamped NO_MEM is counted as the error it is. */
+	if (status == ALP_CC3501E_RESP_OK) {
+		g_frames_ok++;
+	} else {
+		g_frames_err++;
+		g_last_error = (uint8_t)status;
+	}
+
+	/* Frame the reply: [cmd | flags=0 | payload_len(LE) | status | data | pad | crc].
+	 * flags = 0 -> solicited reply.  NOTHING in this firmware ever sets
+	 * ALP_CC3501E_FLAG_ASYNC_EVENT: async events are never emitted as frames of
+	 * their own, they are queued in the event ring and handed back inside an
+	 * ordinary GET_PENDING_EVENTS reply.  payload = status(1) + data + pad + the
+	 * mandatory wire-MAJOR-4 2-byte CRC trailer. */
+	/* Pad the reply payload up to a multiple of CC3501E_REPLY_PAD so the HOST's
+	 * DMA can move it as ONE burst-aligned chunk.
+	 *
+	 * The host's DW SSI raises its DMA request on a FIFO watermark, so its driver
+	 * has to shrink the burst until it divides the transfer exactly -- an ODD
+	 * length collapses the burst to 1, i.e. one DMA transaction per byte.  Even
+	 * with that handled by splitting off a tail chunk, an unaligned length still
+	 * costs a SECOND PL330 setup + semaphore round trip per transfer, which is
+	 * what kept DMA slower than PIO on this bridge.  Reply payload is
+	 * 1 + data_len + ALP_CC3501E_CRC_BYTES, so without padding roughly half of
+	 * all frames are odd.
+	 *
+	 * The declared payload_len INCLUDES the pad AND the CRC, so payload_len is
+	 * NOT status + data.  That is safe only for a reply payload that is
+	 * SELF-DELIMITING.  SOCK_RECV is: data_len sits inside
+	 * alp_cc3501e_sock_recv_resp_t.  GET_PENDING_EVENTS was NOT -- its reply data
+	 * is a bare packed entry list -- so an empty ring's 7 zero pad bytes were
+	 * walked as three "opcode 0x00, len 0" entries, ~5.8 phantom events per
+	 * second (alp-sdk#1740; the host walk now stops at a zero opcode).  Any NEW
+	 * variable-length reply payload must carry its own count or terminator.
+	 * Costs at most CC3501E_REPLY_PAD-1 bytes of wire out of ~1.7 KB. */
+	uint16_t reply_payload = (uint16_t)(1u + data_len + (uint16_t)ALP_CC3501E_CRC_BYTES);
+	{
+		const uint16_t rem = (uint16_t)(reply_payload % CC3501E_REPLY_PAD);
+
+		if (rem != 0u) {
+			const uint16_t pad = (uint16_t)(CC3501E_REPLY_PAD - rem);
+
+			/* Only pad if it still fits the caller's frame buffer.  The pad sits
+			 * BEFORE the CRC trailer -- [status|data][zero pad][crc] -- so it is
+			 * zeroed starting right after the DATA bytes, not after where the CRC
+			 * trailer will land. */
+			if ((size_t)ALP_CC3501E_HEADER_BYTES + reply_payload + pad <= reply_cap) {
+				memset(&reply_frame[CC3501E_REPLY_STATUS_OFF + 1u + data_len], 0, pad);
+				reply_payload = (uint16_t)(reply_payload + pad);
+			}
+		}
+	}
+	reply_frame[0]                        = cmd_echo;
+	reply_frame[1]                        = 0u;
+	reply_frame[2]                        = (uint8_t)(reply_payload & 0xFFu);
+	reply_frame[3]                        = (uint8_t)((reply_payload >> 8) & 0xFFu);
+	reply_frame[CC3501E_REPLY_STATUS_OFF] = (uint8_t)status;
+
+	/* Append the mandatory MAJOR-4 CRC trailer: the header bytes just written
+	 * plus every payload byte up to (not including) these trailing 2 bytes --
+	 * <alp/protocol/cc3501e.h>'s ALP_CC3501E_CRC_BYTES doc.  Always the LAST 2
+	 * bytes of the (possibly padded) declared payload. */
+	{
+		const size_t covered = (size_t)reply_payload - (size_t)ALP_CC3501E_CRC_BYTES;
+		uint16_t     crc =
+		    crc16_table_update(ALP_CRC16_CCITT_FALSE_INIT, reply_frame, ALP_CC3501E_HEADER_BYTES);
+		crc = crc16_table_update(crc, &reply_frame[CC3501E_REPLY_STATUS_OFF], covered);
+		reply_frame[CC3501E_REPLY_STATUS_OFF + covered]      = (uint8_t)(crc & 0xFFu);
+		reply_frame[CC3501E_REPLY_STATUS_OFF + covered + 1u] = (uint8_t)((crc >> 8) & 0xFFu);
+	}
+	return (size_t)ALP_CC3501E_HEADER_BYTES + reply_payload;
+}
+
+#else /* !CC3501E_WIRE_CRC */
+
+/* CC3501E_WIRE_CRC=OFF: wire MAJOR 3 (@ref ALP_CC3501E_PROTOCOL_MAJOR_LEGACY),
+ * byte-identical to the 3.1 wire this firmware spoke before #2035 -- no CRC
+ * trailer on any request or reply, and @ref ALP_CC3501E_RESP_OK_LEGACY (0x00)
+ * is the wire OK byte, not @ref ALP_CC3501E_RESP_OK (0x5A).  A board flashed
+ * with this build must be indistinguishable, on the wire, from a released
+ * 3.1 firmware -- that is the whole point of the option (some boards will
+ * not want the CRC's flash/cycle cost) -- so this is a straight port of the
+ * pre-#2035 protocol_build_reply(), not a CRC-stripped rewrite of the ON arm
+ * above: the framing, padding and clamp arithmetic are the ones this
+ * firmware shipped as v9/3.1 (git history: commit b04bb0c and earlier).
+ *
+ * GET_VERSION keeps its dual-shape carve-out even here (#2035; "GET_VERSION
+ * is accepted with or without a CRC trailer, in both builds" -- see
+ * protocol.h's protocol_build_reply() doc and CC3501E_FW_IMPLEMENTS_
+ * PROTOCOL_MAJOR's comment in protocol_meta.c): a host whose cached
+ * ctx->fw_proto_major is stale at 4 (e.g. this board was OTA'd DOWN from
+ * 4.0 firmware to this 3.1-legacy image) still sends a CRC'd GET_VERSION,
+ * and this build must still answer it -- with the ordinary legacy-shaped
+ * reply below -- rather than reject it and strand that host with no way to
+ * rediscover the board's real major. */
 size_t protocol_build_reply(const uint8_t *req_frame,
                             size_t         req_len,
                             uint8_t       *reply_frame,
@@ -729,16 +1044,44 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 		const uint8_t  flags       = req_frame[1];
 		const uint16_t payload_len = (uint16_t)req_frame[2] | ((uint16_t)req_frame[3] << 8);
 
-		/* Captured byte count must match the declared payload exactly. */
+		/* Captured byte count must match the declared payload exactly --
+		 * unchanged from wire MAJOR 3.1. */
 		if ((size_t)ALP_CC3501E_HEADER_BYTES + (size_t)payload_len == req_len) {
-			const uint8_t *req = (payload_len > 0u) ? &req_frame[ALP_CC3501E_HEADER_BYTES] : NULL;
-			status             = protocol_dispatch(cmd_echo,
-			                                       flags,
-			                                       req,
-			                                       payload_len,
-			                                       &reply_frame[CC3501E_REPLY_DATA_OFF],
-			                                       reply_cap - CC3501E_REPLY_DATA_OFF,
-			                                       &data_len);
+			/* The GET_VERSION-with-a-present-CRC carve-out (see this #else
+			 * arm's top comment).  Gated on cmd_echo, so it can never widen
+			 * what any OTHER opcode accepts -- a non-GET_VERSION request
+			 * with 2 extra trailing bytes still falls through to the
+			 * ordinary dispatch below, where that opcode's own handler
+			 * rejects the unexpected payload length on its own terms,
+			 * exactly as a real 3.1 firmware would. */
+			if (cmd_echo == (uint8_t)ALP_CC3501E_CMD_GET_VERSION &&
+			    payload_len == (uint16_t)ALP_CC3501E_CRC_BYTES) {
+				const uint8_t *crc_trailer = &req_frame[ALP_CC3501E_HEADER_BYTES];
+				uint16_t       crc         = crc16_table_update(
+				    ALP_CRC16_CCITT_FALSE_INIT, req_frame, ALP_CC3501E_HEADER_BYTES);
+				const uint16_t wire_crc =
+				    (uint16_t)crc_trailer[0] | ((uint16_t)crc_trailer[1] << 8);
+
+				if (crc == wire_crc) {
+					status = protocol_dispatch(cmd_echo,
+					                           flags,
+					                           NULL,
+					                           0u,
+					                           &reply_frame[CC3501E_REPLY_DATA_OFF],
+					                           reply_cap - CC3501E_REPLY_DATA_OFF,
+					                           &data_len);
+				}
+			} else {
+				const uint8_t *req =
+				    (payload_len > 0u) ? &req_frame[ALP_CC3501E_HEADER_BYTES] : NULL;
+				status = protocol_dispatch(cmd_echo,
+				                           flags,
+				                           req,
+				                           payload_len,
+				                           &reply_frame[CC3501E_REPLY_DATA_OFF],
+				                           reply_cap - CC3501E_REPLY_DATA_OFF,
+				                           &data_len);
+			}
 		}
 	}
 
@@ -752,9 +1095,9 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 		status   = ALP_CC3501E_RESP_ERR_NO_MEM;
 	}
 
-	/* Diagnostics bookkeeping: count OK vs error replies and latch the last
-	 * non-OK status, for GET_DIAG_INFO / DIAG_GET_STATS.  Runs AFTER the clamp so
-	 * a clamped NO_MEM is counted as the error it is. */
+	/* Diagnostics bookkeeping runs against the LOGICAL status (ALP_CC3501E_RESP_OK,
+	 * 0x5A -- every handler's internal success return, unchanged by this build
+	 * option), not the wire byte substituted below. */
 	if (status == ALP_CC3501E_RESP_OK) {
 		g_frames_ok++;
 	} else {
@@ -762,31 +1105,9 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 		g_last_error = (uint8_t)status;
 	}
 
-	/* Frame the reply: [cmd | flags=0 | payload_len(LE) | status | data | pad].
-	 * flags = 0 -> solicited reply.  NOTHING in this firmware ever sets
-	 * ALP_CC3501E_FLAG_ASYNC_EVENT: async events are never emitted as frames of
-	 * their own, they are queued in the event ring and handed back inside an
-	 * ordinary GET_PENDING_EVENTS reply.  payload = status(1) + data + pad. */
-	/* Pad the reply payload up to a multiple of CC3501E_REPLY_PAD so the HOST's
-	 * DMA can move it as ONE burst-aligned chunk.
-	 *
-	 * The host's DW SSI raises its DMA request on a FIFO watermark, so its driver
-	 * has to shrink the burst until it divides the transfer exactly -- an ODD
-	 * length collapses the burst to 1, i.e. one DMA transaction per byte.  Even
-	 * with that handled by splitting off a tail chunk, an unaligned length still
-	 * costs a SECOND PL330 setup + semaphore round trip per transfer, which is
-	 * what kept DMA slower than PIO on this bridge.  Reply payload is
-	 * 1 + data_len, so without padding roughly half of all frames are odd.
-	 *
-	 * The declared payload_len INCLUDES the pad, so payload_len is NOT
-	 * status + data.  That is safe only for a reply payload that is
-	 * SELF-DELIMITING.  SOCK_RECV is: data_len sits inside
-	 * alp_cc3501e_sock_recv_resp_t.  GET_PENDING_EVENTS was NOT -- its reply data
-	 * is a bare packed entry list -- so an empty ring's 7 zero pad bytes were
-	 * walked as three "opcode 0x00, len 0" entries, ~5.8 phantom events per
-	 * second (alp-sdk#1740; the host walk now stops at a zero opcode).  Any NEW
-	 * variable-length reply payload must carry its own count or terminator.
-	 * Costs at most CC3501E_REPLY_PAD-1 bytes of wire out of ~1.7 KB. */
+	/* Frame the reply: [cmd | flags=0 | payload_len(LE) | status | data | pad],
+	 * NO CRC trailer -- byte-identical to the 3.1 wire.  See the ON arm above
+	 * for why payload_len is padded to CC3501E_REPLY_PAD. */
 	uint16_t reply_payload = (uint16_t)(1u + data_len);
 	{
 		const uint16_t rem = (uint16_t)(reply_payload % CC3501E_REPLY_PAD);
@@ -794,17 +1115,27 @@ size_t protocol_build_reply(const uint8_t *req_frame,
 		if (rem != 0u) {
 			const uint16_t pad = (uint16_t)(CC3501E_REPLY_PAD - rem);
 
-			/* Only pad if it still fits the caller's frame buffer. */
 			if ((size_t)ALP_CC3501E_HEADER_BYTES + reply_payload + pad <= reply_cap) {
 				memset(&reply_frame[CC3501E_REPLY_STATUS_OFF + reply_payload], 0, pad);
 				reply_payload = (uint16_t)(reply_payload + pad);
 			}
 		}
 	}
-	reply_frame[0]                        = cmd_echo;
-	reply_frame[1]                        = 0u;
-	reply_frame[2]                        = (uint8_t)(reply_payload & 0xFFu);
-	reply_frame[3]                        = (uint8_t)((reply_payload >> 8) & 0xFFu);
-	reply_frame[CC3501E_REPLY_STATUS_OFF] = (uint8_t)status;
+	reply_frame[0] = cmd_echo;
+	reply_frame[1] = 0u;
+	reply_frame[2] = (uint8_t)(reply_payload & 0xFFu);
+	reply_frame[3] = (uint8_t)((reply_payload >> 8) & 0xFFu);
+	/* The wire OK byte on this shape is ALP_CC3501E_RESP_OK_LEGACY (0x00), not
+	 * ALP_CC3501E_RESP_OK (0x5A) -- <alp/protocol/cc3501e.h> now defines
+	 * RESP_OK as 0x5A unconditionally (the MAJOR-4 bump changed what the
+	 * SYMBOL means, not just what MAJOR-4 firmwares emit), so this is the one
+	 * place that translates a handler's logical OK back to the byte a 3.1
+	 * host actually expects on this wire -- see chips/cc3501e/cc3501e_core.c's
+	 * resp_to_status(), which maps 0x00 to OK only when the negotiated
+	 * fw_major is the LEGACY value. */
+	reply_frame[CC3501E_REPLY_STATUS_OFF] =
+	    (status == ALP_CC3501E_RESP_OK) ? (uint8_t)ALP_CC3501E_RESP_OK_LEGACY : (uint8_t)status;
 	return (size_t)ALP_CC3501E_HEADER_BYTES + reply_payload;
 }
+
+#endif /* CC3501E_WIRE_CRC */

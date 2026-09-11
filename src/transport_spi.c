@@ -6,12 +6,15 @@
  * link).
  *
  * Wire framing (see <alp/protocol/cc3501e.h>): a 4-byte little-endian
- * header followed by the payload -- NO start-of-frame byte and NO CRC
- * (the channel is a short, hardwired, point-to-point SPI bus, not a
- * noisy shared line):
+ * header followed by the payload -- NO start-of-frame byte (the channel is
+ * a short, hardwired, point-to-point SPI bus, not a noisy shared line).
+ * Wire MAJOR 4 (#2035) DOES add a mandatory 2-byte CRC-16/CCITT-FALSE
+ * trailer to every frame, both directions, INSIDE the declared
+ * payload_len -- see protocol_build_reply() (protocol.c), which is where
+ * both the request-CRC check and the reply-CRC append actually happen:
  *
- *   REQUEST : cmd | flags | payload_len(LE16) | payload[payload_len]
- *   REPLY   : cmd | flags | payload_len(LE16) | status | data[...]
+ *   REQUEST : cmd | flags | payload_len(LE16) | payload[payload_len-2] | crc(LE16)
+ *   REPLY   : cmd | flags | payload_len(LE16) | status | data[...] | pad | crc(LE16)
  *
  * Request and reply ride SEPARATE SPI transactions: the firmware stages
  * the reply on CS-high (request complete) and the host reads it back in

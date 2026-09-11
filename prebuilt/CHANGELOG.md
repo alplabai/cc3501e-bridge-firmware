@@ -7,6 +7,86 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.8.0
+
+GPE: `0.149.200.0`. Wire protocol: `4.0`. sha256
+`1928b7d89d22f53ac69c36843c2fec631499fa7bf88f9adaf7fde74c9af15182`.
+
+**The wire carries a CRC-16/CCITT-FALSE trailer on every frame, both
+directions** (MAJOR 4). It exists because a dead SPI phase was observed on real
+silicon returning `RESP_OK` with a corrupted payload: the old `RESP_OK` of
+`0x00` is exactly what a dead phase clocks back for every byte it touches, so a
+total transport failure was indistinguishable from success. `RESP_OK` is now
+`0x5A` and the CRC makes corruption detectable rather than silently accepted.
+
+**`CC3501E_WIRE_CRC` makes that a build option, and it is a wire-major
+selector rather than a cosmetic toggle.** ON (default) is MAJOR 4. OFF reports
+MAJOR 3 and is byte-identical to the 3.1 wire — proven against a real pre-4.0
+build, 31 of 31 shared vectors matching. A `_Static_assert` enforces the
+pairing: an OFF build that still reported 4 would tell a MAJOR-4 host to append
+CRCs this firmware ignores and demand CRCs it never sends, which is a silent,
+total link failure that looks like a hardware fault. Turning it off removes the
+dead-phase guard, which is why it is not the default.
+
+**The fix that made 4.0 work at all.** The 256-entry CRC table was built lazily
+on first use, and first use is `protocol_build_reply()` servicing request one —
+inside the SPI interrupt handler. That is roughly 100 us at this core's 160 MHz,
+against a host reply-header gate that is a blind fixed 200 us already mostly
+spent on normal dispatch. Frame one overshot it: the host clocked into a slave
+with nothing armed, those bytes sat in the RX FIFO, and every later transfer
+returned the previous phase's bytes — a permanent one-transfer lag that no
+retry clears. The table is now built on the boot path, before the slave is
+armed. Without this, every opcode returned `-5` and the part looked dead while
+it was answering the whole time.
+
+Verified on an E1M-AEN803 (serial `2026W36-0003`) across 48 cold-cycled runs:
+`GET_VERSION` reports `protocol v4.0 ... match`, `fw_version=0x0800` read back
+over `GET_DIAG_INFO`, and `PING`, `GET_MAC`, `GET_CAPABILITIES`,
+`WIFI_SCAN_START` and `BLE_ENABLE` all return `0`.
+
+**`WIFI_CONNECT_STA` (0x12) IS NOT VERIFIED IN THIS RELEASE. Do not assume it
+works.** The verification list above is exhaustive — `PING`, `GET_VERSION`,
+`GET_MAC`, `GET_CAPABILITIES`, `WIFI_SCAN_START`, `BLE_ENABLE` — and station
+association is deliberately absent from it.
+
+Seven cold-booted attempts against a WPA3 AP at -79 dBm on 2026-09-11 never
+completed an association, and no bridge exchange succeeded for 95 seconds
+afterwards, while `PING` had answered on the first attempt moments earlier.
+The radio's own verdict was never readable, so whether the association itself
+would have succeeded is still unknown.
+
+Two structural findings from that investigation, neither fixed here:
+
+- This image does not call `cc3501e_hw_wifi_boot_start()` (see `src/main.c`),
+  so the STA role is NOT brought up at boot. A `WIFI_CONNECT_STA` issued as
+  the first radio operation therefore carries `Wlan_Start`, a `Wlan_Set` and a
+  10 s `Wlan_RoleUp` *inside* the connect body, on top of the 30 s association
+  wait and 10 s DHCP. Bounded pieces alone exceed 50 s, and four of those
+  calls have no bound in our source at all.
+- `cc3501e_hw_wifi_connect_sta()` skips the `bridge_transport_spi_hw_suspend()`
+  bracket that the boot path uses around `Wlan_RoleUp`, on the stated premise
+  that the role is "pre-cached at boot" — which the point above makes false on
+  this image.
+
+Also note `Wlan_Disconnect()` now runs on every connect failure exit. It was
+added after the last time station association was bench-proven, and it takes
+no timeout parameter.
+
+If you need station mode, call `GET_MAC` and `WIFI_SCAN_START` first — both
+are verified — which moves `Wlan_Start` and the role transition out of the
+connect body, and budget well beyond 40 s for the connect itself.
+
+**Known limitation, not a regression from v0.7.0.** The link can wedge during a
+session: a transport desync after which every opcode fails until a cold cycle,
+observed at roughly 7 runs in 24 with default host settings. It is host-side and
+predates this release. alp-sdk provides two mitigations,
+`CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS` and
+`CONFIG_ALP_SDK_CC3501E_POST_SUCCESS_GUARD_MS`; with them at 50 and 20 the
+failure did not recur in 24 runs (Fisher one-sided p = 0.0047, 95% upper bound
+on the residual rate 11.7%). Both default to a no-op, so a host that wants the
+mitigation must opt in. A large `STREAM_WRITE` also wedges the link — 64 B and
+256 B pass, 1024 B and 4092 B do not — and that is still open.
+
 ## v0.7.0
 
 Three landings since v0.6.0, none of which were in a shipped artifact until now.

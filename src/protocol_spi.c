@@ -128,7 +128,12 @@ alp_cc3501e_resp_t handle_spi1_transfer(const uint8_t *req,
 	const bool     no_tx = (flags & ALP_CC3501E_SPI1_XFER_NO_TX) != 0u;
 
 	if ((flags & (uint8_t)~SPI1_XFER_FLAGS_ALL) != 0u) return ALP_CC3501E_RESP_ERR_INVALID;
-	if (len > ALP_CC3501E_SPI1_MAX_XFER) return ALP_CC3501E_RESP_ERR_INVALID;
+	/* CC3501E_SPI1_MAX_XFER_V4 (protocol.h), not the header's
+	 * ALP_CC3501E_SPI1_MAX_XFER -- wire MAJOR 4's mandatory 2-byte request CRC
+	 * trailer rides inside the same ALP_CC3501E_MAX_PAYLOAD-bounded payload_len
+	 * a maxed-out transfer already saturates, so 2 bytes less is the real
+	 * ceiling now. */
+	if (len > CC3501E_SPI1_MAX_XFER_V4) return ALP_CC3501E_RESP_ERR_INVALID;
 
 	/* EXACT length check, not >=.  A short frame would make the worker clock
 	 * whatever stale bytes sit past the payload in job.req; a long one means

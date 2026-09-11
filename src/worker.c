@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "worker.h"
+#include "protocol.h"  /* CC3501E_SPI1_MAX_XFER_V4 -- the CONFIGURE reply's max_xfer */
 #include "transport.h" /* bridge_transport_spi_hw_reinit -- post-radio-op SPI re-sync */
 #include "../hal/cc3501e_hw.h"
 
@@ -439,7 +440,12 @@ static void worker_execute(uint8_t cmd)
 		    wk_get_le32(job.req, 0u), job.req[4], job.req[5], job.req[6], &actual_freq_hz);
 		if (rv == CC3501E_HW_OK) {
 			wk_put_le32(buf, actual_freq_hz);
-			wk_put_le16(&buf[4], (uint16_t)ALP_CC3501E_SPI1_MAX_XFER);
+			/* Report CC3501E_SPI1_MAX_XFER_V4 (protocol.h), not the header's
+			 * ALP_CC3501E_SPI1_MAX_XFER -- wire MAJOR 4's mandatory request CRC
+			 * trailer costs 2 bytes of the same payload_len ceiling a maxed chunk
+			 * already saturates, so the host must chunk 2 bytes smaller or its
+			 * last chunk truncates silently at exactly the largest transfer. */
+			wk_put_le16(&buf[4], (uint16_t)CC3501E_SPI1_MAX_XFER_V4);
 			buf[6] = job.req[5];
 			buf[7] = 0u;
 			len    = 8u;
