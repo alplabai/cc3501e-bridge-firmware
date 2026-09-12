@@ -9,19 +9,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## v0.8.0
 
-GPE: `0.149.222.0`. Wire protocol: `4.0`. sha256
-`c63fcbadf1e71a57ec9bf8282008140bd5e33ae9f50a46bb94467e0a9803d94f`.
+GPE: `0.254.5.0`. Wire protocol: `4.0`. sha256
+`c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7`.
 
-**Re-wrapped at `0.149.222.0`, up from the `0.149.200.0` this release was
-first cut at.** Bench unit `2026W36-0003` has since been flashed at
-`0.149.220.0`, and the CC35 secure boot loader enforces GPE monotonicity per
-part: the original blob would stream clean onto that unit, exit 0, and then
-refuse to boot -- a dead link, permanently, for that part. Only the four-byte
-version field, the SHA-256 TLV and the signature TLV differ; all 118 differing
-bytes are accounted for and the stage-1 raw image is byte-identical
-(`raw-sha256` unchanged, rebuilt and confirmed from `d53a728`). Same firmware,
-new stamp -- the same pairing v0.6.0's `0.149.76.0` -> `0.149.90.0` re-wrap
-records below.
+**RE-CUT 2026-09-12, from source, not merely re-wrapped.** v0.8.0 was never
+distributed, so the version number was still free -- the same move this file
+records for the 0.6.0 pre-release that became v0.5.1 before distribution. The
+previous v0.8.0 blob (`c63fcbad...`, GPE `0.149.222.0`) is superseded and must
+not be flashed: bench unit `2026W36-0003` has since climbed to `0.254.4.0`, and
+the CC35 secure boot loader enforces GPE monotonicity per part, so that older
+blob would stream clean onto it, exit 0, and then permanently refuse to boot.
+
+### What this re-cut adds — the station now gets a DHCP lease
+
+The station associated reliably and then failed to obtain an address about three
+times in four. Two mechanisms were found and fixed, each verified on silicon by
+the failure signature changing, not merely by a better number:
+
+1. **The station was in power save across DHCP.** `Wlan_Start()` defaults to
+   `WLAN_STATION_AUTO_PS_MODE`, and the bridge additionally applied its latched
+   `BALANCED` policy right after `Wlan_RoleUp(STA)` -- which also maps to
+   AUTO_PS. An AP buffers broadcast until a DTIM beacon, and a sleeping station
+   on a marginal link misses beacons and therefore misses DTIMs. An unconfigured
+   station now defaults to ACTIVE; a host `POWER_POLICY` still wins once sent.
+   *Evidence:* the failing DHCP state moved from `SELECTING` (no OFFER arriving)
+   to `REQUESTING` (OFFER arrives, ACK does not).
+
+2. **lwIP's retransmit backoff turned retries into dead air.** `dhcp_select()`
+   arms `1 << tries` seconds just as `dhcp_discover()` does, so by `tries = 5`
+   the next REQUEST is 32 s away and the client spends the budget idle. A
+   stalled client is now restarted -- gated on `tries >= 3` so an exchange about
+   to be answered is never interrupted, capped at 2 restarts so an absent server
+   still terminates. *Evidence:* `tries` on the failing attempt fell from 5 to 3
+   and late leases moved from 12 s to 1 s.
+
+Measured on `e1m-aen-evk-01` at -80/-81 dBm on the on-board antenna, cold-cycled
+between every attempt:
+
+| | before | after |
+|---|---|---|
+| address inside the connect call | ~1 in 4 | **12 of 16** |
+| address by any route | ~1 in 4 | **14 of 16** |
+
+**Residual, stated plainly:** 1 of 16 still failed at `REQUESTING`/`tries = 3`,
+and 1 further attempt hit the separate first-radio-op scan wedge already recorded
+for that place. Both are counted against the fractions above rather than
+discarded. At this RF level a four-frame DHCP exchange failing occasionally is
+link loss rather than a logic defect; a host that retries once reaches roughly
+98%, and the driver now reports enough to decide -- a distinct no-address status,
+the DHCP state and the retry count.
+
+Also in this cut: the lease budget covers lwIP's fourth DISCOVER rather than
+stopping four seconds short of it; `GET_DIAG_INFO` grew from 16 to 18 bytes to
+report the STA DHCP state and retry count (an older host reads 16 and is
+unaffected); the vendor console is initialised at boot, because `InitTerm` was
+dead-stripped and `Report()` -- which the vendor's own `link_callback` calls
+immediately before `dhcp_start()` -- was walking a NULL UART handle on every
+connect.
 
 **The wire carries a CRC-16/CCITT-FALSE trailer on every frame, both
 directions** (MAJOR 4). It exists because a dead SPI phase was observed on real
