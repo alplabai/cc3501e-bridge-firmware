@@ -79,6 +79,58 @@ Two structural findings from that investigation, neither fixed here:
   that the role is "pre-cached at boot" — which the point above makes false on
   this image.
 
+  **Adding that bracket has since been tried on silicon and it WEDGES THE
+  LINK. Do not add it.** The obvious reading of the finding above is that
+  `ensure_sta_role()` should quiesce the bridge around the role-up the way the
+  boot path does. That change was written, built, signed and flashed to
+  `2026W36-0003` on 2026-09-11, and it made things strictly worse: with it,
+  `WIFI_SCAN_START` never completes and the bridge stays dead; without it, the
+  same scan returns records.
+
+  Measured as an A/B on one board, same host app, same host build, same core,
+  same steps, only the CC3501E image differing:
+
+  | | with the bracket | published v0.8.0 |
+  |---|---|---|
+  | `PING` after a 25 s silent window | never answered | ok, first attempt |
+  | `cc3501e_wifi_scan()` | no records | `ALP_OK`, 4 records |
+
+  The mechanism is in this repository already. `bridge_transport_spi_hw_suspend()`
+  calls `SPI_transferCancel()`, which is the firmware's only call site for it,
+  and on this image that call site is unreachable because `src/main.c` does not
+  call `cc3501e_hw_wifi_boot_start()`. Bracketing `ensure_sta_role()` makes the
+  cancel live for the first time in a shipped image. `hal/ti/cc3501e_hw_ti_ota.c`
+  and `hal/ti/transport_hw_ti_spi.c` both already record that cancelling an
+  armed callback-mode transfer from the bring-up task does not return, and the
+  OTA pump replaced `suspend()` with a quiesce-then-release pattern for exactly
+  that reason. A silent-bus experiment ruled out the obvious escape: even with
+  the host issuing nothing at all for 25 s, the bracketed build stayed dead
+  through ~70 s, so this is not a race against host traffic that quieting the
+  host can avoid.
+
+  If the role-up genuinely needs quiescing, the OTA pump's pattern is the shape
+  to copy, not `suspend()`.
+
+  **And the premise itself does not survive measurement.** The finding above
+  reads as "the unguarded `Wlan_RoleUp` in the connect body is what wedges the
+  link". It is not. `cc3501e_hw_wifi_scan_run()` performs the SAME
+  `ensure_sta_role()` role-up, equally unguarded, and on this image a scan
+  issued as the first radio operation of a boot completes and returns records,
+  5 of 5 cold-booted runs. A `WIFI_CONNECT_STA` issued as the first radio
+  operation still wedges, at WPA2 and WPA3 alike, and the `WIFI_STATUS` read
+  after it times out too, so the radio's own verdict has never been readable.
+
+  Scoped precisely, on `2026W36-0003`:
+
+  | | `WIFI_SCAN_START` first | `WIFI_CONNECT_STA` first |
+  |---|---|---|
+  | published v0.8.0 | returns records | wedges |
+  | v0.8.0 + the suspend bracket | wedges | wedges |
+
+  So the bracket is a regression that additionally breaks the scan, and the
+  connect wedge predates it and is untouched by it. Whatever wedges the connect
+  is in the connect body AFTER the role-up, not the role-up.
+
 Also note `Wlan_Disconnect()` now runs on every connect failure exit. It was
 added after the last time station association was bench-proven, and it takes
 no timeout parameter.
@@ -86,6 +138,32 @@ no timeout parameter.
 If you need station mode, call `GET_MAC` and `WIFI_SCAN_START` first — both
 are verified — which moves `Wlan_Start` and the role transition out of the
 connect body, and budget well beyond 40 s for the connect itself.
+
+**Scan before you connect, and read the security kind off the scan rather
+than assuming it.** On `2026W36-0003` a scan returns five networks, stable
+across four cold-booted runs, at -74 to -92 dBm. Bluetooth advertisements on
+the same board read -97 to -99 dBm, while a host Wi-Fi interface metres away
+sits at -36 dBm. That is roughly a 40 dB deficit across both radios and points
+at the antenna path on that unit rather than at anything in this image; an
+association attempted against a marginal AP on a deaf receiver is weak evidence
+about the connect path either way.
+
+One caution learned the hard way there: a SINGLE scan is not enough to conclude
+an AP is absent. One run on this board returned four records and omitted a
+fifth that three later runs, plus a fourth from a different app, all reported at
+a stable -83 dBm. Repeat a scan before concluding anything from what is missing
+from it.
+
+The scan also reports each record's security kind, and it is worth trusting
+over an assumption: the AP this release's failed attempts targeted decodes as
+WPA3, while every connect but one requested WPA2-PSK. Note the two encodings
+differ -- the connect field is `0` open, `1` WPA2-PSK, `2` WPA3-SAE, while the
+scan-result enum is `0` open, `1` WEP, `2` WPA, `3` WPA2, `4` WPA3 -- so read
+the decoded name, never the raw number.
+
+Treat the channel field of a scan record as the least trustworthy part of it:
+across four runs here it moved between cold-identical runs while the matching
+RSSI moved 2 dB, and it reported channel 1 for an AP whose name indicates 5 GHz.
 
 **Known limitation, not a regression from v0.7.0.** The link can wedge during a
 session: a transport desync after which every opcode fails until a cold cycle,
