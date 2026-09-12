@@ -769,7 +769,15 @@ void worker_run_pending(void)
 		 * cc3501e_hw_ble_scan_stop() and this list kept asserting the body still had
 		 * one, and WIFI_DISCONNECT sat here for its whole life with no re-init in its
 		 * body at all.  If you add or remove a bridge_transport_spi_hw_reinit() in any
-		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change. */
+		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change.
+		 *
+		 * Re-checked for WIFI_CONNECT_STA, which gained a reinit in its body: it stays
+		 * OFF this list, deliberately.  That body's reinit sits BETWEEN the STA
+		 * role-up and Wlan_Connect, so the whole association -- Wlan_Connect, the 30 s
+		 * event wait, DHCP, and the failure-exit Wlan_Disconnect -- still runs after
+		 * it, and the drain's reinit here is what recovers the slave from all of THAT.
+		 * The body's is not a substitute for it.  Same reasoning would apply to
+		 * WIFI_SCAN_START, which has had a body reinit since long before this list. */
 		const bool body_already_reinit =
 		    (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) || (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT);
 		/* SPI1 host passthrough is exempt for the SAME reason as the two socket
