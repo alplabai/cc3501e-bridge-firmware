@@ -79,6 +79,38 @@ Two structural findings from that investigation, neither fixed here:
   that the role is "pre-cached at boot" — which the point above makes false on
   this image.
 
+  **Adding that bracket has since been tried on silicon and it WEDGES THE
+  LINK. Do not add it.** The obvious reading of the finding above is that
+  `ensure_sta_role()` should quiesce the bridge around the role-up the way the
+  boot path does. That change was written, built, signed and flashed to
+  `2026W36-0003` on 2026-09-11, and it made things strictly worse: with it,
+  `WIFI_SCAN_START` never completes and the bridge stays dead; without it, the
+  same scan returns records.
+
+  Measured as an A/B on one board, same host app, same host build, same core,
+  same steps, only the CC3501E image differing:
+
+  | | with the bracket | published v0.8.0 |
+  |---|---|---|
+  | `PING` after a 25 s silent window | never answered | ok, first attempt |
+  | `cc3501e_wifi_scan()` | no records | `ALP_OK`, 4 records |
+
+  The mechanism is in this repository already. `bridge_transport_spi_hw_suspend()`
+  calls `SPI_transferCancel()`, which is the firmware's only call site for it,
+  and on this image that call site is unreachable because `src/main.c` does not
+  call `cc3501e_hw_wifi_boot_start()`. Bracketing `ensure_sta_role()` makes the
+  cancel live for the first time in a shipped image. `hal/ti/cc3501e_hw_ti_ota.c`
+  and `hal/ti/transport_hw_ti_spi.c` both already record that cancelling an
+  armed callback-mode transfer from the bring-up task does not return, and the
+  OTA pump replaced `suspend()` with a quiesce-then-release pattern for exactly
+  that reason. A silent-bus experiment ruled out the obvious escape: even with
+  the host issuing nothing at all for 25 s, the bracketed build stayed dead
+  through ~70 s, so this is not a race against host traffic that quieting the
+  host can avoid.
+
+  If the role-up genuinely needs quiescing, the OTA pump's pattern is the shape
+  to copy, not `suspend()`.
+
 Also note `Wlan_Disconnect()` now runs on every connect failure exit. It was
 added after the last time station association was bench-proven, and it takes
 no timeout parameter.
@@ -86,6 +118,15 @@ no timeout parameter.
 If you need station mode, call `GET_MAC` and `WIFI_SCAN_START` first — both
 are verified — which moves `Wlan_Start` and the role transition out of the
 connect body, and budget well beyond 40 s for the connect itself.
+
+**Before blaming this firmware for a failed association, scan and check the
+target is actually there.** On `2026W36-0003` a scan returns four networks at
+-75 to -89 dBm and Bluetooth advertisements at -93 to -99 dBm, while a host
+Wi-Fi interface metres away sits at -36 dBm. That is roughly a 40 dB deficit
+across both radios, which points at the antenna path on that unit rather than
+at anything in this image. The AP that release's seven failed attempts targeted
+reports -79 dBm from that board. An association that never completes against an
+AP at the edge of a deaf receiver is not evidence about the connect path.
 
 **Known limitation, not a regression from v0.7.0.** The link can wedge during a
 session: a transport desync after which every opcode fails until a cold cycle,
