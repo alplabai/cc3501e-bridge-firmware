@@ -55,6 +55,10 @@ appControlBlock app_CB;
 /* InitTerm() -- see the call in cc3501e_hw_net_init() for why a headless bridge
  * with an unrouted UART still has to initialise the vendor console. */
 #include <uart_term.h>
+/* netif_is_up / netif_is_link_up / netif_dhcp_data + struct dhcp, for the
+ * GET_DIAG_INFO DHCP-state bytes (cc3501e_hw_wifi_dhcp_diag below). */
+#include <lwip/netif.h>
+#include <lwip/dhcp.h>
 #endif
 
 #include "alp/protocol/cc3501e.h"
@@ -204,6 +208,47 @@ static void wifi_event_cb(WlanEvent_t *event)
 uint32_t cc3501e_hw_wifi_last_event_id(void)
 {
 	return wifi_cb_last_id;
+}
+
+/* See the contract on the declaration in hal/cc3501e_hw.h. */
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
+
+	/* network_stack_init() has not run on a boot that never brought lwIP up
+	 * (update mode skips cc3501e_hw_net_init entirely), so the netif pointer is
+	 * the thing to guard on, not wifi_started: the netif is registered at BOOT,
+	 * long before any radio op. */
+	struct netif *nif = (struct netif *)network_get_sta_if();
+	if (nif == 0) {
+		return;
+	}
+
+	if (flags_out != 0) {
+		uint8_t f = 0u;
+		if (netif_is_up(nif)) f |= 0x01u;
+		if (netif_is_link_up(nif)) f |= 0x02u;
+		*flags_out = f;
+	}
+
+	/* NULL until dhcp_start() runs, which is exactly the case worth telling
+	 * apart -- it leaves state_out at 0, "not reported", rather than
+	 * fabricating a DHCP_STATE_OFF that would look like a started-then-stopped
+	 * client. */
+	struct dhcp *d = netif_dhcp_data(nif);
+	if (d == 0) {
+		return;
+	}
+	if (state_out != 0) {
+		/* +1 so 0 stays reserved for "not reported"; d->state is u8_t and the
+		 * enum tops out well below 255, so this cannot wrap. */
+		*state_out = (uint8_t)(d->state + 1u);
+	}
+	if (flags_out != 0) {
+		const uint8_t tries = (d->tries > 63u) ? 63u : d->tries;
+		*flags_out          = (uint8_t)((*flags_out & 0x03u) | (uint8_t)(tries << 2));
+	}
 }
 
 /* Current WI-FI role for GET_DIAG_INFO (see cc3501e_hw.h).  Pure bookkeeping --
@@ -385,6 +430,14 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	 * GET_DIAG_INFO reads this unconditionally, so the non-Wi-Fi ti build must
 	 * define it too (matches cc3501e_hw_stub.c). */
 	return 0u;
+}
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	/* No lwIP linked in this build, so there is no DHCP client to report on.
+	 * Zero is the wire's "not reported", which is the honest answer here --
+	 * same reason cc3501e_hw_wifi_last_event_id() above must exist. */
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
 }
 #endif /* CC3501E_WIFI */
 
@@ -786,8 +839,25 @@ static void wifi_clear_stale_assoc(void)
  * associate-then-10s-DHCP, and NOT with the 30 s association wait above, which
  * never expired.
  *
- * THIS CHANGE DOES NOT FIX THAT BENCH FAILURE, and the measurement that says so
- * came from the same transcript.  After the failed connect the host polled
+ * THIS CHANGE IS NOT A CURE, but do not read it as a no-op either -- an earlier
+ * version of this comment over-retracted it, and the correction is worth having.
+ *
+ * MEASURED 2026-09-12 on the image that reports lwIP's own DHCP state: the
+ * failure is INTERMITTENT, not absolute.  Across four runs at -78 dBm the
+ * station leased once (192.168.1.194, followed by a full TCP round trip to
+ * 192.168.1.1:80) and failed to lease on the others, and in a failing run the
+ * diagnostic read DHCP_STATE_SELECTING with tries = 5 -- DISCOVERs leaving,
+ * mostly unanswered.
+ *
+ * With a per-attempt success probability below one, attempts are what buy you a
+ * lease, and this budget is what decides how many happen INSIDE the connect
+ * call: three at 10 s (t = 0, 2, 6), four at 20 s (adding t = 14).  So the
+ * change genuinely improves the odds of the connect itself succeeding.  What it
+ * cannot do is make an unanswered DISCOVER answered, which is why the cause
+ * still sits below this function.
+ *
+ * The evidence that first prompted the retraction still stands and still
+ * matters.  After the failed connect the host polled
  * WIFI_GET_IP once a second for 30 s and got "no address" every single time --
  * and those answers are trustworthy rather than a dead link, because
  * GET_DIAG_INFO, BLE_ENABLE, BLE_SCAN, BLE_DISABLE and a proxied GPIO read all
