@@ -55,6 +55,10 @@ appControlBlock app_CB;
 /* InitTerm() -- see the call in cc3501e_hw_net_init() for why a headless bridge
  * with an unrouted UART still has to initialise the vendor console. */
 #include <uart_term.h>
+/* netif_is_up / netif_is_link_up / netif_dhcp_data + struct dhcp, for the
+ * GET_DIAG_INFO DHCP-state bytes (cc3501e_hw_wifi_dhcp_diag below). */
+#include <lwip/netif.h>
+#include <lwip/dhcp.h>
 #endif
 
 #include "alp/protocol/cc3501e.h"
@@ -204,6 +208,47 @@ static void wifi_event_cb(WlanEvent_t *event)
 uint32_t cc3501e_hw_wifi_last_event_id(void)
 {
 	return wifi_cb_last_id;
+}
+
+/* See the contract on the declaration in hal/cc3501e_hw.h. */
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
+
+	/* network_stack_init() has not run on a boot that never brought lwIP up
+	 * (update mode skips cc3501e_hw_net_init entirely), so the netif pointer is
+	 * the thing to guard on, not wifi_started: the netif is registered at BOOT,
+	 * long before any radio op. */
+	struct netif *nif = (struct netif *)network_get_sta_if();
+	if (nif == 0) {
+		return;
+	}
+
+	if (flags_out != 0) {
+		uint8_t f = 0u;
+		if (netif_is_up(nif)) f |= 0x01u;
+		if (netif_is_link_up(nif)) f |= 0x02u;
+		*flags_out = f;
+	}
+
+	/* NULL until dhcp_start() runs, which is exactly the case worth telling
+	 * apart -- it leaves state_out at 0, "not reported", rather than
+	 * fabricating a DHCP_STATE_OFF that would look like a started-then-stopped
+	 * client. */
+	struct dhcp *d = netif_dhcp_data(nif);
+	if (d == 0) {
+		return;
+	}
+	if (state_out != 0) {
+		/* +1 so 0 stays reserved for "not reported"; d->state is u8_t and the
+		 * enum tops out well below 255, so this cannot wrap. */
+		*state_out = (uint8_t)(d->state + 1u);
+	}
+	if (flags_out != 0) {
+		const uint8_t tries = (d->tries > 63u) ? 63u : d->tries;
+		*flags_out          = (uint8_t)((*flags_out & 0x03u) | (uint8_t)(tries << 2));
+	}
 }
 
 /* Current WI-FI role for GET_DIAG_INFO (see cc3501e_hw.h).  Pure bookkeeping --
@@ -385,6 +430,14 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	 * GET_DIAG_INFO reads this unconditionally, so the non-Wi-Fi ti build must
 	 * define it too (matches cc3501e_hw_stub.c). */
 	return 0u;
+}
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	/* No lwIP linked in this build, so there is no DHCP client to report on.
+	 * Zero is the wire's "not reported", which is the honest answer here --
+	 * same reason cc3501e_hw_wifi_last_event_id() above must exist. */
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
 }
 #endif /* CC3501E_WIFI */
 

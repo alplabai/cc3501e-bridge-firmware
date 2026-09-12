@@ -596,6 +596,16 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	return 0u;
 }
 
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	/* No lwIP in the stub, so there is no DHCP client to report on.  Zero is the
+	 * wire's "not reported" for both bytes, which is the honest answer -- same
+	 * reason cc3501e_hw_wifi_last_event_id() above returns 0 rather than
+	 * inventing an event. */
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
+}
+
 uint8_t cc3501e_hw_radio_role(void)
 {
 	/* The stub brings no radio up -- every wifi_ap_start / connect here returns
