@@ -651,8 +651,59 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
  *
  * Deliberately NOT cc3501e_hw_wifi_disconnect(): that mirrors DISCONNECTED /
  * FAIL_NONE into the status latch, which would erase the very fail_reason the host
- * is about to read.  Callers invoke this BEFORE their wifi_conn_set(), so the
- * failure latch is written last and wins.
+ * is about to read.
+ *
+ * CALLERS NOW INVOKE THIS *AFTER* THEIR wifi_conn_set(), not before.  The old
+ * order was justified by "the failure latch is written last and wins", but that
+ * reasoning belongs to cc3501e_hw_wifi_disconnect(), which writes the latch.
+ * THIS helper does not touch it, so nothing is won by going first -- and going
+ * first costs the host its verdict.
+ *
+ * IT DOES NOT HANG.  Settled by reading the SDK, not inferred: Wlan_Disconnect's
+ * STA branch is `ret = CME_WlanDisconnect(TRUE)`, and CME_WlanDisconnect ends in
+ * `pushMsg2Queue(&msg); return status;` -- it dispatches a message and returns,
+ * with no blocking wait
+ * (SDK source/ti/net/wifi_stack/app_entry/wlan_if.c and .../cme/cme.c).  The
+ * bench agrees: on the scan-first ordering a failed association is followed by
+ * BLE_ENABLE, BLE_SCAN and BLE_DISABLE all succeeding, 2 of 2, and those are
+ * worker-routed so they can only drain after this body returned.  An earlier
+ * version of this comment asserted the hang as the campaign's central symptom.
+ * It was wrong.
+ *
+ * WHAT THE SDK DOES SHOW IS WORSE, AND IT IS THE #1437 MECHANISM.
+ * Wlan_Disconnect first calls set_cond_in_process_wlan_discconnect(1), which
+ * sets WLAN_IF_DISCONNECT_IN_PROGRESS in the SDK's g_oper_bitmap.  On the STA
+ * branch it then returns WITHOUT calling set_finish_wlan_disconnect() -- only
+ * the AP branch and the failure label clear it inline.  The bit is otherwise
+ * cleared in exactly one place: the WLAN_EVENT_DISCONNECT handler.
+ *
+ * And Wlan_Connect gates on that same bitmap.  It calls
+ * set_cond_in_process_wlan_connect() -> is_wlan_oper_in_progress(), whose
+ * allow-mask for CONNECT is ROLE_UP_AP | ROLE_DOWN_AP | SET | GET | GET_EXCLUDE
+ * | SET_EXCLUDE.  WLAN_IF_DISCONNECT_IN_PROGRESS is NOT in it.  So while that
+ * bit is set, every Wlan_Connect returns RET_OPER_IN_PROGRESS immediately --
+ * which this file maps to ALP_CC3501E_WIFI_FAIL_KICK.
+ *
+ * That is EXACTLY the #1437 symptom this helper exists to prevent: "the next
+ * connect, with a correct SSID and passphrase, fails at the role-up kick with
+ * FAIL_KICK".  So the helper may be causing the bug it was added to cure.
+ *
+ * NOT PROVEN, and the gap is specific: whether the supplicant emits
+ * WLAN_EVENT_DISCONNECT when asked to disconnect a STA that never associated.
+ * If it does, the bit clears and this is a non-issue.  If it does not, the bit
+ * sticks for the rest of the session and every later connect dies at the kick.
+ * That is one bench observation away -- a failed connect, then a second connect,
+ * and read fail_reason -- and it is worth taking before changing this helper.
+ *
+ * Ordering the latch first is therefore cheap insurance, not the cure: it costs
+ * nothing, and it means a hang ANYWHERE after it -- this call, the drain's own
+ * reinit, or something else -- still leaves the host holding a verdict.
+ * FAIL_KICK vs FAIL_TIMEOUT vs FAIL_REJECTED is the difference between a wrong
+ * passphrase, a marginal signal, and a firmware defect.  Bounding or deferring
+ * the call is deliberately NOT done here: the tree requires a busy/reinit/ready
+ * bracket around a disconnect (see src/worker.c and src/protocol_wifi.c), a
+ * bare tick-deferred flag would drop that, and deferring bounds nothing anyway
+ * since the tick runs on the same task.
  *
  * Best-effort: the association may already be gone, so a non-zero return is not
  * itself a failure -- the caller's own error is what gets reported. */
@@ -763,8 +814,8 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	                 (const char *)psk,
 	                 (char)psk_len,
 	                 0) != 0) {
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
+		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		return CC3501E_HW_ERR_IO;
 	}
 	/* BOUNDED wait for the connect event.  This op is WORKER-ROUTED (see protocol.c
@@ -788,17 +839,17 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	if (osi_SyncObjWait(&wifi_event_sync, 30u * OSI_WAIT_FOR_SECOND) != OSI_OK) {
 		/* No connect event within the wait -- TERMINAL timeout (was masked as a
 		 * retryable IO that looped the host's poll-by-repeat -> -4). */
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
 		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT);
+		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		return CC3501E_HW_ERR_IO;
 	}
 	if (wifi_last_status < 0) {
 		/* FW rejected the association/auth (WLAN_EVENT_CONNECT Status<0, or a
 		 * DISCONNECT/ASSOCIATION_REJECTED/AUTHENTICATION_REJECTED event) -- TERMINAL. */
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
 		              (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED);
+		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
 		return CC3501E_HW_ERR_IO;
 	}
 	/* L2 ASSOCIATED.  Bring the STA netif UP at L3 + start DHCP, MIRRORING the AP path
