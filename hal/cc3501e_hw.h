@@ -546,4 +546,24 @@ uint8_t cc3501e_hw_radio_role(void);
  * the free_heap_bytes field. */
 uint32_t cc3501e_hw_wifi_last_event_id(void);
 
+/* lwIP's own view of the STA DHCP client, for GET_DIAG_INFO's two APPENDED
+ * bytes (16 and 17).  Nothing the host could previously read distinguishes
+ * "dhcp_start() never ran" from "DISCOVERs are going out and nothing answers",
+ * and on this SoM there is no console to watch it from -- the CC35 UART2 pins
+ * and the radio tracer pin are both unrouted, measured 2026-08-29.
+ *
+ * @param state_out  lwIP dhcp->state PLUS ONE, so that 0 can mean "not
+ *                   reported" -- either this firmware has no lwIP linked, or the
+ *                   netif has no dhcp struct because DHCP was never started.
+ *                   1 therefore means DHCP_STATE_OFF, 7 means SELECTING and 11
+ *                   means BOUND.
+ * @param flags_out  bit0 netif UP, bit1 netif LINK_UP, bits 2..7 dhcp->tries
+ *                   saturated at 63.  tries is what separates "one DISCOVER went
+ *                   out" from "six went out and none were answered".
+ *
+ * Both are best-effort diagnostics: a torn read costs one misleading diagnostic
+ * byte and nothing else, which is why this does NOT take LOCK_TCPIP_CORE -- the
+ * diag opcode must stay a light, non-blocking read. */
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out);
+
 #endif /* CC3501E_BRIDGE_HAL_CC3501E_HW_H */

@@ -52,6 +52,13 @@ appControlBlock app_CB;
 /* uptime source for cc3501e_hw_wifi_connect_sta's bounded DHCP-lease poll
  * (ClockP_usleep between tries so the tcpip thread runs DHCP). */
 #include <ti/drivers/dpl/ClockP.h>
+/* InitTerm() -- see the call in cc3501e_hw_net_init() for why a headless bridge
+ * with an unrouted UART still has to initialise the vendor console. */
+#include <uart_term.h>
+/* netif_is_up / netif_is_link_up / netif_dhcp_data + struct dhcp, for the
+ * GET_DIAG_INFO DHCP-state bytes (cc3501e_hw_wifi_dhcp_diag below). */
+#include <lwip/netif.h>
+#include <lwip/dhcp.h>
 #endif
 
 #include "alp/protocol/cc3501e.h"
@@ -203,6 +210,47 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	return wifi_cb_last_id;
 }
 
+/* See the contract on the declaration in hal/cc3501e_hw.h. */
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
+
+	/* network_stack_init() has not run on a boot that never brought lwIP up
+	 * (update mode skips cc3501e_hw_net_init entirely), so the netif pointer is
+	 * the thing to guard on, not wifi_started: the netif is registered at BOOT,
+	 * long before any radio op. */
+	struct netif *nif = (struct netif *)network_get_sta_if();
+	if (nif == 0) {
+		return;
+	}
+
+	if (flags_out != 0) {
+		uint8_t f = 0u;
+		if (netif_is_up(nif)) f |= 0x01u;
+		if (netif_is_link_up(nif)) f |= 0x02u;
+		*flags_out = f;
+	}
+
+	/* NULL until dhcp_start() runs, which is exactly the case worth telling
+	 * apart -- it leaves state_out at 0, "not reported", rather than
+	 * fabricating a DHCP_STATE_OFF that would look like a started-then-stopped
+	 * client. */
+	struct dhcp *d = netif_dhcp_data(nif);
+	if (d == 0) {
+		return;
+	}
+	if (state_out != 0) {
+		/* +1 so 0 stays reserved for "not reported"; d->state is u8_t and the
+		 * enum tops out well below 255, so this cannot wrap. */
+		*state_out = (uint8_t)(d->state + 1u);
+	}
+	if (flags_out != 0) {
+		const uint8_t tries = (d->tries > 63u) ? 63u : d->tries;
+		*flags_out          = (uint8_t)((*flags_out & 0x03u) | (uint8_t)(tries << 2));
+	}
+}
+
 /* Current WI-FI role for GET_DIAG_INFO (see cc3501e_hw.h).  Pure bookkeeping --
  * no Wlan_Get, so this is safe to poll while a role is up.
  *
@@ -302,6 +350,50 @@ void cc3501e_hw_wifi_boot_start(void)
  * netif_add (no thread wait), so it is unaffected by the busy-poll thereafter. */
 void cc3501e_hw_net_init(void)
 {
+	/* Initialise the vendor console terminal.  This bridge has no console and the
+	 * UART is not routed, so the obvious reading is that this call is pointless.  It
+	 * is not: WITHOUT it the shipped image dereferences a NULL UART handle on every
+	 * station connect.
+	 *
+	 * Read out of build/ti/cc3501e-bridge.out as shipped in v0.8.0:
+	 *
+	 *     link_callback:  ... bl <Report>        ; "link_callback==UP starting DHCP"
+	 *                     ... bl <dhcp_start>
+	 *
+	 *     Report -> Message -> UART_writePolling -> putch
+	 *            -> UART2_write(uartHandle, ...)
+	 *     UART2_writeTimeout:  ldr r4, [r0, #0]  ; the handle, with NO null check
+	 *
+	 * and `InitTerm` does not appear in that image at all -- it was dead-stripped
+	 * because nothing called it -- so `uartHandle` is never assigned and stays NULL
+	 * from .bss.  The vendor's link_callback() (network_terminal demo's
+	 * network_lwip.c, which ti/build_ti.sh compiles verbatim) calls Report() there
+	 * unconditionally, and hal/ti/cc3501e_hw_ti_sock.c calls it on its own socket
+	 * error paths.  Both run that dereference: on the worker task, under
+	 * LOCK_TCPIP_CORE, immediately before dhcp_start().
+	 *
+	 * ti/cc3501e_aen_wifi.syscfg says "the bridge firmware never calls
+	 * InitTerm()/Report()".  The first half is what caused this; the second half is
+	 * simply wrong, and the disassembly above is why.
+	 *
+	 * NOT CLAIMED: that this is why the station never gets a lease.  The connect
+	 * body demonstrably returns and the bridge demonstrably keeps serving BLE, GPIO
+	 * and diagnostics afterwards, so whatever that dereference does on this silicon,
+	 * it is survivable today.  What cannot stand is a shipped image whose Wi-Fi
+	 * connect path depends on the contents of address 0 -- that is undefined
+	 * behaviour whose outcome can change with any relink.
+	 *
+	 * Opening the unrouted UART is proven safe rather than assumed: a probe build on
+	 * 2026-08-29 opened UART2_0, got a non-NULL handle and wrote 188988 bytes with
+	 * UART2_STATUS_SUCCESS (both XDS110 COM ports received nothing, because
+	 * GPIO5/GPIO6 do not reach the probe on this SoM -- see the syscfg).  The cost is
+	 * a polled TX of a few dozen characters at 115200 on the connect path, a couple
+	 * of milliseconds, and TX drains with no receiver attached.
+	 *
+	 * Called BEFORE network_stack_init() so the terminal is valid before any vendor
+	 * callback can reach Report(). */
+	InitTerm();
+
 	network_stack_init();
 	/* Register the STA netif HERE at boot too -- before transport_spi_init() spawns
 	 * the busy-poll bridge task.  network_stack_add_if_sta() does LOCK_TCPIP_CORE +
@@ -338,6 +430,14 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	 * GET_DIAG_INFO reads this unconditionally, so the non-Wi-Fi ti build must
 	 * define it too (matches cc3501e_hw_stub.c). */
 	return 0u;
+}
+void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
+{
+	/* No lwIP linked in this build, so there is no DHCP client to report on.
+	 * Zero is the wire's "not reported", which is the honest answer here --
+	 * same reason cc3501e_hw_wifi_last_event_id() above must exist. */
+	if (state_out != 0) *state_out = 0u;
+	if (flags_out != 0) *flags_out = 0u;
 }
 #endif /* CC3501E_WIFI */
 
@@ -715,9 +815,113 @@ static void wifi_clear_stale_assoc(void)
 }
 
 /* STA L3 bring-up: bounded DHCP-lease poll after the L2 connect event.
- * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 50 * 200 ms = 10 s budget
- * (the worker drain sleeps between tries so the tcpip thread runs DHCP). */
-#define CC3501E_STA_DHCP_TRIES 50u
+ * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 100 * 200 ms = 20 s budget
+ * (the worker drain sleeps between tries so the tcpip thread runs DHCP).
+ *
+ * 20 s, not the 10 s this shipped with, and the four-second difference is the
+ * whole point.  lwIP retransmits DISCOVER on a doubling backoff: dhcp_discover()
+ * increments dhcp->tries AFTER the send and then arms
+ *
+ *     msecs = (u16_t)((dhcp->tries < 6 ? 1 << dhcp->tries : 60) * 1000);
+ *
+ * (third_party/lwip/lwip-stack/src/core/ipv4/dhcp.c in the vendor SDK), so the
+ * sends land at t = 0, 2, 6, 14, 30, 62 s.  A 10 s budget therefore emits
+ * exactly THREE DISCOVERs -- the last at t=6 -- and then gives up at t=10, four
+ * seconds of dead air before the fourth would have gone out.  That is the worst
+ * available place to stop: inside the longest gap so far, having spent only the
+ * three shortest retries.
+ *
+ * The association SUCCEEDS, which is what makes the lease the interesting half.
+ * Bench-measured on an E1M-AEN801 with the on-board antenna: a post-fail
+ * WIFI_GET_RSSI reads -75 dBm with status 0, which a radio that never associated
+ * cannot produce, and the scan reports the same -75 dBm for the same AP.  The
+ * connect failures returned at 14.45 s and 16.87 s -- consistent with
+ * associate-then-10s-DHCP, and NOT with the 30 s association wait above, which
+ * never expired.
+ *
+ * THIS CHANGE IS NOT A CURE, but do not read it as a no-op either -- an earlier
+ * version of this comment over-retracted it, and the correction is worth having.
+ *
+ * MEASURED 2026-09-12 on the image that reports lwIP's own DHCP state: the
+ * failure is INTERMITTENT, not absolute.  Across four runs at -78 dBm the
+ * station leased once (192.168.1.194, followed by a full TCP round trip to
+ * 192.168.1.1:80) and failed to lease on the others, and in a failing run the
+ * diagnostic read DHCP_STATE_SELECTING with tries = 5 -- DISCOVERs leaving,
+ * mostly unanswered.
+ *
+ * With a per-attempt success probability below one, attempts are what buy you a
+ * lease, and this budget is what decides how many happen INSIDE the connect
+ * call: three at 10 s (t = 0, 2, 6), four at 20 s (adding t = 14).  So the
+ * change genuinely improves the odds of the connect itself succeeding.  What it
+ * cannot do is make an unanswered DISCOVER answered, which is why the cause
+ * still sits below this function.
+ *
+ * The evidence that first prompted the retraction still stands and still
+ * matters.  After the failed connect the host polled
+ * WIFI_GET_IP once a second for 30 s and got "no address" every single time --
+ * and those answers are trustworthy rather than a dead link, because
+ * GET_DIAG_INFO, BLE_ENABLE, BLE_SCAN, BLE_DISABLE and a proxied GPIO read all
+ * succeeded AFTERWARDS on the same link.  Nothing here tears the association or
+ * the netif down on the no-lease path (this function just latches and returns),
+ * so lwIP's DHCP client kept running throughout.  Association plus the 10 s
+ * in-body poll plus 30 s of host polling is roughly 40 s with no lease, which
+ * spans the DISCOVERs at 0, 2, 6, 14 AND 30 s.  A fourth attempt would have
+ * changed nothing.
+ *
+ * The budget is still wrong as written and still worth correcting: stopping four
+ * seconds before a retransmit cannot be the right place to give up, whatever the
+ * cause turns out to be.  Treat this as removing a confounder, not as the fix.
+ *
+ * 20 s covers the fourth DISCOVER at t=14 and leaves 6 s for OFFER/REQUEST/ACK.
+ * Deliberately NOT 35 s to also cover the fifth at t=30, and the caller's budget
+ * is why.  This image never calls cc3501e_hw_wifi_boot_start() (see src/main.c),
+ * so a connect issued as the first radio op of a boot carries Wlan_Start, a
+ * Wlan_Set and a 10 s Wlan_RoleUp INSIDE this body, before the 30 s association
+ * wait -- prebuilt/CHANGELOG.md records that.  The association timeout and this
+ * poll are mutually exclusive (a timed-out association returns above and never
+ * reaches DHCP), so the deepest path that reaches here is
+ * role-up + association + lease = 10 + 30 + 20 = 60 s against the 70000 ms the
+ * bench apps pass.  At 35 s that same path is 75 s and the caller gives up
+ * first, turning a fixable lease delay back into an unreadable host timeout.
+ *
+ * Measured, that path is nowhere near its worst case: the two failing runs took
+ * 14.45 s and 16.87 s end to end, so role-up plus association cost roughly 4.5 s
+ * and the new budget puts them at about 24.5 s.
+ *
+ * Where the real cause is NOT, as far as static reading can settle it: the
+ * vendor netif plumbing.  cc3501e_hw_net_init() calls network_stack_add_if_sta()
+ * at boot, _role_sta_up() installs both callbacks, network_set_up() does
+ * netif_set_up then netif_set_link_up, status_callback() fills hwaddr from
+ * Wlan_Get(WLAN_GET_MACADDRESS) (pMacAddress is a 6-byte array, so the memcpy is
+ * not a truncated pointer), and link_callback() registers the receive path via
+ * Wlan_EtherPacketRecvRegisterCallback() and then calls dhcp_start() because
+ * sta_ip_mode initialises to IP_DHCP and isIpAcquired starts zero.  All of that
+ * is in the network_terminal demo's network_lwip.c, which ti/build_ti.sh
+ * compiles verbatim, and the LP_EM_CC35X1 and LP_EM_CC35X1ET copies are
+ * byte-identical.
+ *
+ * So the next evidence is below lwIP or off-board: the NWP's STA data path, or
+ * the AP declining to lease.
+ *
+ * It CANNOT come from the CC3501E's own console, and an earlier version of this
+ * comment wrongly proposed that.  link_callback() does print "link_callback==UP
+ * starting DHCP" and "DHCP is %d" through Report(), but ti/cc3501e_aen_wifi.syscfg
+ * records the measurement that kills the idea: on the E1M-AEN801 the CC35 UART2
+ * pins (GPIO5/GPIO6) are NOT routed to the debug probe.  A probe build opened
+ * UART2_0, got a non-NULL handle and wrote 188988 bytes with
+ * UART2_STATUS_SUCCESS while BOTH XDS110 COM ports received zero bytes across a
+ * full cold boot.  The radio tracer pin (GPIO9) is unrouted as well, and an
+ * activated part exposes no MEM-AP over SWD.  There is no console here.
+ *
+ * The decisive read therefore has to travel over the bridge link itself, and
+ * lwIP already holds the answer: netif_dhcp_data(sta netif)->state separates the
+ * two candidates outright.  DHCP_STATE_OFF means dhcp_start() never ran and the
+ * fault is above the radio; SELECTING with ->tries climbing means DISCOVERs are
+ * leaving and nothing is coming back, which points at the NWP data path or the
+ * AP.  Reporting that state, ->tries, and netif->flags through GET_DIAG_INFO is
+ * the smallest change that ends the guessing, and it needs no wiring that this
+ * SoM does not have. */
+#define CC3501E_STA_DHCP_TRIES 100u
 
 /* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
  * cc3501e_hw_wifi_ap_start() for why each one matters.  Values mirror TI's

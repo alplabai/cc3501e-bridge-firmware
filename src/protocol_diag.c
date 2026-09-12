@@ -177,6 +177,37 @@ alp_cc3501e_resp_t handle_get_diag_info(const uint8_t *req,
 	 * ALP_CC3501E_PROTOCOL_VERSION bump of its own (v5 is for opcode 0x47). */
 	reply_data[15]  = bridge_transport_spi_boot_mark();
 	*reply_data_len = 16u;
+
+	/* APPENDED bytes 16..17: lwIP's own view of the STA DHCP client.
+	 *
+	 * Why appended rather than folded into a reserved byte: all three are taken
+	 * (reserved[0] the radio event id, reserved[1] the last OTA flush fault,
+	 * reserved[2] the update-mode boot mark).
+	 *
+	 * Why this does not break an older host: alp-sdk's cc3501e_request()
+	 * truncates the copy to the caller's capacity, and cc3501e_diag_info()
+	 * passes a 16-byte buffer and checks `got < sizeof(reply)` -- a MINIMUM, not
+	 * an exact length.  An old host therefore asks for 16, gets 16, parses
+	 * normally, and never sees these bytes.
+	 *
+	 * Why it is worth two bytes: nothing a host could previously read separates
+	 * "dhcp_start() never ran" from "DISCOVERs are going out and nothing is
+	 * answering", and on this SoM there is no console to watch it from -- the
+	 * CC35 UART2 pins and the radio tracer pin are both unrouted (measured
+	 * 2026-08-29, see ti/cc3501e_aen_wifi.syscfg).  The station associates and
+	 * then never gets an address; these two bytes are what tell the two
+	 * remaining candidates apart.
+	 *
+	 * Conditional on reply_cap so a smaller reply budget keeps the original
+	 * 16-byte answer instead of failing outright -- a diagnostic opcode has to
+	 * keep working when other things do not. */
+	if (reply_cap >= 18u) {
+		uint8_t dhcp_state = 0u, dhcp_flags = 0u;
+		cc3501e_hw_wifi_dhcp_diag(&dhcp_state, &dhcp_flags);
+		reply_data[16]  = dhcp_state;
+		reply_data[17]  = dhcp_flags;
+		*reply_data_len = 18u;
+	}
 	return ALP_CC3501E_RESP_OK;
 }
 
