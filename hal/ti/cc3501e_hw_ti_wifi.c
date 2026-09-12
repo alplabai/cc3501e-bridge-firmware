@@ -731,12 +731,29 @@ static void wifi_clear_stale_assoc(void)
  * available place to stop: inside the longest gap so far, having spent only the
  * three shortest retries.
  *
- * This matters because the association SUCCEEDS.  Bench-measured on an
- * E1M-AEN801 with the on-board antenna: a post-fail WIFI_GET_RSSI reads -75 dBm
- * with status 0, which a radio that never associated cannot produce, and the
- * scan reports the same -75 dBm for the same AP.  The connect failures returned
- * at 14.45 s and 16.87 s -- consistent with associate-then-10s-DHCP, and NOT
- * with the 30 s association wait above, which never expired.
+ * The association SUCCEEDS, which is what makes the lease the interesting half.
+ * Bench-measured on an E1M-AEN801 with the on-board antenna: a post-fail
+ * WIFI_GET_RSSI reads -75 dBm with status 0, which a radio that never associated
+ * cannot produce, and the scan reports the same -75 dBm for the same AP.  The
+ * connect failures returned at 14.45 s and 16.87 s -- consistent with
+ * associate-then-10s-DHCP, and NOT with the 30 s association wait above, which
+ * never expired.
+ *
+ * THIS CHANGE DOES NOT FIX THAT BENCH FAILURE, and the measurement that says so
+ * came from the same transcript.  After the failed connect the host polled
+ * WIFI_GET_IP once a second for 30 s and got "no address" every single time --
+ * and those answers are trustworthy rather than a dead link, because
+ * GET_DIAG_INFO, BLE_ENABLE, BLE_SCAN, BLE_DISABLE and a proxied GPIO read all
+ * succeeded AFTERWARDS on the same link.  Nothing here tears the association or
+ * the netif down on the no-lease path (this function just latches and returns),
+ * so lwIP's DHCP client kept running throughout.  Association plus the 10 s
+ * in-body poll plus 30 s of host polling is roughly 40 s with no lease, which
+ * spans the DISCOVERs at 0, 2, 6, 14 AND 30 s.  A fourth attempt would have
+ * changed nothing.
+ *
+ * The budget is still wrong as written and still worth correcting: stopping four
+ * seconds before a retransmit cannot be the right place to give up, whatever the
+ * cause turns out to be.  Treat this as removing a confounder, not as the fix.
  *
  * 20 s covers the fourth DISCOVER at t=14 and leaves 6 s for OFFER/REQUEST/ACK.
  * Deliberately NOT 35 s to also cover the fifth at t=30, and the caller's budget
@@ -754,10 +771,23 @@ static void wifi_clear_stale_assoc(void)
  * 14.45 s and 16.87 s end to end, so role-up plus association cost roughly 4.5 s
  * and the new budget puts them at about 24.5 s.
  *
- * If a lease still never arrives at 20 s, this budget is not the defect and the
- * fix is elsewhere -- the AP's DHCP server, or the NWP's bridging of the STA
- * netif -- but the failure will then be a real 20 s of trying rather than a stop
- * in the middle of the backoff. */
+ * Where the real cause is NOT, as far as static reading can settle it: the
+ * vendor netif plumbing.  cc3501e_hw_net_init() calls network_stack_add_if_sta()
+ * at boot, _role_sta_up() installs both callbacks, network_set_up() does
+ * netif_set_up then netif_set_link_up, status_callback() fills hwaddr from
+ * Wlan_Get(WLAN_GET_MACADDRESS) (pMacAddress is a 6-byte array, so the memcpy is
+ * not a truncated pointer), and link_callback() registers the receive path via
+ * Wlan_EtherPacketRecvRegisterCallback() and then calls dhcp_start() because
+ * sta_ip_mode initialises to IP_DHCP and isIpAcquired starts zero.  All of that
+ * is in the network_terminal demo's network_lwip.c, which ti/build_ti.sh
+ * compiles verbatim, and the LP_EM_CC35X1 and LP_EM_CC35X1ET copies are
+ * byte-identical.
+ *
+ * So the next evidence is below lwIP or off-board: the NWP's STA data path, or
+ * the AP declining to lease.  The cheapest decisive read needs no code change at
+ * all -- link_callback() already prints "link_callback==UP starting DHCP" and
+ * "DHCP is %d" through Report(), so capturing the CC3501E's own serial output
+ * across a connect says whether dhcp_start() ran and what it returned. */
 #define CC3501E_STA_DHCP_TRIES 100u
 
 /* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
