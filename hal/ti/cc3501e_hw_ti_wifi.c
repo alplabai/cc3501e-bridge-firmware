@@ -659,20 +659,41 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
  * THIS helper does not touch it, so nothing is won by going first -- and going
  * first costs the host its verdict.
  *
- * Wlan_Disconnect() takes NO timeout parameter and has no bound in our source,
- * and the whole bridge is served by the single bring-up task (src/main.c runs
- * worker_run_pending() and cc3501e_hw_tick() on it in one loop).  So IF this
- * call did not return, the task would be gone, the latch would never be
- * written, and CMD_WIFI_STATUS could only time out.
+ * IT DOES NOT HANG.  Settled by reading the SDK, not inferred: Wlan_Disconnect's
+ * STA branch is `ret = CME_WlanDisconnect(TRUE)`, and CME_WlanDisconnect ends in
+ * `pushMsg2Queue(&msg); return status;` -- it dispatches a message and returns,
+ * with no blocking wait
+ * (SDK source/ti/net/wifi_stack/app_entry/wlan_if.c and .../cme/cme.c).  The
+ * bench agrees: on the scan-first ordering a failed association is followed by
+ * BLE_ENABLE, BLE_SCAN and BLE_DISABLE all succeeding, 2 of 2, and those are
+ * worker-routed so they can only drain after this body returned.  An earlier
+ * version of this comment asserted the hang as the campaign's central symptom.
+ * It was wrong.
  *
- * BUT THE EVIDENCE LEANS THE OTHER WAY -- stated plainly because an earlier
- * version of this comment asserted the hang as established, and it is not.  On
- * the scan-first ordering a failed association is followed by BLE_ENABLE,
- * BLE_SCAN and BLE_DISABLE all succeeding, 2 of 2 runs.  Those are
- * worker-routed, so they can only drain AFTER this body returned -- including
- * this call.  So on that path Wlan_Disconnect() demonstrably returns.  The
- * structural difference on the wedging connect-first path is the missing reinit
- * between the role-up and Wlan_Connect, not this call.
+ * WHAT THE SDK DOES SHOW IS WORSE, AND IT IS THE #1437 MECHANISM.
+ * Wlan_Disconnect first calls set_cond_in_process_wlan_discconnect(1), which
+ * sets WLAN_IF_DISCONNECT_IN_PROGRESS in the SDK's g_oper_bitmap.  On the STA
+ * branch it then returns WITHOUT calling set_finish_wlan_disconnect() -- only
+ * the AP branch and the failure label clear it inline.  The bit is otherwise
+ * cleared in exactly one place: the WLAN_EVENT_DISCONNECT handler.
+ *
+ * And Wlan_Connect gates on that same bitmap.  It calls
+ * set_cond_in_process_wlan_connect() -> is_wlan_oper_in_progress(), whose
+ * allow-mask for CONNECT is ROLE_UP_AP | ROLE_DOWN_AP | SET | GET | GET_EXCLUDE
+ * | SET_EXCLUDE.  WLAN_IF_DISCONNECT_IN_PROGRESS is NOT in it.  So while that
+ * bit is set, every Wlan_Connect returns RET_OPER_IN_PROGRESS immediately --
+ * which this file maps to ALP_CC3501E_WIFI_FAIL_KICK.
+ *
+ * That is EXACTLY the #1437 symptom this helper exists to prevent: "the next
+ * connect, with a correct SSID and passphrase, fails at the role-up kick with
+ * FAIL_KICK".  So the helper may be causing the bug it was added to cure.
+ *
+ * NOT PROVEN, and the gap is specific: whether the supplicant emits
+ * WLAN_EVENT_DISCONNECT when asked to disconnect a STA that never associated.
+ * If it does, the bit clears and this is a non-issue.  If it does not, the bit
+ * sticks for the rest of the session and every later connect dies at the kick.
+ * That is one bench observation away -- a failed connect, then a second connect,
+ * and read fail_reason -- and it is worth taking before changing this helper.
  *
  * Ordering the latch first is therefore cheap insurance, not the cure: it costs
  * nothing, and it means a hang ANYWHERE after it -- this call, the drain's own
