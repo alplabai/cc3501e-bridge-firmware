@@ -103,6 +103,11 @@ static void pp_release_constraint(uint8_t id)
  * works once a role is up, and the host may configure power at any time. */
 static uint8_t  pp_policy_latched = ALP_CC3501E_PP_BALANCED;
 static uint32_t pp_idle_ms_latched;
+/* Has the HOST ever set a policy?  Until it does, a STA role runs ACTIVE rather
+ * than the BALANCED default -- see cc3501e_hw_power_sta_default_active() for the
+ * measurement behind that, and note the host's own policy still wins the moment
+ * it sends one. */
+static bool pp_host_set_policy;
 /* Set by the SPI-dispatch ISR, consumed by the TASK -- see cc3501e_hw_power_service(). */
 static volatile bool pp_radio_dirty;
 /* Separate from pp_radio_dirty: the CORE half runs ONLY on an explicit host
@@ -325,7 +330,25 @@ void cc3501e_hw_power_service(void)
 	}
 
 	const bool radio_up = (cc3501e_hw_radio_role() != ALP_CC3501E_ROLE_OFF);
-	const bool ok       = pp_apply_radio(pp_policy_latched, pp_idle_ms_latched);
+	/* An un-configured STA runs ACTIVE, not the BALANCED default.  BALANCED maps
+	 * to WLAN_STATION_AUTO_PS_MODE, and applying that here -- which happens right
+	 * after Wlan_RoleUp(STA), before Wlan_Connect -- puts the station to sleep
+	 * exactly when it has to hear a DHCP OFFER.  The AP buffers broadcast and
+	 * multicast until a DTIM beacon, and a sleeping station on a marginal link
+	 * misses beacons and therefore misses DTIMs: measured on e1m-aen-evk-01 at
+	 * -78 dBm, the station associated every time, its DISCOVERs left every time
+	 * (DHCP_STATE_SELECTING, tries = 5), and it leased on roughly one attempt in
+	 * four.
+	 *
+	 * The host's power API stays authoritative: once it sends a POWER_POLICY,
+	 * pp_host_set_policy latches and that policy is applied verbatim, including
+	 * BALANCED.  This only changes what an un-configured station defaults to,
+	 * where the alternative is a bridge that cannot reliably get an address. */
+	const uint8_t eff =
+	    (!pp_host_set_policy && cc3501e_hw_radio_role() != (uint8_t)ALP_CC3501E_ROLE_WIFI_AP)
+	        ? (uint8_t)ALP_CC3501E_PP_PERFORMANCE
+	        : pp_policy_latched;
+	const bool ok = pp_apply_radio(eff, pp_idle_ms_latched);
 
 	pp_radio_ok = radio_up ? ok : true;
 }
@@ -370,6 +393,7 @@ int cc3501e_hw_set_power_policy(uint8_t policy, uint8_t wake_events, uint32_t id
 	 * policy set before Wlan_RoleUp() is re-applied by
 	 * cc3501e_hw_power_reapply_radio() once the STA role is up. */
 	pp_policy_latched  = policy;
+	pp_host_set_policy = true;
 	pp_idle_ms_latched = idle_ms_before_sleep;
 
 	/* Latch the radio half for the TASK.  This function runs in SPI-DISPATCH (ISR)
