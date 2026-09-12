@@ -715,9 +715,50 @@ static void wifi_clear_stale_assoc(void)
 }
 
 /* STA L3 bring-up: bounded DHCP-lease poll after the L2 connect event.
- * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 50 * 200 ms = 10 s budget
- * (the worker drain sleeps between tries so the tcpip thread runs DHCP). */
-#define CC3501E_STA_DHCP_TRIES 50u
+ * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 100 * 200 ms = 20 s budget
+ * (the worker drain sleeps between tries so the tcpip thread runs DHCP).
+ *
+ * 20 s, not the 10 s this shipped with, and the four-second difference is the
+ * whole point.  lwIP retransmits DISCOVER on a doubling backoff: dhcp_discover()
+ * increments dhcp->tries AFTER the send and then arms
+ *
+ *     msecs = (u16_t)((dhcp->tries < 6 ? 1 << dhcp->tries : 60) * 1000);
+ *
+ * (third_party/lwip/lwip-stack/src/core/ipv4/dhcp.c in the vendor SDK), so the
+ * sends land at t = 0, 2, 6, 14, 30, 62 s.  A 10 s budget therefore emits
+ * exactly THREE DISCOVERs -- the last at t=6 -- and then gives up at t=10, four
+ * seconds of dead air before the fourth would have gone out.  That is the worst
+ * available place to stop: inside the longest gap so far, having spent only the
+ * three shortest retries.
+ *
+ * This matters because the association SUCCEEDS.  Bench-measured on an
+ * E1M-AEN801 with the on-board antenna: a post-fail WIFI_GET_RSSI reads -75 dBm
+ * with status 0, which a radio that never associated cannot produce, and the
+ * scan reports the same -75 dBm for the same AP.  The connect failures returned
+ * at 14.45 s and 16.87 s -- consistent with associate-then-10s-DHCP, and NOT
+ * with the 30 s association wait above, which never expired.
+ *
+ * 20 s covers the fourth DISCOVER at t=14 and leaves 6 s for OFFER/REQUEST/ACK.
+ * Deliberately NOT 35 s to also cover the fifth at t=30, and the caller's budget
+ * is why.  This image never calls cc3501e_hw_wifi_boot_start() (see src/main.c),
+ * so a connect issued as the first radio op of a boot carries Wlan_Start, a
+ * Wlan_Set and a 10 s Wlan_RoleUp INSIDE this body, before the 30 s association
+ * wait -- prebuilt/CHANGELOG.md records that.  The association timeout and this
+ * poll are mutually exclusive (a timed-out association returns above and never
+ * reaches DHCP), so the deepest path that reaches here is
+ * role-up + association + lease = 10 + 30 + 20 = 60 s against the 70000 ms the
+ * bench apps pass.  At 35 s that same path is 75 s and the caller gives up
+ * first, turning a fixable lease delay back into an unreadable host timeout.
+ *
+ * Measured, that path is nowhere near its worst case: the two failing runs took
+ * 14.45 s and 16.87 s end to end, so role-up plus association cost roughly 4.5 s
+ * and the new budget puts them at about 24.5 s.
+ *
+ * If a lease still never arrives at 20 s, this budget is not the defect and the
+ * fix is elsewhere -- the AP's DHCP server, or the NWP's bridging of the STA
+ * netif -- but the failure will then be a real 20 s of trying rather than a stop
+ * in the middle of the backoff. */
+#define CC3501E_STA_DHCP_TRIES 100u
 
 /* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
  * cc3501e_hw_wifi_ap_start() for why each one matters.  Values mirror TI's
