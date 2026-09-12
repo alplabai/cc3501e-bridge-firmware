@@ -111,6 +111,26 @@ Two structural findings from that investigation, neither fixed here:
   If the role-up genuinely needs quiescing, the OTA pump's pattern is the shape
   to copy, not `suspend()`.
 
+  **And the premise itself does not survive measurement.** The finding above
+  reads as "the unguarded `Wlan_RoleUp` in the connect body is what wedges the
+  link". It is not. `cc3501e_hw_wifi_scan_run()` performs the SAME
+  `ensure_sta_role()` role-up, equally unguarded, and on this image a scan
+  issued as the first radio operation of a boot completes and returns records,
+  5 of 5 cold-booted runs. A `WIFI_CONNECT_STA` issued as the first radio
+  operation still wedges, at WPA2 and WPA3 alike, and the `WIFI_STATUS` read
+  after it times out too, so the radio's own verdict has never been readable.
+
+  Scoped precisely, on `2026W36-0003`:
+
+  | | `WIFI_SCAN_START` first | `WIFI_CONNECT_STA` first |
+  |---|---|---|
+  | published v0.8.0 | returns records | wedges |
+  | v0.8.0 + the suspend bracket | wedges | wedges |
+
+  So the bracket is a regression that additionally breaks the scan, and the
+  connect wedge predates it and is untouched by it. Whatever wedges the connect
+  is in the connect body AFTER the role-up, not the role-up.
+
 Also note `Wlan_Disconnect()` now runs on every connect failure exit. It was
 added after the last time station association was bench-proven, and it takes
 no timeout parameter.
