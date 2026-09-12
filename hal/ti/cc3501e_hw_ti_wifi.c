@@ -52,6 +52,9 @@ appControlBlock app_CB;
 /* uptime source for cc3501e_hw_wifi_connect_sta's bounded DHCP-lease poll
  * (ClockP_usleep between tries so the tcpip thread runs DHCP). */
 #include <ti/drivers/dpl/ClockP.h>
+/* InitTerm() -- see the call in cc3501e_hw_net_init() for why a headless bridge
+ * with an unrouted UART still has to initialise the vendor console. */
+#include <uart_term.h>
 #endif
 
 #include "alp/protocol/cc3501e.h"
@@ -302,6 +305,50 @@ void cc3501e_hw_wifi_boot_start(void)
  * netif_add (no thread wait), so it is unaffected by the busy-poll thereafter. */
 void cc3501e_hw_net_init(void)
 {
+	/* Initialise the vendor console terminal.  This bridge has no console and the
+	 * UART is not routed, so the obvious reading is that this call is pointless.  It
+	 * is not: WITHOUT it the shipped image dereferences a NULL UART handle on every
+	 * station connect.
+	 *
+	 * Read out of build/ti/cc3501e-bridge.out as shipped in v0.8.0:
+	 *
+	 *     link_callback:  ... bl <Report>        ; "link_callback==UP starting DHCP"
+	 *                     ... bl <dhcp_start>
+	 *
+	 *     Report -> Message -> UART_writePolling -> putch
+	 *            -> UART2_write(uartHandle, ...)
+	 *     UART2_writeTimeout:  ldr r4, [r0, #0]  ; the handle, with NO null check
+	 *
+	 * and `InitTerm` does not appear in that image at all -- it was dead-stripped
+	 * because nothing called it -- so `uartHandle` is never assigned and stays NULL
+	 * from .bss.  The vendor's link_callback() (network_terminal demo's
+	 * network_lwip.c, which ti/build_ti.sh compiles verbatim) calls Report() there
+	 * unconditionally, and hal/ti/cc3501e_hw_ti_sock.c calls it on its own socket
+	 * error paths.  Both run that dereference: on the worker task, under
+	 * LOCK_TCPIP_CORE, immediately before dhcp_start().
+	 *
+	 * ti/cc3501e_aen_wifi.syscfg says "the bridge firmware never calls
+	 * InitTerm()/Report()".  The first half is what caused this; the second half is
+	 * simply wrong, and the disassembly above is why.
+	 *
+	 * NOT CLAIMED: that this is why the station never gets a lease.  The connect
+	 * body demonstrably returns and the bridge demonstrably keeps serving BLE, GPIO
+	 * and diagnostics afterwards, so whatever that dereference does on this silicon,
+	 * it is survivable today.  What cannot stand is a shipped image whose Wi-Fi
+	 * connect path depends on the contents of address 0 -- that is undefined
+	 * behaviour whose outcome can change with any relink.
+	 *
+	 * Opening the unrouted UART is proven safe rather than assumed: a probe build on
+	 * 2026-08-29 opened UART2_0, got a non-NULL handle and wrote 188988 bytes with
+	 * UART2_STATUS_SUCCESS (both XDS110 COM ports received nothing, because
+	 * GPIO5/GPIO6 do not reach the probe on this SoM -- see the syscfg).  The cost is
+	 * a polled TX of a few dozen characters at 115200 on the connect path, a couple
+	 * of milliseconds, and TX drains with no receiver attached.
+	 *
+	 * Called BEFORE network_stack_init() so the terminal is valid before any vendor
+	 * callback can reach Report(). */
+	InitTerm();
+
 	network_stack_init();
 	/* Register the STA netif HERE at boot too -- before transport_spi_init() spawns
 	 * the busy-poll bridge task.  network_stack_add_if_sta() does LOCK_TCPIP_CORE +
@@ -784,10 +831,26 @@ static void wifi_clear_stale_assoc(void)
  * byte-identical.
  *
  * So the next evidence is below lwIP or off-board: the NWP's STA data path, or
- * the AP declining to lease.  The cheapest decisive read needs no code change at
- * all -- link_callback() already prints "link_callback==UP starting DHCP" and
- * "DHCP is %d" through Report(), so capturing the CC3501E's own serial output
- * across a connect says whether dhcp_start() ran and what it returned. */
+ * the AP declining to lease.
+ *
+ * It CANNOT come from the CC3501E's own console, and an earlier version of this
+ * comment wrongly proposed that.  link_callback() does print "link_callback==UP
+ * starting DHCP" and "DHCP is %d" through Report(), but ti/cc3501e_aen_wifi.syscfg
+ * records the measurement that kills the idea: on the E1M-AEN801 the CC35 UART2
+ * pins (GPIO5/GPIO6) are NOT routed to the debug probe.  A probe build opened
+ * UART2_0, got a non-NULL handle and wrote 188988 bytes with
+ * UART2_STATUS_SUCCESS while BOTH XDS110 COM ports received zero bytes across a
+ * full cold boot.  The radio tracer pin (GPIO9) is unrouted as well, and an
+ * activated part exposes no MEM-AP over SWD.  There is no console here.
+ *
+ * The decisive read therefore has to travel over the bridge link itself, and
+ * lwIP already holds the answer: netif_dhcp_data(sta netif)->state separates the
+ * two candidates outright.  DHCP_STATE_OFF means dhcp_start() never ran and the
+ * fault is above the radio; SELECTING with ->tries climbing means DISCOVERs are
+ * leaving and nothing is coming back, which points at the NWP data path or the
+ * AP.  Reporting that state, ->tries, and netif->flags through GET_DIAG_INFO is
+ * the smallest change that ends the guessing, and it needs no wiring that this
+ * SoM does not have. */
 #define CC3501E_STA_DHCP_TRIES 100u
 
 /* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
