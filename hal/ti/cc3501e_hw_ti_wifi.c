@@ -839,8 +839,25 @@ static void wifi_clear_stale_assoc(void)
  * associate-then-10s-DHCP, and NOT with the 30 s association wait above, which
  * never expired.
  *
- * THIS CHANGE DOES NOT FIX THAT BENCH FAILURE, and the measurement that says so
- * came from the same transcript.  After the failed connect the host polled
+ * THIS CHANGE IS NOT A CURE, but do not read it as a no-op either -- an earlier
+ * version of this comment over-retracted it, and the correction is worth having.
+ *
+ * MEASURED 2026-09-12 on the image that reports lwIP's own DHCP state: the
+ * failure is INTERMITTENT, not absolute.  Across four runs at -78 dBm the
+ * station leased once (192.168.1.194, followed by a full TCP round trip to
+ * 192.168.1.1:80) and failed to lease on the others, and in a failing run the
+ * diagnostic read DHCP_STATE_SELECTING with tries = 5 -- DISCOVERs leaving,
+ * mostly unanswered.
+ *
+ * With a per-attempt success probability below one, attempts are what buy you a
+ * lease, and this budget is what decides how many happen INSIDE the connect
+ * call: three at 10 s (t = 0, 2, 6), four at 20 s (adding t = 14).  So the
+ * change genuinely improves the odds of the connect itself succeeding.  What it
+ * cannot do is make an unanswered DISCOVER answered, which is why the cause
+ * still sits below this function.
+ *
+ * The evidence that first prompted the retraction still stands and still
+ * matters.  After the failed connect the host polled
  * WIFI_GET_IP once a second for 30 s and got "no address" every single time --
  * and those answers are trustworthy rather than a dead link, because
  * GET_DIAG_INFO, BLE_ENABLE, BLE_SCAN, BLE_DISABLE and a proxied GPIO read all
