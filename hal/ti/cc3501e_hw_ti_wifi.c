@@ -696,8 +696,58 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
 		return CC3501E_HW_ERR_INVAL;
 	}
+	/* Did THIS call actually perform the role-up?  ensure_sta_role() returns at its
+	 * wifi_sta_role_up early-return with no radio op at all when the role is already
+	 * latched, and in that case the slave is live and callback-armed.  The reinit
+	 * below must not run then -- see its comment. */
+	const bool role_up_was_latched = wifi_sta_role_up;
+
 	const int wifi_rv =
 	    cc3501e_hw_wifi_ensure_sta_role(); /* lazy-start + bounded STA role-up (shared) */
+
+	/* Recover the bridge slave between the role-up and Wlan_Connect, but ONLY when a
+	 * role-up actually happened on this call.
+	 *
+	 * ensure_sta_role() runs Wlan_Set(STA_WIFI_BAND) + Wlan_RoleUp, and a radio op of
+	 * that weight tears the slave's DMA down -- the same teardown lazy_start()
+	 * reinits after Wlan_Start, and the same one cc3501e_hw_wifi_scan_run() reinits
+	 * after its own role-up + Wlan_Scan.  This body had a reinit AFTER it, from the
+	 * worker drain (src/worker.c, WIFI_CONNECT_STA is not on the exemption list), but
+	 * none BETWEEN the role-up and Wlan_Connect: it went straight into a 30 s
+	 * osi_SyncObjWait with the slave down.
+	 *
+	 * Bench-measured asymmetry, published v0.8.0.  CONNECT as the first radio op of a
+	 * boot -- role-up inside this body -- times out AND every opcode after it fails
+	 * until a cold cycle, so the drain's own reinit never runs either, which says the
+	 * drain does not return.  SCAN first -- role-up inside scan_run(), behind its
+	 * reinit -- still fails to associate but the link SURVIVES: BLE_ENABLE, BLE_SCAN,
+	 * BLE_DISABLE and a proxied GPIO read all succeed after it, 2 of 2.
+	 *
+	 * So this reinit is NOT expected to fix the association.  What it should do is
+	 * make the failure observable: a live slave answers PING and WIFI_STATUS off the
+	 * ISR even while the worker is stuck, so the radio's own fail_reason becomes
+	 * readable instead of timing out.  Judge it on that, not on association.
+	 *
+	 * GATED because reinit on a LIVE slave is its own documented hazard, not a no-op:
+	 * transport_hw_ti_spi.c states its precondition is "ONLY right after a radio op",
+	 * cc3501e_hw_ti_ble.c records a reinit on a no-work path taking over 120 s and
+	 * repeatedly wedging the link, and src/worker.c calls that shape "the destructive
+	 * no-op".  The scan-first ordering is the ONE station path that currently
+	 * survives; leaving it byte-identical is deliberate.
+	 *
+	 * Reinit ONLY -- deliberately no bridge_transport_spi_hw_suspend() around the
+	 * role-up.  That was tried, flashed, and wedges the link outright: suspend() calls
+	 * SPI_transferCancel(), which this tree records three times as not returning
+	 * against an armed callback transfer, and bracketing ensure_sta_role() made that
+	 * call reachable in a shipped image for the first time.  See prebuilt/CHANGELOG.md.
+	 * Reinit-only is the proven-safe half: it is what GET_MAC and the scan already do.
+	 *
+	 * The drain's post-body reinit is still required and stays: this one is BEFORE
+	 * Wlan_Connect, the drain's is after the body returns. */
+	if (!role_up_was_latched) {
+		bridge_transport_spi_hw_reinit();
+	}
+
 	if (wifi_rv != CC3501E_HW_OK) {
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
 		return wifi_rv;
@@ -718,10 +768,16 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		return CC3501E_HW_ERR_IO;
 	}
 	/* BOUNDED wait for the connect event.  This op is WORKER-ROUTED (see protocol.c
-	 * wifi_join -> worker), so the wait pends off the SPI ISR; the READY/host-IRQ
-	 * line (CC35 GPIO17 -> Alif P2_6, a rev-1 wire) is held BUSY for the duration --
-	 * the SPI framing itself is hardware SS0 -- so the host never clocks into the
-	 * dead SPI-slave DMA.  The L2 association completes on
+	 * wifi_join -> worker), so the wait pends off the SPI ISR.
+	 *
+	 * NOTE this comment used to add "the READY/host-IRQ line is held BUSY for the
+	 * duration ... so the host never clocks into the dead SPI-slave DMA".  That is no
+	 * longer true on the first-op-is-CONNECT path: the gated reinit above re-arms the
+	 * slave and raises READY before this wait, on purpose, so the host CAN clock
+	 * WIFI_STATUS in and read the radio's verdict.  It is also not true on this bench
+	 * regardless -- READY (CC35 GPIO17 -> Alif P2_6) is an open connection on the
+	 * E1M-AEN801 unit, 0 edges in 20000 samples, so it holds nobody off.  The SPI
+	 * framing itself is hardware SS0.  The L2 association completes on
 	 * silicon.  WPA2 associates ~15s in, but WPA3-SAE is SLOWER (the extra SAE
 	 * commit/confirm exchange + PMF), so a 15s wait raced the WLAN_EVENT_CONNECT and
 	 * timed out on a WPA3 AP even though the association was in progress -- bench-seen
