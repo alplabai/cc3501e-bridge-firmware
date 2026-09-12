@@ -87,11 +87,32 @@ raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
+# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.2.0 (measured 2026-09-12).
+#
+# That unit (module 2026W36-0003) was warm-programmed at 0.254.2.0 that evening:
+# the programmer streamed 1105568 bytes and saved its report, and the part then
+# answered an 18-byte GET_DIAG_INFO that only the new image produces.
+#
+# TWO CONSEQUENCES, BOTH PERMANENT FOR THAT UNIT:
+#   - it can never again boot the shipped v0.8.0 artifact (0.149.222.0), nor the
+#     0.254.0.0 set in cc3501e-release-0.254.0.0.  Both are rollbacks on it now.
+#   - any future image for it must be STRICTLY ABOVE 0.254.2.0.
+#
+# The gpe-floor BELOW is deliberately NOT raised to 0.254.2.0 yet, and the
+# distinction matters.  That number gates the SHIPPED BLOB: raising it without
+# re-wrapping turns check_prebuilt_kind.py red on v0.8.0, because 0.149.222.0 is
+# genuinely below it -- the same floor/re-wrap pairing the v0.6.0 and v0.8.0
+# entries in prebuilt/CHANGELOG.md record.  The two move together, in the
+# release-cut commit.
+#
+# What protects a BENCH OPERATOR is not this number but docs/full-erase-and-flash.md
+# step 2, which says to take the highest of the sets you programmed, your
+# flashing logs, and prebuilt/CHANGELOG.md.  This block is that flashing log.
+#
 # ALSO NOT A CEILING: a complete set stamped 0.254.0.0 exists on the bench host
-# (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and is not
-# recorded here, so it does not move this floor -- but if it was ever programmed
-# to a unit, that unit's real floor is 0.254.0.0.  Establish the floor for the
-# specific part before flashing it; see docs/full-erase-and-flash.md step 2.
+# (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and does
+# not move this floor -- but if it was ever programmed to a unit, that unit's
+# real floor is 0.254.0.0.
 gpe-floor:    0.149.222.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
