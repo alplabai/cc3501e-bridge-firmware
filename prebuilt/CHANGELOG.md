@@ -143,10 +143,21 @@ connect body, and budget well beyond 40 s for the connect itself.
 than assuming it.** On `2026W36-0003` a scan returns five networks, stable
 across four cold-booted runs, at -74 to -92 dBm. Bluetooth advertisements on
 the same board read -97 to -99 dBm, while a host Wi-Fi interface metres away
-sits at -36 dBm. That is roughly a 40 dB deficit across both radios and points
-at the antenna path on that unit rather than at anything in this image; an
-association attempted against a marginal AP on a deaf receiver is weak evidence
-about the connect path either way.
+sits at -36 dBm.
+
+**That gap is the ANTENNA DESIGN, not a fault.** This unit uses an ON-BOARD
+antenna; earlier bring-up on this family used an external u.FL at J1. An
+on-board antenna against a host laptop's is expected to read tens of dB down,
+so roughly -75 dBm for a nearby AP is the normal operating point here, not
+evidence of a broken RF path. An earlier version of this note read the gap as
+pointing at "the antenna path on that unit", which overstated it.
+
+What the levels DO mean for the connect path: the link budget is genuinely
+tighter than an external-antenna bring-up, and WPA3-SAE costs extra round
+trips over WPA2 (the SAE commit/confirm exchange plus PMF), so a marginal
+signal bites a WPA3 association harder than a WPA2 one. Budget accordingly and
+prefer the strongest AP available when testing association; do not read a
+failed association at -83 dBm as proof of a firmware defect.
 
 One caution learned the hard way there: a SINGLE scan is not enough to conclude
 an AP is absent. One run on this board returned four records and omitted a
