@@ -78,7 +78,21 @@ raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
 # etc.) and an earlier cut of 0.5.1 did the same.  That convention is broken by
 # construction -- every bench or OTA-iterated unit climbs into 0.149.x through
 # ti/regen_flashset.sh and can then never accept a 0.5.x.0 artifact again.
-gpe-floor:    0.149.220.0
+#
+# Moved 0.149.220.0 -> 0.149.222.0: v0.8.0 ships stamped 0.149.222.0 and
+# e1m-aen-evk-01 is running it, so a unit here HAS been flashed above the
+# recorded floor and the floor's own rule ("raise it whenever a bench run
+# flashes higher") had not been applied.  Left stale, the next person picking a
+# VERSION just above the floor would have chosen 0.149.221.0 -- below that unit
+# -- and the SBL would have taken the image and then refused to boot it, which
+# is permanent.
+#
+# ALSO NOT A CEILING: a complete set stamped 0.254.0.0 exists on the bench host
+# (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and is not
+# recorded here, so it does not move this floor -- but if it was ever programmed
+# to a unit, that unit's real floor is 0.254.0.0.  Establish the floor for the
+# specific part before flashing it; see docs/full-erase-and-flash.md step 2.
+gpe-floor:    0.149.222.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
