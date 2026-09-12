@@ -56,9 +56,9 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   d53a728cc6f9bea9073f349a4a39147f17412898
-image-sha256: c63fcbadf1e71a57ec9bf8282008140bd5e33ae9f50a46bb94467e0a9803d94f
-raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
+built-from:   017e7cf76ef78d6e31b59254b26b8de1371021b0
+image-sha256: c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7
+raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -120,7 +120,7 @@ raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
 # (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and does
 # not move this floor -- but if it was ever programmed to a unit, that unit's
 # real floor is 0.254.0.0.
-gpe-floor:    0.149.222.0
+gpe-floor:    0.254.5.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
