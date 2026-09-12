@@ -59,6 +59,10 @@ appControlBlock app_CB;
  * GET_DIAG_INFO DHCP-state bytes (cc3501e_hw_wifi_dhcp_diag below). */
 #include <lwip/netif.h>
 #include <lwip/dhcp.h>
+/* LOCK_TCPIP_CORE / UNLOCK_TCPIP_CORE for the stalled-DHCP restart in
+ * cc3501e_hw_wifi_connect_sta(); network_set_up() takes the same lock from this
+ * same worker context, so the precedent is the vendor's own. */
+#include <lwip/tcpip.h>
 #endif
 
 #include "alp/protocol/cc3501e.h"
@@ -923,6 +927,12 @@ static void wifi_clear_stale_assoc(void)
  * SoM does not have. */
 #define CC3501E_STA_DHCP_TRIES 100u
 
+/* How many times the lease poll may restart a stalled DHCP client.  Two keeps
+ * the worst case bounded -- each restart costs at most the 2 s to its first
+ * retransmit -- while giving a lossy link three independent runs at the
+ * exchange inside one connect call. */
+#define CC3501E_STA_DHCP_KICKS 2u
+
 /* Soft-AP role-up defaults that a zero-init does NOT supply; see the block in
  * cc3501e_hw_wifi_ap_start() for why each one matters.  Values mirror TI's
  * ParseRoleUpApCmd() reference defaults for CC35xx. */
@@ -1078,11 +1088,47 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * once a nonzero IP is leased means a host that observes CONNECTED can open sockets
 	 * immediately (the netif has a route). */
 	uint32_t ip = 0u, mask = 0u, gw = 0u, dhcp = 0u;
+	unsigned kicks = 0u;
 	for (unsigned i = 0u; i < CC3501E_STA_DHCP_TRIES; ++i) {
 		if (network_stack_get_if_ip(WLAN_ROLE_STA, &ip, &mask, &gw, &dhcp) == 0 && ip != 0u) {
 			break;
 		}
 		ip = 0u;
+
+		/* RESTART A STALLED CLIENT rather than wait out its backoff.
+		 *
+		 * lwIP arms `msecs = (tries < 6 ? 1 << tries : 60) * 1000` in both
+		 * dhcp_discover() and dhcp_select(), so the gap between attempts doubles:
+		 * t = 0, 2, 6, 14, 30, 62 s.  By tries = 3 the client is transmitting for
+		 * a few milliseconds and then idle for 8, then 16, then 32 seconds.  Most
+		 * of this poll's budget is spent in that dead air.
+		 *
+		 * Bench-measured at -80 dBm on the image that reports lwIP's own state: a
+		 * failing attempt sits in DHCP_STATE_REQUESTING with tries = 5 -- the
+		 * OFFER arrived and the REQUEST went out, and the ACK did not come back.
+		 * That is a lossy link, not a broken path, and the answer to a lossy link
+		 * is more attempts per second, not a longer wait.
+		 *
+		 * Restarting resets tries to 0 and begins again at 2 s spacing.  Capped at
+		 * CC3501E_STA_DHCP_KICKS so a genuinely absent server still terminates,
+		 * and gated on tries >= 3 so a healthy exchange in progress is never
+		 * interrupted -- a client that is about to be answered must be left alone.
+		 *
+		 * LOCK_TCPIP_CORE because dhcp_release_and_stop/dhcp_start are core
+		 * functions; network_set_up() takes the same lock from this same worker
+		 * context a few lines above, so this adds no new locking hazard. */
+		if (kicks < CC3501E_STA_DHCP_KICKS) {
+			struct netif *nif = (struct netif *)network_get_sta_if();
+			struct dhcp  *d   = (nif != 0) ? netif_dhcp_data(nif) : 0;
+			if (d != 0 && d->tries >= 3u) {
+				LOCK_TCPIP_CORE();
+				dhcp_release_and_stop(nif);
+				(void)dhcp_start(nif);
+				UNLOCK_TCPIP_CORE();
+				++kicks;
+			}
+		}
+
 		ClockP_usleep(CC3501E_STA_DHCP_POLL_US);
 	}
 	if (ip == 0u) {
