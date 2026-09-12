@@ -661,19 +661,28 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
  *
  * Wlan_Disconnect() takes NO timeout parameter and has no bound in our source,
  * and the whole bridge is served by the single bring-up task (src/main.c runs
- * worker_run_pending() and cc3501e_hw_tick() on it in one loop).  So if this
- * call does not return -- issued, note, to an NWP that never associated -- the
- * task is gone, the status latch is never written, and CMD_WIFI_STATUS can only
- * time out.  That is the campaign's central symptom: across every failed
- * association on this bench the radio's own state and fail_reason were NEVER
- * ONCE readable, which is exactly what a latch written after an unbounded call
- * looks like from the host.
+ * worker_run_pending() and cc3501e_hw_tick() on it in one loop).  So IF this
+ * call did not return, the task would be gone, the latch would never be
+ * written, and CMD_WIFI_STATUS could only time out.
  *
- * Writing the latch first costs nothing and makes the verdict survivable: even
- * if this hangs, the host has already been told WHY, and FAIL_KICK vs
- * FAIL_TIMEOUT vs FAIL_REJECTED is the difference between a wrong passphrase, a
- * marginal signal, and a firmware defect.  It does not stop the hang -- bounding
- * or skipping the call when nothing associated is a separate change.
+ * BUT THE EVIDENCE LEANS THE OTHER WAY -- stated plainly because an earlier
+ * version of this comment asserted the hang as established, and it is not.  On
+ * the scan-first ordering a failed association is followed by BLE_ENABLE,
+ * BLE_SCAN and BLE_DISABLE all succeeding, 2 of 2 runs.  Those are
+ * worker-routed, so they can only drain AFTER this body returned -- including
+ * this call.  So on that path Wlan_Disconnect() demonstrably returns.  The
+ * structural difference on the wedging connect-first path is the missing reinit
+ * between the role-up and Wlan_Connect, not this call.
+ *
+ * Ordering the latch first is therefore cheap insurance, not the cure: it costs
+ * nothing, and it means a hang ANYWHERE after it -- this call, the drain's own
+ * reinit, or something else -- still leaves the host holding a verdict.
+ * FAIL_KICK vs FAIL_TIMEOUT vs FAIL_REJECTED is the difference between a wrong
+ * passphrase, a marginal signal, and a firmware defect.  Bounding or deferring
+ * the call is deliberately NOT done here: the tree requires a busy/reinit/ready
+ * bracket around a disconnect (see src/worker.c and src/protocol_wifi.c), a
+ * bare tick-deferred flag would drop that, and deferring bounds nothing anyway
+ * since the tick runs on the same task.
  *
  * Best-effort: the association may already be gone, so a non-zero return is not
  * itself a failure -- the caller's own error is what gets reported. */
