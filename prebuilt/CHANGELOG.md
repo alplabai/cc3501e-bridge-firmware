@@ -119,14 +119,31 @@ If you need station mode, call `GET_MAC` and `WIFI_SCAN_START` first — both
 are verified — which moves `Wlan_Start` and the role transition out of the
 connect body, and budget well beyond 40 s for the connect itself.
 
-**Before blaming this firmware for a failed association, scan and check the
-target is actually there.** On `2026W36-0003` a scan returns four networks at
--75 to -89 dBm and Bluetooth advertisements at -93 to -99 dBm, while a host
-Wi-Fi interface metres away sits at -36 dBm. That is roughly a 40 dB deficit
-across both radios, which points at the antenna path on that unit rather than
-at anything in this image. The AP that release's seven failed attempts targeted
-reports -79 dBm from that board. An association that never completes against an
-AP at the edge of a deaf receiver is not evidence about the connect path.
+**Scan before you connect, and read the security kind off the scan rather
+than assuming it.** On `2026W36-0003` a scan returns five networks, stable
+across four cold-booted runs, at -74 to -92 dBm. Bluetooth advertisements on
+the same board read -97 to -99 dBm, while a host Wi-Fi interface metres away
+sits at -36 dBm. That is roughly a 40 dB deficit across both radios and points
+at the antenna path on that unit rather than at anything in this image; an
+association attempted against a marginal AP on a deaf receiver is weak evidence
+about the connect path either way.
+
+One caution learned the hard way there: a SINGLE scan is not enough to conclude
+an AP is absent. One run on this board returned four records and omitted a
+fifth that three later runs, plus a fourth from a different app, all reported at
+a stable -83 dBm. Repeat a scan before concluding anything from what is missing
+from it.
+
+The scan also reports each record's security kind, and it is worth trusting
+over an assumption: the AP this release's failed attempts targeted decodes as
+WPA3, while every connect but one requested WPA2-PSK. Note the two encodings
+differ -- the connect field is `0` open, `1` WPA2-PSK, `2` WPA3-SAE, while the
+scan-result enum is `0` open, `1` WEP, `2` WPA, `3` WPA2, `4` WPA3 -- so read
+the decoded name, never the raw number.
+
+Treat the channel field of a scan record as the least trustworthy part of it:
+across four runs here it moved between cold-identical runs while the matching
+RSSI moved 2 dB, and it reported channel 1 for an AP whose name indicates 5 GHz.
 
 **Known limitation, not a regression from v0.7.0.** The link can wedge during a
 session: a transport desync after which every opcode fails until a cold cycle,
