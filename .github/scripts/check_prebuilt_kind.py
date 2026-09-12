@@ -56,13 +56,27 @@ WRAPPED_MAGIC = bytes((0xC2, 0x47, 0x0C, 0x69))
 RAW_SP_MASK = 0xFFF00000
 RAW_SP_MATCH = 0x20000000
 
-#: A wrapped image carries its GPE anti-rollback stamp as four bytes
-#: (major, a, b, c) at file offset 36.  The CC35 SBL enforces monotonicity
+#: A wrapped image carries its GPE anti-rollback stamp in FOUR NON-CONTIGUOUS
+#: bytes near file offset 36 (0x24): 0x24 major, 0x25 minor, 0x26 patch,
+#: 0x27 PADDING, and 0x28 the fourth field.  The CC35 SBL enforces monotonicity
 #: against the part's last-seen version, permanently, even with every
 #: *_rollback_protection_* fuse reading 0 -- so a stamp below what our units
 #: have seen ships a blob that streams clean and then refuses to boot.
+#:
+#: This used to read `bytes[36:40]`, i.e. major.minor.patch.PADDING.  Padding is
+#: always zero, so every blob's fourth field read as 0: a floor with a nonzero
+#: fourth field could never be cleared, and two different stamps compared equal,
+#: letting a blob whose real fourth field is BELOW the floor pass the one gate
+#: that exists to stop an unrecoverable brick.  Measured on the bench host:
+#: cc3501e-flashset-1564 is 0.133.84.59 and 1562probe is 0.133.111.160, both of
+#: which the old slice reported as `.0`.  docs/full-erase-and-flash.md records
+#: the same layout, determined by building 0.253.7.9 and reading back
+#: `00 fd 07 00 09`.
 GPE_OFFSET = 36
-GPE_LEN = 4
+#: Bytes to read so the slice covers 0x24..0x28 inclusive.
+GPE_SPAN = 5
+#: Indices WITHIN that span that carry version fields, skipping the padding.
+GPE_FIELDS = (0, 1, 2, 4)
 
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 RECIPE = REPO / "prebuilt" / "BUILD_RECIPE.md"
@@ -121,6 +135,41 @@ def observed_kind(head: bytes) -> tuple[str | None, str]:
     )
 
 
+def gpe_stamp(raw: bytes) -> tuple[int, ...]:
+    """The four GPE version fields out of a blob's first GPE_SPAN stamp bytes.
+
+    Split out so the padding-skipping layout has one home and one check.
+    """
+    return tuple(raw[i] for i in GPE_FIELDS)
+
+
+def selftest() -> int:
+    """Assert the stamp parse skips the padding byte.
+
+    The case that matters is a stamp whose padding and fourth field DIFFER; the
+    old contiguous `raw[36:40]` slice returns the padding and cannot tell
+    0.253.7.9 from 0.253.7.0.  Byte values below are the layout recorded in
+    docs/full-erase-and-flash.md, determined by building 0.253.7.9 and reading
+    back `00 fd 07 00 09`.
+    """
+    raw = bytes((0x00, 0xFD, 0x07, 0x00, 0x09))
+    got = gpe_stamp(raw)
+    if got != (0, 253, 7, 9):
+        print(f"::error::gpe_stamp selftest: expected (0, 253, 7, 9), got {got}")
+        return 1
+    # A real bench artifact: cc3501e-flashset-1564 is 0.133.84.59, which the old
+    # slice reported as 0.133.84.0.
+    if gpe_stamp(bytes((0x00, 0x85, 0x54, 0x00, 0x3B))) != (0, 133, 84, 59):
+        print("::error::gpe_stamp selftest: 0.133.84.59 case failed")
+        return 1
+    # Ordering is what the gate actually uses, and it must see the fourth field.
+    if not gpe_stamp(bytes((0, 149, 222, 0, 1))) > gpe_stamp(bytes((0, 149, 222, 0, 0))):
+        print("::error::gpe_stamp selftest: fourth field does not affect ordering")
+        return 1
+    print("ok  gpe_stamp selftest: padding at 0x27 skipped, fourth field read at 0x28")
+    return 0
+
+
 def gpe_floor() -> tuple[int, ...] | None:
     """Parse `gpe-floor: 0.a.b.c` out of prebuilt/BUILT_FROM, or None."""
     if not BUILT_FROM.is_file():
@@ -152,11 +201,11 @@ def newest_wrapped(blobs: list[pathlib.Path]) -> pathlib.Path | None:
 
 def check_gpe(blob: pathlib.Path, floor: tuple[int, ...]) -> int:
     """Assert the shipped stamp has major 0 and clears the recorded floor."""
-    raw = blob.read_bytes()[GPE_OFFSET:GPE_OFFSET + GPE_LEN]
-    if len(raw) < GPE_LEN:
+    raw = blob.read_bytes()[GPE_OFFSET:GPE_OFFSET + GPE_SPAN]
+    if len(raw) < GPE_SPAN:
         print(f"::error::{blob.relative_to(REPO)} is too short to hold a GPE stamp")
         return 1
-    stamp = tuple(raw)
+    stamp = gpe_stamp(raw)
     shown = ".".join(str(x) for x in stamp)
     rc = 0
     if stamp[0] != 0:
@@ -177,6 +226,12 @@ def check_gpe(blob: pathlib.Path, floor: tuple[int, ...]) -> int:
 
 
 def main() -> int:
+    # `--selftest` checks the stamp PARSE alone, with no blobs involved, so a
+    # parse regression reports itself even on a tree whose artifacts all happen
+    # to carry a zero fourth field.
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+
     if not RECIPE.is_file():
         print(f"::error::{RECIPE.relative_to(REPO)} is missing -- "
               "the artifact-kind record it holds is what this gate checks")

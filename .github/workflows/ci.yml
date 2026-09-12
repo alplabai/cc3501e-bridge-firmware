@@ -398,5 +398,13 @@ jobs:
       # prebuilt/BUILD_RECIPE.md records which release is which in prose; this
       # makes that record machine-checked, and also fails a NEW release whose
       # kind nobody wrote down.
+      # --selftest first: the GPE stamp's four version fields are NOT contiguous
+      # (0x27 is padding, 0x28 is the fourth field), and reading them as a flat
+      # 4-byte slice silently zeroed every blob's fourth field for the life of
+      # this gate.  A parse bug here passes a blob that then bricks a part, so
+      # the parse carries its own check rather than relying on the blobs in the
+      # tree happening to have a zero there.
       - name: each prebuilt's artifact kind matches BUILD_RECIPE.md
-        run: python3 .github/scripts/check_prebuilt_kind.py
+        run: |
+          python3 .github/scripts/check_prebuilt_kind.py --selftest
+          python3 .github/scripts/check_prebuilt_kind.py
