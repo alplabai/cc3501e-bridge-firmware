@@ -87,16 +87,23 @@ raw-sha256:   d34434a5f0ceedd496cea9e6644930ed135775ef4d004b2cb837ab7405186c9a
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.2.0 (measured 2026-09-12).
+# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.4.0 (measured 2026-09-12).
 #
-# That unit (module 2026W36-0003) was warm-programmed at 0.254.2.0 that evening:
-# the programmer streamed 1105568 bytes and saved its report, and the part then
-# answered an 18-byte GET_DIAG_INFO that only the new image produces.
+# That unit (module 2026W36-0003) was warm-programmed THREE TIMES that evening,
+# 0.254.2.0 -> 0.254.3.0 -> 0.254.4.0, the last streaming 1105668 bytes in
+# 17.778 s with PROGRAM_RC=0 and its report saved.  It then booted and answered
+# PING + GET_VERSION across 16 cold DPS-150 power cycles, each with both edges
+# verified.
 #
-# TWO CONSEQUENCES, BOTH PERMANENT FOR THAT UNIT:
+# CONSEQUENCES, ALL PERMANENT FOR THAT UNIT:
 #   - it can never again boot the shipped v0.8.0 artifact (0.149.222.0), nor the
 #     0.254.0.0 set in cc3501e-release-0.254.0.0.  Both are rollbacks on it now.
-#   - any future image for it must be STRICTLY ABOVE 0.254.2.0.
+#   - 0.254.2.0 and 0.254.3.0 are ALSO rollbacks on it now -- each intermediate
+#     flash is spent the moment the next one lands.
+#   - any future image for it must be STRICTLY ABOVE 0.254.4.0.  A stamp chosen
+#     between 0.254.2.0 and 0.254.4.0 looks new against an older log entry and
+#     permanently bricks the part, which is why this entry is kept current rather
+#     than appended to.
 #
 # The gpe-floor BELOW is deliberately NOT raised to 0.254.2.0 yet, and the
 # distinction matters.  That number gates the SHIPPED BLOB: raising it without
