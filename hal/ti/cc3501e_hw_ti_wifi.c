@@ -270,20 +270,22 @@ static void wifi_event_cb(WlanEvent_t *event)
 		 * error path can leave stuck.
 		 *
 		 * RESIDUAL, stated plainly (this is an observability byte, not a
-		 * safety one): a disconnect WE issue while ACTUALLY CONNECTED or
-		 * mid-association -- a host WIFI_DISCONNECT while connected, or
-		 * wifi_clear_stale_assoc()'s #1437 cleanup after a FAILED connect --
-		 * routes through a vendor path (cme_station_flow.c ~548 ->
-		 * cmeStaSendDisConnectedEventToApp() ~875) that sends REASON 3
-		 * (WLAN_REASON_DEAUTH_LEAVING, a REAL 802.11 code, not 200) and
-		 * arrives ASYNCHRONOUSLY.  If a NEW connect attempt's mark_connecting()
-		 * runs before that delayed event lands, this event's reason 3 CAN be
-		 * recorded against the NEW attempt, landing inside its CONNECTING
-		 * window.  A reader that sees exactly reason 3 should treat it as
-		 * POSSIBLY self-inflicted (our own prior disconnect), not necessarily
-		 * a real AP-initiated deauth of the current attempt -- see
-		 * hal/cc3501e_hw.h's cc3501e_hw_wifi_last_reason() contract, which
-		 * states this plainly for the host too. */
+		 * safety one): mark_connecting() clears wifi_last_reason at SUBMIT
+		 * (SPI-ISR/protocol context), and cc3501e_hw_wifi_connect_sta() clears
+		 * it AGAIN right before Wlan_Connect (see there) -- but that second
+		 * reset is still not the same instant the vendor actually begins
+		 * processing the new connect.  A late event from the PREVIOUS attempt
+		 * (still in flight on this host-driver thread -- e.g. a disconnect WE
+		 * issued while actually connected or mid-association, host
+		 * WIFI_DISCONNECT or the #1437 cleanup, whose vendor DISCONNECT
+		 * carries REASON 3 / WLAN_REASON_DEAUTH_LEAVING, a REAL 802.11 code,
+		 * not 200) landing in that tiny remaining window can still be recorded
+		 * against the NEW attempt.  Not scoped to reason 3 specifically any
+		 * more (that was the wider pre-second-reset window's shape) -- ANY
+		 * late event from the prior attempt that lands there is recorded as
+		 * if it belonged to the new one.  See hal/cc3501e_hw.h's
+		 * cc3501e_hw_wifi_last_reason() contract, which states this plainly
+		 * for the host too. */
 		if (wifi_conn_is_connecting() &&
 		    event->Data.Disconnect.ReasonCode != (int16_t)WLAN_DISCONNECT_USER_INITIATED) {
 			wifi_last_reason = event->Data.Disconnect.ReasonCode;
@@ -1095,10 +1097,13 @@ static void wifi_clear_stale_assoc(void)
 		 * dropped.  This call always runs AFTER the caller's own
 		 * wifi_conn_set(FAILED, ...), so the connecting-state gate that
 		 * replaced the flag is already closed by the time this fires: see
-		 * that case's RESIDUAL note for the one narrow situation (a NEW
-		 * attempt's mark_connecting() racing this call's own delayed
-		 * DISCONNECT event) where that gate can still record this
-		 * disconnect's reason 3 against the wrong attempt. */
+		 * that case's RESIDUAL note for the one narrow situation (this call's
+		 * own delayed DISCONNECT event landing in the tiny window between a
+		 * NEW attempt's second wifi_last_reason reset -- in
+		 * cc3501e_hw_wifi_connect_sta(), right before its own Wlan_Connect --
+		 * and the vendor actually starting to process that new connect) where
+		 * that gate can still record THIS disconnect's reason against the
+		 * wrong attempt. */
 		(void)Wlan_Disconnect(WLAN_ROLE_STA, NULL);
 	}
 }
@@ -1304,6 +1309,20 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	}
 	osi_SyncObjClear(&wifi_event_sync);
 	wifi_last_status = 0;
+	/* mark_connecting() (SPI-ISR/protocol context, at submit) already cleared
+	 * wifi_last_reason once for this attempt, but that was BEFORE the worker
+	 * body reached this point -- everything from ensure_sta_role() through the
+	 * reinit above runs in between, and a late event from the PREVIOUS attempt
+	 * (still in flight on the host-driver thread) can land in that gap and get
+	 * recorded there.  Two real shapes, not just one: a supplicant DISCONNECT
+	 * carrying any real reason arriving after an AUTHENTICATION_REJECTED
+	 * already closed out the old attempt, or a late ASSOCIATION_REJECTED /
+	 * AUTHENTICATION_REJECTED arriving after the old attempt was already
+	 * declared a TIMEOUT.  Clear it again HERE too, right next to
+	 * wifi_last_status's own reset and for the same reason -- immediately
+	 * before Wlan_Connect, as close to the new attempt's real start as this
+	 * body gets. */
+	wifi_last_reason = 0;
 	/* Wlan_Connect(ssid,len,bssid=NULL,secType,pass,passlen,flags=0).  Open
 	 * networks pass a NULL/zero-length password. */
 	if (Wlan_Connect((const signed char *)ssid,
@@ -1607,14 +1626,18 @@ int cc3501e_hw_wifi_ap_stop(void)
 	/* The AP role-up path forces device-wide pm to ALWAYS_ACTIVE, both inline
 	 * (cc3501e_hw_wifi_ap_start()'s own Wlan_Set() before RoleUp) and via
 	 * pp_apply_radio()'s AP-up override on every later apply.  Neither is
-	 * self-undoing: with the AP now down, nothing re-derives and re-applies
-	 * the host's actual latched policy, so the device would stay
-	 * ALWAYS_ACTIVE -- even under a BALANCED/LOW_POWER/DEEP_SLEEP
-	 * CMD_POWER_POLICY the host already sent -- until the next explicit
-	 * POWER_POLICY.  Re-apply now.  Safe to call unconditionally, whether or
-	 * not a STA role is also up: cc3501e_hw_power_apply_radio_now() ->
-	 * pp_apply_radio_effective() already no-ops cleanly with no STA role up
-	 * (#5's guard) -- this is TASK CONTEXT ONLY, and safe here because
+	 * self-undoing, so re-apply now to re-derive the host's actual latched
+	 * policy with the AP no longer forcing anything.
+	 *
+	 * THIS ONLY ACTUALLY FIXES IT WHEN A STA ROLE IS ALSO UP.  Safe to call
+	 * unconditionally either way -- cc3501e_hw_power_apply_radio_now() ->
+	 * pp_apply_radio_effective() no-ops cleanly with no STA role up (#5's
+	 * guard) -- but that guard means an AP-ONLY bridge (no STA role ever
+	 * brought up) is NOT fixed by this call: it stays ALWAYS_ACTIVE
+	 * regardless, until a STA role comes up or the next POWER_POLICY lands
+	 * with one already up.  That residual costs idle power only, not
+	 * correctness -- ALWAYS_ACTIVE is always a safe (if wasteful) state,
+	 * never a wrong one.  TASK CONTEXT ONLY, and safe here because
 	 * WIFI_AP_STOP is worker-routed (src/worker.c, src/protocol_wifi.c's
 	 * handle_wifi_ap_stop() -> handle_worker_routed()), so this body -- like
 	 * cc3501e_hw_wifi_ensure_sta_role() -- always runs in worker_run_pending()

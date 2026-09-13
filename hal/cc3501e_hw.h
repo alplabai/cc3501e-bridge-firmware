@@ -299,17 +299,26 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * neither can run while an attempt is open: the cleanup always runs AFTER its
  * caller's own wifi_conn_set(FAILED, ...), and a host WIFI_DISCONNECT only
  * ever fires from CONNECTED. Both leave the gate closed the whole time they
- * run.
+ * run.  The converse gap also exists and is NOT recorded: a reject event
+ * that arrives after the attempt has already been declared a TIMEOUT is
+ * lost -- the attempt is already terminal (state is no longer CONNECTING)
+ * by the time that late event shows up, so the gate is already closed
+ * against it too.
  *
- * RESIDUAL (read this before trusting an exact match): if a NEW connect
- * attempt starts (mark_connecting()) before one of those OWN disconnects'
- * delayed vendor DISCONNECT event arrives, that event's reason -- REAL 802.11
- * reason 3, WLAN_REASON_DEAUTH_LEAVING, not 200, so the always-ignore-200 rule
- * above does not catch it -- can land inside the NEW attempt's now-open
- * window and be recorded against it. A reader that sees exactly reason 3
- * should treat it as POSSIBLY self-inflicted (a just-prior disconnect this
- * firmware issued), not necessarily a real AP-side deauth of the current
- * attempt.
+ * RESIDUAL (read this before trusting an exact match): wifi_last_reason is
+ * cleared twice for a new attempt -- once by cc3501e_hw_wifi_mark_connecting()
+ * at submit, and again by cc3501e_hw_wifi_connect_sta() immediately before its
+ * own Wlan_Connect (hal/ti/cc3501e_hw_ti_wifi.c) -- but neither reset is the
+ * exact instant the vendor begins processing that new connect.  A late event
+ * from the PREVIOUS attempt (still in flight on the host-driver thread) that
+ * lands in the tiny window between that second reset and the vendor actually
+ * processing the new connect can still be recorded against the new one.  Not
+ * limited to a disconnect-then-connect's reason 3 (WLAN_REASON_DEAUTH_LEAVING)
+ * -- any late event the prior attempt produces, including a supplicant
+ * DISCONNECT with a different real reason after an AUTHENTICATION_REJECTED,
+ * or a late ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED after a TIMEOUT,
+ * can land there too. A reader should treat an unexpected value as POSSIBLY
+ * belonging to the prior attempt, not necessarily the current one.
  *
  * SCOPE: covers the CONNECT ATTEMPT only -- the reason or status that ENDED
  * or REJECTED that attempt.  Once an attempt reaches CONNECTED this value is
