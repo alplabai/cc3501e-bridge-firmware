@@ -365,9 +365,11 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
  * reply is byte-identical to the request that produced it EXCEPT for the
  * generic 5-bit header seq (protocol.c's s_current_req_seq), which
  * poll_by_repeat() holds constant across every retry of one logical call.
- * DISPATCH CONTEXT ONLY, same as the ring itself -- see
- * hal/ti/cc3501e_hw_ti_sock.c's CONCURRENCY comment above rx_ring; the task-
- * side pump never reads or writes these, so no volatile and no cross-
+ * DISPATCH CONTEXT ONLY.  Unlike hal/ti/cc3501e_hw_ti_sock.c's own
+ * `uncommitted` (which the worker task also writes, on arm/disarm -- see
+ * that file's CONCURRENCY comment above rx_ring), these two are written
+ * ONLY from this function, which only ever runs in the SPI dispatch
+ * callback: no task-context writer exists, so no volatile and no cross-
  * context ordering concern. */
 static uint8_t  last_recv_seq;
 static uint16_t last_recv_handle;
@@ -428,18 +430,38 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 			const int rc =
 			    cc3501e_hw_sock_recv_ring(handle, &reply_data[hdr], (uint16_t)room, replay, &got);
 
-			/* Record THIS call's identity for the NEXT one to compare against --
-			 * but only when this handle actually engaged the ring (rc != -1).
-			 * Recording it unconditionally would let an UNRELATED handle's
-			 * SOCK_RECV (one this ring does not own, rc == -1, worker-routed
-			 * below) overwrite last_recv_seq/last_recv_handle in between the
-			 * prefetched handle's own original serve and its retry, making
-			 * that retry's replay check compare against the wrong call and
-			 * miss the very case this fix exists for. */
-			if (rc != -1) {
-				last_recv_seq    = seq;
-				last_recv_handle = handle;
-			}
+			/* Record THIS call's identity for the NEXT one to compare against
+			 * -- UNCONDITIONALLY, on every SOCK_RECV dispatch, including
+			 * rc == -1 (a handle this ring does not own: UDP, or a STREAM
+			 * socket accepted but never armed for prefetch).
+			 *
+			 * An earlier version of this fix updated last_recv_seq/
+			 * last_recv_handle only when rc != -1, reasoning that an
+			 * unrelated handle's call must not clobber the prefetched
+			 * handle's own retry window.  That reasoning does not hold
+			 * against the SDK host: cc3501e_core.c's sock_busy flag plus
+			 * poll_by_repeat() issuing one call at a time mean a CRC-
+			 * rejected reply's retry is always the very next SOCK_RECV, on
+			 * the SAME handle -- an h2 recv landing between h1's lost reply
+			 * and h1's retry cannot happen.  What the rc-gated version
+			 * actually did was leave last_recv_seq/last_recv_handle FROZEN
+			 * across every rc == -1 call, so up to 30 recvs on an unarmed
+			 * handle could tick the host's shared per-dispatch seq counter
+			 * through most of a cycle without ever updating last_*, and the
+			 * 31st recv on the ARMED handle would then alias whatever seq
+			 * that handle's own last serve happened to hold -- wrongly read
+			 * as a replay, silently duplicating a block, still reported OK.
+			 * Recording every call removes that: last_* now always reflects
+			 * the most recent SOCK_RECV dispatch, armed or not, so an
+			 * armed handle's seq can only collide with its OWN prior serve,
+			 * not with however many unarmed calls ran in between.  See
+			 * sock_recv_commit.h for the narrower residual recording every
+			 * call still leaves (same-handle aliasing after exactly the
+			 * right number of INTERVENING seq-allocating calls) and why
+			 * only a dedicated host-side SOCK_RECV seq counter removes it
+			 * entirely. */
+			last_recv_seq    = seq;
+			last_recv_handle = handle;
 
 			if (rc == -2) {
 				/* Armed for this handle but momentarily empty.  The pump is the

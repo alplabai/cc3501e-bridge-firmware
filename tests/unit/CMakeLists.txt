@@ -199,14 +199,43 @@ target_link_options(test_sock_send_done PRIVATE -Wl,--wrap=cc3501e_hw_sock_send)
 target_link_libraries(test_sock_send_done PRIVATE ztest_shim)
 add_test(NAME sock_send_done COMMAND test_sock_send_done)
 
+# sock_recv_replay: protocol_sockets.c's handle_sock_recv() fast-path REPLAY
+# DECISION (seq != 0 && seq == last_recv_seq && handle == last_recv_handle),
+# unreachable on the plain stub HAL because cc3501e_hw_sock_recv_ring() there
+# always returns -1 (no prefetch ring on the stub) -- so the fast path is
+# never entered and `replay` is never computed in test_transport_spi.c.
+# `--wrap` redirects every firmware call to cc3501e_hw_sock_recv_ring() to
+# __wrap_cc3501e_hw_sock_recv_ring() (the test file), which records the
+# `replay`/`handle` it was called with -- turning the otherwise-unreachable
+# decision into a code path this suite can drive and inspect over the wire.
+# Same FW_SOURCES + stub HAL as test_sock_send_done (no CC3501E_WIFI).
+add_executable(test_sock_recv_replay
+    sock_recv_replay/src/test_sock_recv_replay.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_sock_recv_replay PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_sock_recv_replay PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1)
+target_compile_options(test_sock_recv_replay PRIVATE ${TEST_FLAGS})
+target_link_options(test_sock_recv_replay PRIVATE -Wl,--wrap=cc3501e_hw_sock_recv_ring)
+target_link_libraries(test_sock_recv_replay PRIVATE ztest_shim)
+add_test(NAME sock_recv_replay COMMAND test_sock_recv_replay)
+
 # sock_recv_commit: the pure tail/uncommitted arithmetic behind the SOCK_RECV
 # lazy-commit fix (silent data loss on a CRC-rejected reply, host review).
 # Deliberately NOT built from FW_SOURCES: src/sock_recv_commit.c has no
 # dependency on the rest of the firmware (no protocol.c, no worker.c, no HAL)
 # by design -- see its own header for why it was split out exactly this way
 # -- and the actual ring it serves (hal/ti/cc3501e_hw_ti_sock.c's rx_ring)
-# needs the TI SimpleLink SDK and is never linked into a host build at all,
-# so this is the only piece of the fix host-testable full stop.
+# needs the TI SimpleLink SDK and is never linked into a host build at all.
+# (test_sock_recv_replay above covers the OTHER host-testable half of this
+# fix -- the replay DECISION in protocol_sockets.c -- via --wrap instead;
+# together they are the two pieces of the fix host-testable full stop.)
 add_executable(test_sock_recv_commit
     sock_recv_commit/src/test_sock_recv_commit.c
     ${FW}/src/sock_recv_commit.c

@@ -6,14 +6,16 @@
  * arithmetic behind the SOCK_RECV lazy-commit fix (silent data loss on a
  * CRC-rejected reply, host review).
  *
- * This is the ONE piece of the fix host-testable at all: the real ring
- * (hal/ti/cc3501e_hw_ti_sock.c's rx_ring, 64 KB, TCM-placed) needs the TI
- * SimpleLink SDK and is built ONLY for CC3501E_HAL_BACKEND=ti -- it is never
- * linked into a host test binary (see that file's own top comment).
- * sock_recv_commit.h's whole reason for existing is to pull the DECISION a
- * CRC-rejected-reply bug actually lives in -- commit or replay, how many
- * bytes -- out into something silicon-free that CAN be exercised here, even
- * though the byte-copying and lwIP plumbing around it cannot be. */
+ * The real ring (hal/ti/cc3501e_hw_ti_sock.c's rx_ring, 64 KB, TCM-placed)
+ * needs the TI SimpleLink SDK and is built ONLY for CC3501E_HAL_BACKEND=ti
+ * -- it is never linked into a host test binary (see that file's own top
+ * comment).  sock_recv_commit.h's whole reason for existing is to pull the
+ * DECISION a CRC-rejected-reply bug actually lives in -- commit or replay,
+ * how many bytes -- out into something silicon-free that CAN be exercised
+ * here, even though the byte-copying and lwIP plumbing around it cannot be.
+ * (tests/unit/sock_recv_replay/ covers the OTHER host-testable half of this
+ * fix -- protocol_sockets.c's `replay` DECISION itself -- over the wire, via
+ * `--wrap=cc3501e_hw_sock_recv_ring`.) */
 
 #include <zephyr/ztest.h>
 
@@ -95,22 +97,24 @@ ZTEST(cc3501e_sock_recv_commit, test_new_seq_commits_previous_serve_and_advances
 	    n2, 50u, "second serve: min(used=100-50=50, cap=50) -- the NEXT chunk, not a repeat");
 }
 
-/* Simulates cc3501e_hw_sock_prefetch()'s reset (rx_ring.head = rx_ring.tail =
- * 0, uncommitted = 0 -- hal/ti/cc3501e_hw_ti_sock.c) at the pure-arithmetic
- * level: the actual reset line itself lives in TI-only code this suite
- * cannot link or call (see this file's top comment), but what THIS test can
- * and does prove is the consequence that reset promises -- a fresh arm's
- * first serve must not fold in a stale uncommitted count left over from
- * whatever handle the ring served last. */
+/* Exercises the REAL reset path: cc3501e_hw_sock_prefetch()
+ * (hal/ti/cc3501e_hw_ti_sock.c, TI-only, unreachable from this host suite --
+ * see this file's top comment) calls this exact sock_recv_commit_reset(),
+ * not a hand-rolled `uncommitted = 0u;` -- so calling it here proves the
+ * SAME code production runs, not a stand-in for it.  rx_ring.head/tail
+ * cannot follow this same seam (see sock_recv_commit.h's doc comment on
+ * sock_recv_commit_reset() for why), so this test still assigns tail
+ * directly for the "new handle" head/tail reset half of arming -- only the
+ * uncommitted half is the real call. */
 ZTEST(cc3501e_sock_recv_commit, test_prefetch_reset_clears_uncommitted)
 {
 	uint32_t tail        = 10u;
 	uint32_t uncommitted = 5u; /* stale, from a previous handle's session */
 
-	/* cc3501e_hw_sock_prefetch(new_handle, true) resets head = tail = 0 and
-	 * (per this fix) uncommitted = 0. */
-	tail        = 0u;
-	uncommitted = 0u;
+	/* cc3501e_hw_sock_prefetch(new_handle, true) resets head = tail = 0
+	 * directly, and uncommitted via sock_recv_commit_reset(). */
+	tail = 0u;
+	sock_recv_commit_reset(&uncommitted);
 
 	/* The new handle's first-ever serve: if the stale uncommitted=5 had
 	 * survived, a non-replay call would wrongly fold it into tail

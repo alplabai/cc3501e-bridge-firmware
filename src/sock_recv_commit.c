@@ -32,3 +32,8 @@ sock_recv_commit(uint32_t *tail, uint32_t *uncommitted, uint32_t head, bool repl
 	*uncommitted = n;
 	return n;
 }
+
+void sock_recv_commit_reset(uint32_t *uncommitted)
+{
+	*uncommitted = 0u;
+}

@@ -28,6 +28,41 @@
  * independently of the held-back tail) -- correct stream-prefix semantics,
  * never fewer.
  *
+ * RESIDUAL 1 -- seq aliasing (NOT fixed here).  protocol_sockets.c's
+ * handle_sock_recv() identifies a replay by the generic per-dispatch 5-bit
+ * header seq (protocol.c's s_current_req_seq) plus handle, recorded on
+ * EVERY SOCK_RECV dispatch for that handle.  That seq is not SOCK_RECV's
+ * own counter -- it is shared by every opcode the host issues through
+ * cc3501e_core.c's poll_by_repeat().  Two consecutive ring recvs on the
+ * SAME handle therefore collide (the second is wrongly read as a replay of
+ * the first, duplicating a block, still reported OK) when exactly 30 mod 31
+ * OTHER seq-allocating poll_by_repeat() calls -- ANY opcode, not just
+ * SOCK_RECV -- separate them: the 5-bit field has 31 non-zero values
+ * (ALP_CC3501E_REQ_SEQ_NONE = 0 never claims a replay), so the counter
+ * returns to the same value once every 31 allocations on that shared
+ * counter.  The fix is a dedicated SOCK_RECV-only seq counter on the host
+ * side, which removes this by construction (nothing else could ever
+ * advance it between two ring recvs); this firmware-side change cannot
+ * remove it alone, since the firmware only ever sees the seq the host chose
+ * to send.
+ *
+ * RESIDUAL 2 -- a dropped reply with no retry (NOT fixed here).  Lazy-
+ * commit retires the previous call's bytes when a DIFFERENT request
+ * arrives, not when the previous reply is actually known to have reached
+ * the host.  Those are usually the same event (a lost reply provokes
+ * poll_by_repeat()'s same-seq retry, which this fix catches), but not
+ * always: if the host drops a lost reply WITHOUT issuing that same-seq
+ * retry -- poll_by_repeat()'s own deadline expiring immediately after the
+ * CRC-failed attempt, or a corrupted status byte decoding as one of the
+ * terminal codes (0x06/0x07/0xFF) instead of the CRC error it should have
+ * been -- the next call this handle makes is a genuinely new (non-replay)
+ * recv, which commits the still-unacknowledged block and loses it exactly
+ * as before this fix.  The host side will need a same-seq grace re-poll for
+ * recv (retry once more before giving up, rather than surfacing the error
+ * immediately) to close this; this firmware change cannot close it alone,
+ * since by the time a non-replay call arrives there is no way left to tell
+ * "host never saw the last reply" from "host saw it and moved on".
+ *
  * PURE ARITHMETIC, SILICON-FREE.  This file owns ONLY the tail/uncommitted
  * bookkeeping -- head/tail as plain integers, no ring buffer, no memcpy, no
  * lwIP -- so it links and runs identically on the host.
@@ -86,5 +121,21 @@
  * is identical to what it was for the call being replayed. */
 uint32_t
 sock_recv_commit(uint32_t *tail, uint32_t *uncommitted, uint32_t head, bool replay, uint32_t cap);
+
+/*
+ * sock_recv_commit_reset -- the "forget any served-but-not-retired count"
+ * half of arming (or disarming) the prefetch ring for a handle
+ * (hal/ti/cc3501e_hw_ti_sock.c's cc3501e_hw_sock_prefetch(), both branches).
+ * A fresh arm must never inherit a stale count from whatever handle used
+ * the ring last, or that handle's very first serve would wrongly fold
+ * someone else's leftover bytes into its tail.
+ *
+ * Split out (rather than the caller just writing `uncommitted = 0u;`
+ * inline, as an earlier version of this fix did) so the host test suite
+ * can exercise the SAME reset production code runs, instead of a
+ * hand-simulated stand-in for it -- rx_ring.tail/head themselves cannot
+ * follow this same seam (they are `volatile`, ring-buffer-owned fields;
+ * this function only ever owns the plain uint32_t `uncommitted`). */
+void sock_recv_commit_reset(uint32_t *uncommitted);
 
 #endif /* CC3501E_BRIDGE_SOCK_RECV_COMMIT_H */

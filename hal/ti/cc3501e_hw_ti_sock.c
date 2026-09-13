@@ -446,33 +446,52 @@ static uint32_t ring_used(void)
 }
 
 /* LAZY-COMMIT byte count: the most recent cc3501e_hw_sock_recv_ring() call's
- * served-but-not-yet-retired byte count (see sock_recv_commit.h).  DISPATCH
- * CONTEXT ONLY -- unlike every other field here, the task-side pump NEVER
- * reads or writes this, so it carries none of rx_ring's cross-context
- * concerns and needs neither `volatile` nor placement in the shared struct:
- * it is consumer-private bookkeeping about what the consumer itself has
- * (not yet durably) handed out, not a fact the producer needs to observe.
- * Reset alongside rx_ring.head/tail in cc3501e_hw_sock_prefetch(), so a
- * fresh arm never inherits a stale count from a previous session. */
+ * served-but-not-yet-retired byte count (see sock_recv_commit.h).  NOT
+ * dispatch-context-only, unlike an earlier draft of this comment claimed:
+ * cc3501e_hw_sock_prefetch() (below) also writes it, on the WORKER TASK,
+ * from the socket open/close paths (sock_connect / sock_close) -- see the
+ * CONCURRENCY comment below for why that makes this a genuine cross-context
+ * field and how the publish order there keeps it safe without `volatile`. */
 static uint32_t uncommitted;
 
-/* CONCURRENCY: SPSC, unchanged by lazy-commit.  rx_ring.head is written ONLY
- * by the task (cc3501e_hw_sock_pump, the producer) and read only by the
- * dispatch/consumer (via ring_used() / sock_recv_commit()).  rx_ring.tail is
- * written ONLY by the dispatch/consumer (cc3501e_hw_sock_recv_ring) and read
- * only by the task (ring_used(), for the pump's headroom guard).  `uncommitted`
- * above is consumer-private and never touched by the producer at all -- it
- * adds NO new cross-context field.  The one new invariant lazy-commit relies
- * on: cc3501e_hw_sock_recv_ring() computes the post-commit tail into a LOCAL
- * variable, does the full memcpy out of the ring using that local value, and
- * publishes it to the shared rx_ring.tail LAST -- exactly the order the
- * pre-existing code already used (copy, then `tail += n`).  Publishing the
- * advance before the copy would let the pump's headroom check (ring_used(),
- * which reads rx_ring.tail) treat the not-yet-copied bytes as free room and
- * overwrite them with newly-pumped data while this function was still
- * reading them out -- the SAME hazard an eager, pre-copy tail advance would
- * have had even without lazy-commit; this fix does not introduce it, it only
- * has to keep not introducing it while holding the tail back for longer. */
+/* CONCURRENCY: SPSC for the ring's DATA (head/tail/buf), but lazy-commit
+ * gives `uncommitted` a SECOND writer beyond the dispatch/consumer:
+ * rx_ring.head is written ONLY by the task (cc3501e_hw_sock_pump, the
+ * producer) and read only by the dispatch/consumer.  rx_ring.tail is
+ * written ONLY by the dispatch/consumer (cc3501e_hw_sock_recv_ring) and
+ * read only by the task (ring_used(), for the pump's headroom guard).
+ * `uncommitted` is written by the dispatch/consumer on every serve, AND by
+ * the WORKER TASK's cc3501e_hw_sock_prefetch() on arm/disarm -- so, unlike
+ * head/tail, it is not single-writer, and an earlier version of this
+ * comment was wrong to say it "adds NO new cross-context field".
+ *
+ * That second writer is why cc3501e_hw_sock_prefetch()'s arm branch resets
+ * rx_ring.head/tail/uncommitted BEFORE publishing rx_ring.fd_plus1, not
+ * after: cc3501e_hw_sock_recv_ring() (dispatch context, can run at any SPI
+ * callback) only ever touches uncommitted/head/tail for a handle that
+ * currently matches fd_plus1.  Published last, fd_plus1 acts as the
+ * release: dispatch cannot observe the new handle until head, tail, and
+ * uncommitted are ALL already reset for it.  Publishing fd_plus1 first (an
+ * earlier version of this function did) opens a window where a dispatch
+ * call sees the new handle's fd_plus1 but a stale, not-yet-reset
+ * uncommitted from whatever handle used the ring last: sock_recv_commit()
+ * then folds that stale count into a tail that has ALREADY been zeroed,
+ * producing tail = stale_uncommitted while head = 0, which underflows
+ * ring_used()'s unsigned head - tail to a huge value -- stale ring memory
+ * gets served as a normal OK reply, and the pump never gets a chance to
+ * refill anything since the "used" it now sees is (falsely) enormous.
+ *
+ * The other new invariant lazy-commit relies on: cc3501e_hw_sock_recv_ring()
+ * computes the post-commit tail into a LOCAL variable, does the full memcpy
+ * out of the ring using that local value, and publishes it to the shared
+ * rx_ring.tail LAST -- exactly the order the pre-existing code already used
+ * (copy, then `tail += n`).  Publishing the advance before the copy would
+ * let the pump's headroom check (ring_used(), which reads rx_ring.tail)
+ * treat the not-yet-copied bytes as free room and overwrite them with
+ * newly-pumped data while this function was still reading them out -- the
+ * SAME hazard an eager, pre-copy tail advance would have had even without
+ * lazy-commit; this fix does not introduce it, it only has to keep not
+ * introducing it while holding the tail back for longer. */
 
 /* TASK CONTEXT ONLY -- called from cc3501e_hw_tick().  Does the lwIP read. */
 #ifdef CC3501E_RADIO_SPEEDTEST
@@ -635,23 +654,43 @@ void cc3501e_hw_sock_pump(void)
 	}
 }
 
-/* Arm/disarm prefetch for a handle.  Called from the socket open/close paths.
- * Resets `uncommitted` in BOTH arms, not just the arm-on head/tail reset:
- * a fresh arm must never inherit a stale served-but-not-retired count from
- * whatever handle used the ring last (arm-on), and a disarm must not leave
- * one behind to confuse a future arm that, for whatever reason, reads it
- * before its own first serve sets it (arm-off) -- cheap insurance for a
- * single uint32_t, not a case this needs to actually reach in practice. */
+/* Arm/disarm prefetch for a handle.  Called on the WORKER TASK, from the
+ * socket open/close paths (sock_connect / sock_close), which can run
+ * concurrently with a dispatch-context (SPI callback) call into
+ * cc3501e_hw_sock_recv_ring() below.
+ *
+ * Arm-on publishes rx_ring.fd_plus1 LAST, after head/tail/uncommitted are
+ * ALL already reset to 0 -- not first, as an earlier version of this
+ * function did.  fd_plus1 is the only field cc3501e_hw_sock_recv_ring()
+ * checks before touching the rest of the ring, so publishing it last makes
+ * it the release: dispatch cannot observe the new handle until everything
+ * else is already consistent for it.  Publishing it first left a window
+ * where a dispatch call could see the NEW handle's fd_plus1 while
+ * `uncommitted` still held the OLD handle's stale served-but-not-retired
+ * count -- sock_recv_commit() would then fold that stale count into a tail
+ * already zeroed for the new handle, underflowing ring_used()'s unsigned
+ * head - tail and serving stale ring memory as a normal OK reply forever
+ * (see the CONCURRENCY comment above rx_ring for the full trace).
+ *
+ * Resets `uncommitted` on BOTH arms, not just the arm-on head/tail reset: a
+ * fresh arm must never inherit a stale count from whatever handle used the
+ * ring last (arm-on, ordering above), and a disarm must not leave one
+ * behind to confuse a future arm that, for whatever reason, reads it before
+ * its own first serve sets it (arm-off) -- cheap insurance for a single
+ * uint32_t, not a case this needs to actually reach in practice; arm-off's
+ * ordering has no equivalent race since fd_plus1 = 0 immediately stops
+ * cc3501e_hw_sock_recv_ring() from touching the ring for this handle at
+ * all, regardless of what order the rest of this branch runs in. */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 {
 	if (on) {
 		rx_ring.head = rx_ring.tail = 0u;
 		rx_ring.peer_closed         = false;
-		rx_ring.fd_plus1            = handle;
-		uncommitted                 = 0u;
+		sock_recv_commit_reset(&uncommitted);
+		rx_ring.fd_plus1 = handle; /* publish LAST -- see comment above */
 	} else if (rx_ring.fd_plus1 == handle) {
 		rx_ring.fd_plus1 = 0u;
-		uncommitted      = 0u;
+		sock_recv_commit_reset(&uncommitted);
 	}
 }
 
