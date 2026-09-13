@@ -178,6 +178,16 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
+/* IEEE 802.11 status codes wifi_event_cb() acts on below (ASSOCIATION_REJECTED
+ * temporary-reject handling).  Named locally rather than #include'd: the
+ * canonical definitions are hostap's ieee802_11_defs.h
+ * (source/third_party/hostap/src/common/ieee802_11_defs.h:125,135), but hostap
+ * ships this SDK as a PREBUILT archive (hostap.a, see ti/build_ti.sh's link
+ * list) with no -I for its src/common, so that header is not on this TU's
+ * include path. */
+#define CC3501E_WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA 17u /* ieee802_11_defs.h:125 */
+#define CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY  30u /* ieee802_11_defs.h:135 */
+
 static void wifi_event_cb(WlanEvent_t *event)
 {
 	if (event == NULL) {
@@ -292,23 +302,107 @@ static void wifi_event_cb(WlanEvent_t *event)
 		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
-	case WLAN_EVENT_ASSOCIATION_REJECTED:
-		wifi_last_status = -1;
+	case WLAN_EVENT_ASSOCIATION_REJECTED: {
 		/* AssocStatusCode is a real 802.11 status code (driver/drv_ti/
 		 * drv_ti_mlme.c ~1287, wlanDispatcherSendEvent(..., sizeof(uint16_t))
 		 * off apMngPack->u.assoc_resp.status_code) -- worth the same low-byte
 		 * publication a DISCONNECT's ReasonCode gets.  Same CONNECTING-only
-		 * gate as DISCONNECT above (this event only ever fires mid-attempt in
-		 * practice, but the gate costs nothing and keeps the rule uniform). */
+		 * gate as DISCONNECT above. */
+		const uint16_t status = event->Data.AssocStatusCode;
+
+		/* BENCH (Run8, e1m-aen-evk-01, GPE 0.254.8.0, alp-console connect-first
+		 * WPA3, cold power cycle ~1.5 min apart): the connect result strictly
+		 * ALTERNATED pass/fail across consecutive boots (P1: A R A R A R T A R
+		 * A R A; P3 scan-first: A R A R).  Every rejection printed
+		 * `fail: 2` (REJECTED) with WIFI_STATUS last_reason 30
+		 * (CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY) after ~4-6 s, last
+		 * vendor event WLAN_EVENT_DISCONNECT.  INFERENCE (not proven by the
+		 * SDK source, only by the alternating pattern): WPA3 requires PMF, and
+		 * a cold power cycle with no deauth leaves the AP still holding the
+		 * PREVIOUS boot's security association, so it rejects temporarily
+		 * with an Association Comeback Time; the NEXT boot then finds that SA
+		 * expired and succeeds -- hence the strict alternation.
+		 *
+		 * THE ACTUAL BUG this fix closes does not depend on that inference:
+		 * on status 30 with a comeback-time IE (or status 17,
+		 * AP_UNABLE_TO_HANDLE_NEW_STA), the vendor driver ITSELF already
+		 * retries -- ti_drv_rxAssocRespPacket() (drv_ti_mlme.c ~1291-1345)
+		 * registers ti_drv_AssocTimeout via eloop_register_timeout() (the
+		 * AP's own comeback duration for 30, a fixed 200 ms for 17) and, on
+		 * firing, ti_drv_AssocTimeout() (drv_ti_sta_specific.c ~708-733)
+		 * re-sends the association request (ti_drv_txAssocReqPacket()) for up
+		 * to ASSOC_MAX_TRIES(3) attempts before giving up and reporting
+		 * EVENT_ASSOC_TIMED_OUT to the supplicant.  Before this fix, THIS cb
+		 * treated the FIRST rejection as terminal -- set wifi_last_status=-1
+		 * and signalled -- so cc3501e_hw_wifi_connect_sta() published
+		 * FAILED/REJECTED immediately and ran wifi_clear_stale_assoc() ->
+		 * Wlan_Disconnect(), aborting the vendor's own in-flight comeback
+		 * retry out from under it -- exactly the alternating pass/fail
+		 * pattern the bench recorded, independent of whether the PMF/stale-SA
+		 * inference above is the right explanation for WHY the AP rejects.
+		 *
+		 * FIX: 30 and 17 are NOT terminal here.  Record the status into the
+		 * live reason (still gated on wifi_conn_is_connecting(), same rule as
+		 * every other case) so a host polling WIFI_STATUS mid-retry sees it,
+		 * but do NOT set wifi_last_status or signal -- the connect body simply
+		 * keeps waiting on its EXISTING osi_SyncObjWait(&wifi_event_sync, 30s)
+		 * in cc3501e_hw_wifi_connect_sta(), for the vendor's own retry to
+		 * either succeed (WLAN_EVENT_CONNECT) or exhaust ASSOC_MAX_TRIES and
+		 * report a REAL terminal event.  Any other rejected status (not 30 or
+		 * 17) is unaffected and stays terminal, as before.
+		 *
+		 * TIMEOUT BUDGET: unaffected.  This does not add a wait; it only stops
+		 * short-circuiting the association wait BEFORE the vendor's own retry
+		 * (which was already going to run regardless, and was previously being
+		 * aborted mid-flight by our own Wlan_Disconnect()) gets to finish.  The
+		 * connect body's wait is still bounded by the SAME 30 s
+		 * osi_SyncObjWait it always was: if the comeback interval + retries
+		 * exceed what's left of that 30 s, the SAME pre-existing
+		 * FAIL_TIMEOUT path fires exactly as it would for any other slow
+		 * association.  Role-up (bounded 10 s, CC3501E_WIFI_ROLE_TIMEOUT_MS)
+		 * + this 30 s association wait + the DHCP poll's 20 s budget
+		 * (CC3501E_STA_DHCP_TRIES(100) * CC3501E_STA_DHCP_POLL_US(200 ms), see
+		 * below) sums to the SAME 60 s deepest path against the host apps'
+		 * 75000 ms CONNECT timeout budget as before -- no new headroom is
+		 * spent, and 15 s of that budget was already unused margin.
+		 *
+		 * AUTHENTICATION_REJECTED with the SAME statuses is deliberately left
+		 * terminal below, NOT given this treatment: traced in the SDK
+		 * (destroyAuthData(), drv_ti_sta_specific.c ~1112-1124) that the
+		 * driver CANCELS ti_drv_AuthTimeout (eloop_cancel_timeout()) for
+		 * exactly this rejection path (drv_ti_mlme.c ~1183-1191, the
+		 * DENY_LIST_EN branch for 17/30/DENIED_INSUFFICIENT_BANDWIDTH/
+		 * REQUEST_DECLINED) and returns RX_MGMT_NONE -- no retry timer is
+		 * registered (contrast the ASSOC path's eloop_register_timeout()
+		 * above), and RX_MGMT_NONE means wpa_supplicant's own SME layer never
+		 * even sees the frame, so it has no basis to retry either.  Nothing in
+		 * this SDK resumes an auth rejected with 17/30 once the deny-list
+		 * timer is armed; the ASSOC-path retry is genuinely a different,
+		 * unique mechanism, not one that also covers AUTH. */
+		if (status == CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY ||
+		    status == CC3501E_WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA) {
+			if (wifi_conn_is_connecting()) {
+				wifi_last_reason = (int16_t)status;
+			}
+			break; /* deliberately NO wifi_last_status write, NO signal --
+			        * this is not terminal; see the comment above. */
+		}
+
+		wifi_last_status = -1;
 		if (wifi_conn_is_connecting()) {
-			wifi_last_reason = (int16_t)event->Data.AssocStatusCode;
+			wifi_last_reason = (int16_t)status;
 		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
+	}
 	case WLAN_EVENT_AUTHENTICATION_REJECTED:
 		wifi_last_status = -1;
 		/* Same as ASSOCIATION_REJECTED above: AuthStatusCode is a real 802.11
-		 * status code (drv_ti_mlme.c ~1177, off apMngPack->u.auth.status_code). */
+		 * status code (drv_ti_mlme.c ~1177, off apMngPack->u.auth.status_code).
+		 * Kept fully terminal, including for status 17/30 -- see the
+		 * ASSOCIATION_REJECTED case's comment for why nothing in the vendor
+		 * SDK retries an auth rejection the way it retries an association
+		 * rejection. */
 		if (wifi_conn_is_connecting()) {
 			wifi_last_reason = (int16_t)event->Data.AuthStatusCode;
 		}
