@@ -843,8 +843,21 @@ static void wifi_clear_stale_assoc(void)
 }
 
 /* STA L3 bring-up: bounded DHCP-lease poll after the L2 connect event.
- * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 100 * 200 ms = 20 s budget
+ * CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US = 150 * 200 ms = 30 s budget
  * (the worker drain sleeps between tries so the tcpip thread runs DHCP).
+ *
+ * WIDENED 20 s -> 30 s on measurement, not on principle.  With the station held
+ * ACTIVE and a stalled client restarted, the leases that still missed the call
+ * were arriving about 1 SECOND after it gave up -- 3 of 16 in one bench run and
+ * 2 of 16 in the next, each reported as a connect failure that the very next
+ * host read then contradicted by handing back an address.  Those are not radio
+ * failures; they are the call giving up immediately before the answer.
+ *
+ * 30 s is the largest value the caller budgets allow.  The deepest path that
+ * reaches this poll is role-up + association + lease = 10 + 30 + 30 = 70 s,
+ * against the 75000 ms the bench apps pass since their budgets were re-derived
+ * (alp-sdk#2079).  At 35 s that path is 75 s and the caller times out first,
+ * which is exactly the failure this change removes.
  *
  * 20 s, not the 10 s this shipped with, and the four-second difference is the
  * whole point.  lwIP retransmits DISCOVER on a doubling backoff: dhcp_discover()
@@ -908,13 +921,15 @@ static void wifi_clear_stale_assoc(void)
  * wait -- prebuilt/CHANGELOG.md records that.  The association timeout and this
  * poll are mutually exclusive (a timed-out association returns above and never
  * reaches DHCP), so the deepest path that reaches here is
- * role-up + association + lease = 10 + 30 + 20 = 60 s against the 70000 ms the
- * bench apps pass.  At 35 s that same path is 75 s and the caller gives up
- * first, turning a fixable lease delay back into an unreadable host timeout.
+ * role-up + association + lease = 10 + 30 + 30 = 70 s against the 75000 ms the
+ * bench apps pass since their budgets were re-derived (alp-sdk#2079).  At 35 s
+ * that same path is 75 s and the caller gives up first, turning a fixable lease
+ * delay back into an unreadable host timeout -- which is why 30 s is the ceiling
+ * here and not a round number chosen for comfort.
  *
- * Measured, that path is nowhere near its worst case: the two failing runs took
- * 14.45 s and 16.87 s end to end, so role-up plus association cost roughly 4.5 s
- * and the new budget puts them at about 24.5 s.
+ * Measured, that path is nowhere near its worst case: two early failing runs
+ * took 14.45 s and 16.87 s end to end, so role-up plus association cost roughly
+ * 4.5 s, leaving the lease poll the overwhelming majority of the budget.
  *
  * Where the real cause is NOT, as far as static reading can settle it: the
  * vendor netif plumbing.  cc3501e_hw_net_init() calls network_stack_add_if_sta()
@@ -949,7 +964,7 @@ static void wifi_clear_stale_assoc(void)
  * AP.  Reporting that state, ->tries, and netif->flags through GET_DIAG_INFO is
  * the smallest change that ends the guessing, and it needs no wiring that this
  * SoM does not have. */
-#define CC3501E_STA_DHCP_TRIES 100u
+#define CC3501E_STA_DHCP_TRIES 150u
 
 /* How many times the lease poll may restart a stalled DHCP client.  Two keeps
  * the worst case bounded -- each restart costs at most the 2 s to its first
