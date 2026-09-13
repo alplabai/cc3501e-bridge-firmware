@@ -18,7 +18,6 @@
 #include <stdint.h>
 
 #include <ti/drivers/Power.h> /* Power_setConstraint/Policy (pulls PowerWFF3.h via DeviceFamily_CC35XX) */
-#include <ti/drivers/dpl/HwiP.h> /* HwiP_disable/HwiP_restore -- the dirty-flag critical section (#7) */
 
 #ifdef CC3501E_WIFI
 #include <wlan_if.h> /* Wlan_Set -- the RADIO half of the power policy */
@@ -245,7 +244,21 @@ static void pp_apply_core(uint8_t policy)
 /* Apply the radio half of @p policy.  Best-effort: returns 0 when the radio is
  * not up yet (the caller latches and re-applies after role-up) and never fails
  * the whole policy call, so a host that sets power before Wi-Fi still gets the
- * core-side policy applied. */
+ * core-side policy applied.
+ *
+ * ps (WLAN_SET_POWER_SAVE -> CME_WlanSetPSMode(), wlan_if.c ~1716) and pm
+ * (WLAN_SET_POWER_MANAGEMENT -> ctrlCmdFw_SetSleepAuth(), wlan_if.c ~1722)
+ * are NOT the same knob and are NOT coupled in the vendor SDK: ps is the
+ * STA's OWN power-save mode (ACTIVE / AUTO_PS / POWER_SAVE) and only matters
+ * once that STA is associated as a client; pm is DEVICE-WIDE sleep
+ * authorisation (ctrlCmdFw_SetSleepAuth sends ACX_SLEEP_AUTH straight to
+ * firmware, control_cmd_fw.c ~1771, with no per-role scoping at all) -- it is
+ * what actually gates whether the NWP may doze between EITHER role's duty
+ * cycles.  A soft-AP has to beacon continuously and cannot tolerate that
+ * doze (see cc3501e_hw_wifi_ap_start()'s own ALWAYS_ACTIVE force before its
+ * Wlan_RoleUp(AP)), so pm is what THIS function must never hand a sleeping
+ * value to while an AP is up -- ps, being STA-scoped, is independent and may
+ * still follow the host's chosen preset. */
 #ifdef CC3501E_WIFI
 static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 {
@@ -275,6 +288,21 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 		break;
 	default:
 		return false;
+	}
+
+	/* OVERRIDE, regardless of @p policy or who chose it (including an
+	 * explicit host CMD_POWER_POLICY -- power management is device-wide, so a
+	 * host asking for BALANCED/LOW_POWER/DEEP_SLEEP is asking to sleep the
+	 * WHOLE NWP, and this HAL cannot honour that verbatim while a soft-AP is
+	 * relying on the NWP staying awake to keep beaconing (#1562)).  cc3501e_hw_
+	 * wifi_ap_start()'s own inline force only covers the moment RoleUp(AP)
+	 * happens; without this, a LATER policy apply here -- the tick draining an
+	 * explicit host policy, or the STA role-up path's synchronous apply while
+	 * AP is also up -- could still pull pm back to ELP.  ps is untouched: it
+	 * is STA-scoped (see this function's header comment) and stays whatever
+	 * @p policy chose. */
+	if (cc3501e_hw_radio_role() == (uint8_t)ALP_CC3501E_ROLE_WIFI_AP) {
+		pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE;
 	}
 
 	bool ok = (Wlan_Set(WLAN_SET_POWER_SAVE, &ps) >= 0);
@@ -323,9 +351,23 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
  * "STA Role is not up").  pp_apply_radio()'s Wlan_Set() return-value check
  * cannot see either case, so calling it with no STA role up would mark
  * pp_radio_ok true for a policy that silently never reached the radio.
- * Skipping the whole call and leaving pp_radio_dirty set (the caller's job,
- * not this function's) means the STA role-up path's own synchronous apply --
- * or the next tick, once a role exists -- retries it for real. */
+ *
+ * Skipping the call here does NOT leave pp_radio_dirty set for a later drain
+ * to retry -- cc3501e_hw_power_service() (below) already clears it, in its own
+ * critical section, before ever calling this function, so by the time this
+ * guard runs the flag is gone either way.  The real reason a policy set before
+ * any role exists is not lost: cc3501e_hw_wifi_ensure_sta_role() calls
+ * cc3501e_hw_power_apply_radio_now() -- this same function -- UNCONDITIONALLY
+ * on every STA role-up (not gated on pp_radio_dirty at all), re-reading
+ * pp_policy_latched / pp_host_set_policy fresh each time.  So the first STA
+ * role-up after a policy was set with no role up always re-applies it for
+ * real, regardless of what this early-return did or did not leave behind.
+ *
+ * One optimistic-read consequence, PRE-DATING this guard (the old
+ * `radio_up ? ok : true` did the same): pp_radio_ok reads true for a policy
+ * sent while no STA role exists yet, even though nothing was actually applied
+ * -- "not attempted" and "applied and confirmed" are not distinguished on the
+ * wire.  Not new here; noted, not fixed. */
 static void pp_apply_radio_effective(void)
 {
 	if (!cc3501e_hw_wifi_sta_role_up()) {
@@ -353,17 +395,17 @@ static void pp_apply_radio_effective(void)
 	 * up: cc3501e_hw_radio_role() reports AP over STA by design ("AP outranks
 	 * STA" -- see its own comment), so a scan/connect bringing STA up alongside
 	 * an already-running AP read as "AP", took the pp_policy_latched (BALANCED)
-	 * branch, and pulled the AP OUT of the ALWAYS_ACTIVE
-	 * cc3501e_hw_wifi_ap_start() had forced on it, while also connecting the
-	 * new STA under BALANCED/AUTO_PS instead of the intended ACTIVE default.
-	 * Reaching this line already proves a STA role is up (the guard above), so
-	 * testing STA-up directly -- rather than radio_role()'s AP-outranks-STA
-	 * summary -- is what "an STA role is being brought up or is up" (not
-	 * "cc3501e_hw_radio_role() alone") means here, and PERFORMANCE is simply
-	 * the correct unconfigured default whenever it applies: its ALWAYS_ACTIVE
-	 * pm is the identical setting cc3501e_hw_wifi_ap_start() forces inline, so
-	 * an AP running alongside stays on it instead of being pulled to BALANCED's
-	 * ELP/AUTO_PS. */
+	 * branch instead of the unconfigured default -- and, before pp_apply_radio()
+	 * grew its OWN unconditional AP-up override (below it, its header comment),
+	 * that also meant the AP's forced ALWAYS_ACTIVE was pulled back to
+	 * BALANCED's ELP.  Reaching this line already proves a STA role is up (the
+	 * guard above), so testing STA-up directly -- rather than radio_role()'s
+	 * AP-outranks-STA summary -- is what "an STA role is being brought up or
+	 * is up" (not "cc3501e_hw_radio_role() alone") means here.  AP safety no
+	 * longer depends on which branch @p eff takes: pp_apply_radio() forces pm
+	 * to ALWAYS_ACTIVE whenever AP is up regardless of the policy passed in, so
+	 * this function only has to pick the right ps/pm PRESET for the STA side
+	 * -- the AP-safe pm floor is enforced one layer down. */
 	const uint8_t eff =
 	    pp_host_set_policy ? pp_policy_latched : (uint8_t)ALP_CC3501E_PP_PERFORMANCE;
 	const bool ok = pp_apply_radio(eff, pp_idle_ms_latched);
@@ -388,10 +430,23 @@ void cc3501e_hw_power_apply_radio_now(void)
 	pp_apply_radio_effective();
 }
 
+/* worker_critical_enter/exit: declared here rather than pulled from a shared
+ * header, matching hal/ti/cc3501e_nimble_host.c's own local prototype for the
+ * same pair -- there is no header that owns them.  worker.c declares WEAK
+ * no-op defaults (correct for the native/stub build); hal/ti/cc3501e_hw_ti.c
+ * (this same TU's platform-lifecycle sibling) provides the STRONG override
+ * that actually masks interrupts (PRIMASK save/restore) on real silicon --
+ * see its comment for why PRIMASK save/restore, not a bare enable. */
+unsigned long worker_critical_enter(void);
+void          worker_critical_exit(unsigned long key);
+
 /* TASK-context drain for the latched radio policy.  Called from cc3501e_hw_tick().
  * Applying with no STA role up is not an error -- pp_apply_radio_effective()'s
- * own guard (#5) makes that a clean early-return, and pp_radio_dirty stays set
- * (see below) so a LATER drain -- once a role exists -- retries for real. */
+ * own guard (#5) makes that a clean early-return.  This function still clears
+ * pp_radio_dirty below regardless (the flag does NOT survive an early-return),
+ * but that is harmless: cc3501e_hw_wifi_ensure_sta_role() re-applies the
+ * latched policy unconditionally on the first STA role-up either way -- see
+ * pp_apply_radio_effective()'s comment. */
 void cc3501e_hw_power_service(void)
 {
 	/* Read-and-clear pp_core_dirty/pp_radio_dirty as ONE atomic step (#7).  Two
@@ -401,21 +456,22 @@ void cc3501e_hw_power_service(void)
 	 * window had its pp_core_dirty=true observed here (do_core reads true) but
 	 * then WIPED by this function's own `pp_core_dirty = false;` before
 	 * pp_apply_core() ever ran for it, losing the core half of that policy
-	 * silently.  HwiP_disable()/HwiP_restore() is the file's existing masking
-	 * primitive (see <ti/drivers/dpl/HwiP.h>, included above) -- short enough
-	 * to hold with interrupts masked (two volatile reads + two writes), unlike
+	 * silently.  worker_critical_enter()/worker_critical_exit() is the TREE'S
+	 * EXISTING masking primitive for exactly this ISR-vs-task publish/read
+	 * race (src/worker.c's own header comment; also used by event_ring.c) --
+	 * short enough to hold masked (two volatile reads + two writes), unlike
 	 * pp_apply_core()/pp_apply_radio() below, which must NOT run masked (#1683,
 	 * this function's own header comment). */
-	uintptr_t key = HwiP_disable();
+	const unsigned long key = worker_critical_enter();
 	if (!pp_radio_dirty && !pp_core_dirty) {
-		HwiP_restore(key);
+		worker_critical_exit(key);
 		return;
 	}
 	const bool do_core  = pp_core_dirty;
 	const bool do_radio = pp_radio_dirty;
 	pp_radio_dirty      = false;
 	pp_core_dirty       = false;
-	HwiP_restore(key);
+	worker_critical_exit(key);
 
 	/* Core FIRST, then radio -- both on this task, never in the ISR (#1683).
 	 * The core half runs ONLY for an explicit host policy, never because a radio
