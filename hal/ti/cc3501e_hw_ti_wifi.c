@@ -84,7 +84,32 @@ appControlBlock app_CB;
  * call sites is itself inside that same #ifdef. */
 static volatile int16_t wifi_last_reason;
 
+/* Is a connect attempt currently OPEN -- mark_connecting() has run and the
+ * terminal wifi_conn_set() has not (yet) published CONNECTED/CONN_FAILED/
+ * DISCONNECTED?  Forward-declared here so wifi_event_cb() (right below, well
+ * before g_wifi_conn's own declaration further down) can call it; defined
+ * next to g_wifi_conn, which it reads.
+ *
+ * SAFE TO READ FROM wifi_event_cb()'S CONTEXT (the host-driver thread, a third
+ * context alongside the SPI-ISR/protocol context that calls mark_connecting()
+ * and the worker/task context that calls wifi_conn_set()): g_wifi_conn.state
+ * is a single `volatile uint8_t` -- a one-byte load the compiler always
+ * re-reads from memory (no cached/stale value across the call) and that the
+ * CPU cannot tear, so a concurrent write from either other context can only
+ * make this return the OLD state or the NEW one, never a corrupt in-between
+ * value.  A single stale read (seeing the old state for one more event) is
+ * exactly the race this admits, and is what the "RESIDUAL" note on the
+ * DISCONNECT case below and on g_wifi_conn's own comment describes -- nothing
+ * worse.
+ *
+ * Declared inside the #ifdef CC3501E_WIFI block right below, not here: an
+ * unguarded declaration with no matching call in the non-Wi-Fi ti build warns
+ * as unused there too, not just an unguarded definition, and wifi_event_cb()
+ * (its only caller) is itself inside that same block. */
+
 #ifdef CC3501E_WIFI
+static bool wifi_conn_is_connecting(void);
+
 /* --------------------------------------------------------------- *
  * Lazy Wi-Fi bring-up (P0-6) -- the CC35xx host stack is started ONCE,    *
  * on first use, from the async worker's drain (NOT the SPI ISR).  Per     *
@@ -153,17 +178,6 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
-/* FIRMWARE-OWNED "we asked for this disconnect" flag -- set immediately before
- * EVERY Wlan_Disconnect() this firmware issues (wifi_clear_stale_assoc() and
- * cc3501e_hw_wifi_disconnect(), both below), consumed and cleared by the very
- * next WLAN_EVENT_DISCONNECT in wifi_event_cb(), which must then leave
- * wifi_last_reason alone.
- *
- * NOT the same thing as the vendor's WlanEventDisconnect_t::IsStaIsDiscnctInitiator
- * -- see wifi_event_cb()'s DISCONNECT case for why that flag is unreliable for
- * exactly the disconnects THIS flag exists to cover. */
-static volatile bool wifi_own_disconnect_pending;
-
 static void wifi_event_cb(WlanEvent_t *event)
 {
 	if (event == NULL) {
@@ -231,32 +245,47 @@ static void wifi_event_cb(WlanEvent_t *event)
 		/* A connect attempt that the FW rejects arrives as one of these three
 		 * rather than a negative CONNECT.Status; surface it as a failure. */
 		wifi_last_status = -1;
-		/* Use OUR OWN wifi_own_disconnect_pending flag here, NOT the vendor's
-		 * WlanEventDisconnect_t::IsStaIsDiscnctInitiator -- that flag is only
-		 * set for a disconnect issued while the vendor's station state
-		 * machine is IDLE (cme.c ~3298/~3335: ReasonCode hardcoded to
-		 * WLAN_DISCONNECT_USER_INITIATED == 200, IsStaIsDiscnctInitiator = 1).
-		 * A disconnect WE issue while actually connected or mid-association --
-		 * a host WIFI_DISCONNECT while connected, or wifi_clear_stale_assoc()'s
-		 * #1437 cleanup after a FAILED connect that got as far as associating --
-		 * routes through CmeStationDisconnectKick() instead
-		 * (cme_station_flow.c ~548 -> cmeStaSendDisConnectedEventToApp() at
-		 * ~875), which sends ReasonCode = WLAN_REASON_DEAUTH_LEAVING (a real
-		 * 802.11 reason, 3) WITH IsStaIsDiscnctInitiator = 0 -- indistinguishable
-		 * from an AP-initiated deauth by the vendor's own flag.  Narrow but
-		 * real: a host WIFI_DISCONNECT immediately followed by a new connect
-		 * could otherwise have this delayed, vendor-flagged-as-unsolicited
-		 * event land after the new mark_connecting() and publish a stale 0x03
-		 * for the NEW attempt.
+		/* Record the reason ONLY while an attempt is OPEN (mark_connecting()
+		 * ran, wifi_conn_set() has not yet published a terminal state -- see
+		 * wifi_conn_is_connecting()'s own comment for the exact contract and
+		 * why reading it here is safe) -- and NEVER record 200
+		 * (WLAN_DISCONNECT_USER_INITIATED): the vendor hardcodes that value
+		 * whenever a disconnect is issued while its OWN station state machine
+		 * happens to be idle (cme.c ~3298/~3335), and it was never a real
+		 * 802.11 reason regardless of who caused it.
 		 *
-		 * wifi_own_disconnect_pending is set by every Wlan_Disconnect() caller
-		 * in this file regardless of which vendor path handles it, so it
-		 * covers both cases uniformly; the vendor flag is not consulted at all
-		 * any more.  Consumed (cleared) here -- exactly once per firmware-
-		 * issued disconnect -- so it cannot suppress a LATER, real event. */
-		if (wifi_own_disconnect_pending) {
-			wifi_own_disconnect_pending = false;
-		} else {
+		 * This replaces an earlier firmware-owned "we asked for this
+		 * disconnect" flag (wifi_own_disconnect_pending) that tried to track
+		 * our own Wlan_Disconnect() calls directly.  That flag had real gaps:
+		 * cc3501e_hw_wifi_disconnect() could return an error WITHOUT clearing
+		 * it (the vendor returns an error and emits NO event with no STA/P2P
+		 * role up, cme.c ~1645-1654, or when its pending-op check rejects the
+		 * call, wlan_if.c ~191-200/~1324-1329; a role switch can also return
+		 * OK with NO event, cme.c ~1667-1672) -- any of those left the flag
+		 * armed to wrongly swallow a LATER, unrelated event's reason.  A
+		 * vendor-generated event unrelated to our own disconnect (e.g.
+		 * AUTHENTICATION_REJECTED's underlying WPA_SUPP_DISCONNECTED,
+		 * drv_ti_mlme.c ~1177) could also consume it.  Gating on OUR OWN
+		 * connecting-state latch instead needs no bookkeeping that a vendor
+		 * error path can leave stuck.
+		 *
+		 * RESIDUAL, stated plainly (this is an observability byte, not a
+		 * safety one): a disconnect WE issue while ACTUALLY CONNECTED or
+		 * mid-association -- a host WIFI_DISCONNECT while connected, or
+		 * wifi_clear_stale_assoc()'s #1437 cleanup after a FAILED connect --
+		 * routes through a vendor path (cme_station_flow.c ~548 ->
+		 * cmeStaSendDisConnectedEventToApp() ~875) that sends REASON 3
+		 * (WLAN_REASON_DEAUTH_LEAVING, a REAL 802.11 code, not 200) and
+		 * arrives ASYNCHRONOUSLY.  If a NEW connect attempt's mark_connecting()
+		 * runs before that delayed event lands, this event's reason 3 CAN be
+		 * recorded against the NEW attempt, landing inside its CONNECTING
+		 * window.  A reader that sees exactly reason 3 should treat it as
+		 * POSSIBLY self-inflicted (our own prior disconnect), not necessarily
+		 * a real AP-initiated deauth of the current attempt -- see
+		 * hal/cc3501e_hw.h's cc3501e_hw_wifi_last_reason() contract, which
+		 * states this plainly for the host too. */
+		if (wifi_conn_is_connecting() &&
+		    event->Data.Disconnect.ReasonCode != (int16_t)WLAN_DISCONNECT_USER_INITIATED) {
 			wifi_last_reason = event->Data.Disconnect.ReasonCode;
 		}
 		osi_SyncObjSignal(&wifi_event_sync);
@@ -266,15 +295,21 @@ static void wifi_event_cb(WlanEvent_t *event)
 		/* AssocStatusCode is a real 802.11 status code (driver/drv_ti/
 		 * drv_ti_mlme.c ~1287, wlanDispatcherSendEvent(..., sizeof(uint16_t))
 		 * off apMngPack->u.assoc_resp.status_code) -- worth the same low-byte
-		 * publication a DISCONNECT's ReasonCode gets. */
-		wifi_last_reason = (int16_t)event->Data.AssocStatusCode;
+		 * publication a DISCONNECT's ReasonCode gets.  Same CONNECTING-only
+		 * gate as DISCONNECT above (this event only ever fires mid-attempt in
+		 * practice, but the gate costs nothing and keeps the rule uniform). */
+		if (wifi_conn_is_connecting()) {
+			wifi_last_reason = (int16_t)event->Data.AssocStatusCode;
+		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	case WLAN_EVENT_AUTHENTICATION_REJECTED:
 		wifi_last_status = -1;
 		/* Same as ASSOCIATION_REJECTED above: AuthStatusCode is a real 802.11
 		 * status code (drv_ti_mlme.c ~1177, off apMngPack->u.auth.status_code). */
-		wifi_last_reason = (int16_t)event->Data.AuthStatusCode;
+		if (wifi_conn_is_connecting()) {
+			wifi_last_reason = (int16_t)event->Data.AuthStatusCode;
+		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	default:
@@ -618,13 +653,13 @@ int cc3501e_hw_get_mac(uint8_t mac[6])
  *
  * reason is a FROZEN COPY of wifi_last_reason (below), taken by wifi_conn_set()
  * at the moment it publishes a terminal state -- NOT a live mirror.  Freezing
- * matters because wifi_last_reason keeps moving after that: a FAILED connect's
- * cleanup (wifi_clear_stale_assoc(), called right after every wifi_conn_set()
- * on the failure paths) issues its own Wlan_Disconnect(), and its DISCONNECT
- * event -- wifi_own_disconnect_pending suppresses the reason THAT event would
- * otherwise stash (see wifi_event_cb()), but arrives asynchronously and could
- * still land in wifi_last_reason strictly AFTER the real failure reason if
- * this were a live mirror instead of a freeze.
+ * matters even though wifi_event_cb() also gates writes to wifi_last_reason on
+ * wifi_conn_is_connecting(): that gate protects wifi_last_reason from being
+ * overwritten AFTER this attempt's terminal transition, right up until the
+ * NEXT mark_connecting() reopens it (and clears the live static back to 0 --
+ * see mark_connecting()'s own comment).  Freezing here is what lets a host
+ * still read THIS attempt's reason correctly even after that next
+ * mark_connecting() has already cleared the live copy for the new attempt.
  *
  * SCOPE: this byte covers the CONNECT ATTEMPT only -- the reason or status
  * that ENDED or REJECTED that attempt (a DISCONNECT/REJECTED event that
@@ -648,6 +683,17 @@ static volatile struct {
 	              (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE,
 	              0,
 	              0 };
+
+#ifdef CC3501E_WIFI
+/* See the forward declaration + full contract comment above (before
+ * wifi_event_cb()).  Guarded, unlike g_wifi_conn itself: wifi_event_cb(), the
+ * only caller, is CC3501E_WIFI-only too, so an unguarded definition here is
+ * simply unused (and warns as such) in the non-Wi-Fi ti build. */
+static bool wifi_conn_is_connecting(void)
+{
+	return g_wifi_conn.state == (uint8_t)ALP_CC3501E_WIFI_CONNECTING;
+}
+#endif /* CC3501E_WIFI */
 
 void cc3501e_hw_wifi_mark_connecting(void)
 {
@@ -1044,9 +1090,15 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
 static void wifi_clear_stale_assoc(void)
 {
 	if (wifi_started) {
-		/* Arm BEFORE the call -- see wifi_own_disconnect_pending's declaration
-		 * and wifi_event_cb()'s DISCONNECT case. */
-		wifi_own_disconnect_pending = true;
+		/* No "we asked for this" flag to arm here any more -- see
+		 * wifi_event_cb()'s DISCONNECT case for why that approach was
+		 * dropped.  This call always runs AFTER the caller's own
+		 * wifi_conn_set(FAILED, ...), so the connecting-state gate that
+		 * replaced the flag is already closed by the time this fires: see
+		 * that case's RESIDUAL note for the one narrow situation (a NEW
+		 * attempt's mark_connecting() racing this call's own delayed
+		 * DISCONNECT event) where that gate can still record this
+		 * disconnect's reason 3 against the wrong attempt. */
 		(void)Wlan_Disconnect(WLAN_ROLE_STA, NULL);
 	}
 }
@@ -1381,12 +1433,13 @@ int cc3501e_hw_wifi_disconnect(void)
 	if (!wifi_started) {
 		return CC3501E_HW_OK; /* nothing to disconnect */
 	}
-	/* Arm BEFORE the call -- see wifi_own_disconnect_pending's declaration and
-	 * wifi_event_cb()'s DISCONNECT case: a disconnect issued while actually
-	 * connected routes through the vendor's non-idle path, which does NOT set
-	 * IsStaIsDiscnctInitiator, so this flag is the only reliable signal that
-	 * the DISCONNECT event about to fire was ours. */
-	wifi_own_disconnect_pending = true;
+	/* No "we asked for this" flag to arm here any more -- see
+	 * wifi_event_cb()'s DISCONNECT case for why.  Nothing to gate here either:
+	 * a host WIFI_DISCONNECT is only ever issued while state is CONNECTED (the
+	 * only state a host would sensibly send one from), so the connecting-state
+	 * gate that replaced the flag is already closed the whole time this
+	 * function runs -- the vendor's own async DISCONNECT event for THIS call
+	 * cannot land inside a CONNECTING window it never opened. */
 	if (Wlan_Disconnect(WLAN_ROLE_STA, NULL) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
@@ -1551,6 +1604,22 @@ int cc3501e_hw_wifi_ap_stop(void)
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_ap_role_up = false;
+	/* The AP role-up path forces device-wide pm to ALWAYS_ACTIVE, both inline
+	 * (cc3501e_hw_wifi_ap_start()'s own Wlan_Set() before RoleUp) and via
+	 * pp_apply_radio()'s AP-up override on every later apply.  Neither is
+	 * self-undoing: with the AP now down, nothing re-derives and re-applies
+	 * the host's actual latched policy, so the device would stay
+	 * ALWAYS_ACTIVE -- even under a BALANCED/LOW_POWER/DEEP_SLEEP
+	 * CMD_POWER_POLICY the host already sent -- until the next explicit
+	 * POWER_POLICY.  Re-apply now.  Safe to call unconditionally, whether or
+	 * not a STA role is also up: cc3501e_hw_power_apply_radio_now() ->
+	 * pp_apply_radio_effective() already no-ops cleanly with no STA role up
+	 * (#5's guard) -- this is TASK CONTEXT ONLY, and safe here because
+	 * WIFI_AP_STOP is worker-routed (src/worker.c, src/protocol_wifi.c's
+	 * handle_wifi_ap_stop() -> handle_worker_routed()), so this body -- like
+	 * cc3501e_hw_wifi_ensure_sta_role() -- always runs in worker_run_pending()
+	 * on the bringup task, never the SPI-dispatch ISR. */
+	cc3501e_hw_power_apply_radio_now();
 	return CC3501E_HW_OK;
 }
 
