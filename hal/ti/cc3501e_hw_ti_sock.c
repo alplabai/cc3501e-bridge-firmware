@@ -355,9 +355,46 @@ int cc3501e_hw_sock_send(uint16_t       handle,
 	if (handle == 0u || (data == 0 && data_len > 0u)) {
 		return CC3501E_HW_ERR_INVAL;
 	}
-	const int     fd = (int)handle - 1;
-	const ssize_t n  = lwip_send(fd, data, data_len, 0);
+	const int fd = (int)handle - 1;
+
+	/* NON-BLOCKING, deliberately.  The previous blocking lwip_send(..., 0) parked
+	 * the worker for as long as the peer declined to read (#107): a peer that
+	 * stops reading fills its window, the send buffer fills behind it, and
+	 * lwip_send waits until lwIP abandons the connection.  SOCK_SEND is
+	 * worker-routed and the worker holds READY low across the call, so the bridge
+	 * served NO opcode for that whole period -- not just sockets.  It read as a
+	 * dead link.  With the listening socket, any client associated to the
+	 * soft-AP could trigger that on purpose.
+	 *
+	 * SO_SNDTIMEO would be the obvious bound and is NOT available: lwIP ships
+	 * prebuilt in the vendor library without LWIP_SO_SNDTIMEO, so the option does
+	 * not exist on this build.
+	 *
+	 * MSG_DONTWAIT copies whatever fits into the send buffer and returns at once.
+	 * That is already what the wire contract describes -- SOCK_SEND replies with
+	 * a QUEUED byte count and a short count is legal -- so a full buffer becomes
+	 * "0 bytes queued", reported as success, and the host decides whether and
+	 * when to retry.  Retry policy belongs to the host; the bridge's job is to
+	 * stay responsive while the peer sulks.
+	 *
+	 * DO NOT assume this is equivalent to the receive side's MSG_DONTWAIT
+	 * failure, and DO NOT assume it is safe either.  On receive, MSG_DONTWAIT
+	 * returned 0 bytes for 81 s on a live connection because the data had not yet
+	 * been moved from the pcb into the socket's receive box.  Send has no such
+	 * intermediate hop -- it writes into the TCP send buffer directly -- so the
+	 * same pathology is not expected, but this stack's non-blocking paths have
+	 * surprised this tree before.  It must be measured with
+	 * aen-cc3501e-socket-throughput before merge: if send throughput collapses
+	 * toward zero, the non-blocking send is not accepting data and this change
+	 * must not ship. */
+	const ssize_t n = lwip_send(fd, data, data_len, MSG_DONTWAIT);
 	if (n < 0) {
+		if (errno == EWOULDBLOCK || errno == EAGAIN) {
+			/* Send buffer full: the peer is not reading.  Nothing queued, and not
+			 * an error -- report 0 so the host can back off and retry. */
+			if (sent_out != 0) *sent_out = 0u;
+			return CC3501E_HW_OK;
+		}
 		return CC3501E_HW_ERR_IO;
 	}
 	if (sent_out != 0) *sent_out = (uint16_t)n;
