@@ -63,17 +63,22 @@
  * earlier version of that store left every test green).
  *
  * BOTH OUTCOMES ARE CACHED, not just success: a same seq is BY DEFINITION a
- * retry of the identical logical send (the host assigns it once per send,
- * cc3501e_sock_send()), so whatever the first execution produced -- OK with
- * a queued count, or a decoded ERR -- IS the correct answer for every later
- * poll of that same seq.  lwIP can fail AFTER queueing (the SimpleLink SDK's
- * api_msg.c has a real path where tcp_write() succeeds and a LATER
- * tcp_output() still returns ERR_RTE, which the SDK's sockets.c surfaces as
- * a plain failed send() despite bytes already having been written, and
- * hal/ti/cc3501e_hw_ti_sock.c maps that to CC3501E_HW_ERR_IO) -- so treating
- * ERR as "safe to just retry" would risk the SAME duplicate-bytes class this
- * cache exists to prevent.  A cached ERR is therefore just as sticky as a
- * cached OK.
+ * retry of the identical logical send -- the host assigns ONE seq per FRAME
+ * (one per iteration of cc3501e_sock_send()'s remainder-retry loop,
+ * chips/cc3501e/cc3501e_sockets.c, not once per call to that function: each
+ * iteration carries different remaining bytes, so it IS a new logical send
+ * and gets a new seq; that function's own bounded post-timeout grace
+ * re-poll re-sends the SAME frame buffer unmodified, so it reuses THAT
+ * frame's seq, not a fresh one) -- so whatever the first execution produced
+ * -- OK with a queued count, or a decoded ERR -- IS the correct answer for
+ * every later poll of that same seq.  lwIP can fail AFTER queueing (the
+ * SimpleLink SDK's api_msg.c has a real path where tcp_write() succeeds and
+ * a LATER tcp_output() still returns ERR_RTE, which the SDK's sockets.c
+ * surfaces as a plain failed send() despite bytes already having been
+ * written, and hal/ti/cc3501e_hw_ti_sock.c maps that to
+ * CC3501E_HW_ERR_IO) -- so treating ERR as "safe to just retry" would risk
+ * the SAME duplicate-bytes class this cache exists to prevent.  A cached
+ * ERR is therefore just as sticky as a cached OK.
  *
  * INVALIDATED ON A DIFFERENT SEQ (mirrors protocol.c's retry_latch_serve()'s
  * "different seq: drop it" rule, issue #102): a request whose seq does NOT
@@ -81,21 +86,42 @@
  * so handle_sock_send() drops the stale entry before anything else --
  * unlike the generic latch (any worker-routed op's completion can refresh
  * it), this cache only changes on a SOCK_SEND completion, so an old entry
- * could otherwise survive indefinitely.  Safe because the host never
- * re-issues an OLDER seq after a NEWER one, and cc3501e_sock_send()'s
- * sock_busy serialises sends per ctx -- seq only ever moves forward (then
- * wraps).
+ * could otherwise survive indefinitely.  Safe under the host API's own
+ * usage contract, not because anything here enforces it: cc3501e_sock_send()
+ * is a single-caller-per-ctx operation -- it stages its whole remainder-
+ * retry loop's payload in ctx->sock_buf, a per-ctx scratch buffer shared
+ * across that entire call (alp-sdk's chips/cc3501e/core.h).  ctx->sock_busy
+ * does NOT serialise concurrent callers: its own doc comment says it
+ * "catches same-call-stack reentrancy, not two truly concurrent callers on
+ * one ctx", and its check-then-set (`if (ctx->sock_busy) return ...;
+ * ctx->sock_busy = true;`, cc3501e_sockets.c) is itself unlocked, a TOCTOU
+ * race for genuinely concurrent callers.  Under the single-caller contract,
+ * seq only ever moves forward (then wraps).  If that contract is violated
+ * anyway (two threads sending on one ctx), an OLDER seq's frame can land on
+ * the wire AFTER a newer one's, and this invalidation would then discard
+ * and re-execute BOTH sends -- a consequence of the pre-existing misuse
+ * (the two threads are already corrupting each other's writes to the
+ * shared sock_buf before this firmware ever sees a frame), not a new hazard
+ * this invalidation introduces.
  *
  * RESIDUAL: SEQ-WRAP ALIASING, NOT FULLY CLOSED.  The cache is keyed on an
- * 8-bit seq alone.  If 255 frames in a row fail to refresh it (no
- * intervening SOCK_SEND completion under a DIFFERENT seq), the host's
- * per-ctx counter wraps back to a value that is STILL cached, and a
- * genuinely NEW send assigned that same seq is indistinguishable from a
- * retry of the old one -- it would be answered the stale cached outcome
- * WITHOUT EXECUTING.  Nothing narrower than a wider identity (more than 8
- * bits) closes that; the different-seq invalidation above at least bounds
- * the staleness window to "no different seq observed since", not
- * "forever". */
+ * 8-bit seq alone, and the invalidation above drops the entry on any
+ * SOCK_SEND that reaches THIS DISPATCH with a different seq -- dispatched,
+ * not merely completed -- so closing the alias now needs 255 consecutive
+ * host seq increments whose FRAMES NEVER REACH THIS HANDLER at all: a
+ * host-side failure before the frame is even sent (cc3501e_sock_send()
+ * reporting NOT_READY, or its transport-lock acquire timing out --
+ * cc3501e_lock_acquire() inside poll_by_repeat(), alp-sdk#2035), or a
+ * firmware-side rejection that returns before the seq check runs (this
+ * handler's own length check above, or a CRC failure at the framing layer
+ * beneath protocol_dispatch(), which never reaches this TU at all).  If
+ * that happens 255 times running, the host's per-ctx counter wraps back to
+ * a value that is STILL cached, and a genuinely NEW send assigned that same
+ * seq is indistinguishable from a retry of the old one -- it would be
+ * answered the stale cached outcome WITHOUT EXECUTING.  Nothing narrower
+ * than a wider identity (more than 8 bits) closes that; the different-seq
+ * invalidation above at least bounds the staleness window to "no
+ * DISPATCHED different seq since", not "forever". */
 static volatile bool               g_sock_send_cached;
 static volatile uint8_t            g_sock_send_seq;
 static volatile alp_cc3501e_resp_t g_sock_send_status;
@@ -218,12 +244,15 @@ alp_cc3501e_resp_t handle_sock_listen(const uint8_t *req,
  *
  * req[3] is alp_cc3501e_sock_send_t.seq (v7; formerly `reserved`, always 0
  * through v6 -- see the wire-compat note on CC3501E_FW_IMPLEMENTS_PROTOCOL in
- * protocol_meta.c).  The host assigns it once per logical send
- * (cc3501e_sock_send()), so a poll carrying that SAME seq is, by definition,
- * the SAME logical send -- answered from the cache above WITHOUT touching
- * the worker at all, whatever that send's outcome was (OK or a decoded
- * ERR -- see the cache block's comment).  A DIFFERENT seq invalidates
- * whatever was cached and falls through toward the worker-routed path. */
+ * protocol_meta.c).  The host assigns it once per FRAME -- one per iteration
+ * of cc3501e_sock_send()'s remainder-retry loop (chips/cc3501e/
+ * cc3501e_sockets.c), and that function's own bounded post-timeout grace
+ * re-poll reuses the SAME frame's seq rather than assigning a fresh one --
+ * so a poll carrying that SAME seq is, by definition, the SAME logical
+ * frame -- answered from the cache above WITHOUT touching the worker at
+ * all, whatever that frame's outcome was (OK or a decoded ERR -- see the
+ * cache block's comment).  A DIFFERENT seq invalidates whatever was cached
+ * and falls through toward the worker-routed path. */
 alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
                                     size_t         req_len,
                                     uint8_t       *reply_data,
@@ -298,9 +327,12 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 	 *     request's, it cannot un-send bytes already handed to the socket.
 	 *     The host's own post-timeout collect grace (alp-sdk#2035's
 	 *     cc3501e_sock_send(), chips/cc3501e/cc3501e_sockets.c) exists
-	 *     precisely to collect (and thereby cache) the old send before
-	 *     giving up; if that grace ALSO fails and the host then reissues the
-	 *     SAME remaining bytes under a NEW seq, those bytes queue TWICE.
+	 *     precisely to collect the old send before giving up -- not to
+	 *     cache it: the cache here is filled at COMPLETION
+	 *     (protocol_sock_send_on_worker_complete(), worker.h), whether or
+	 *     not this grace's own collect ever happens.  If the grace ALSO
+	 *     fails and the host then reissues the SAME remaining bytes under a
+	 *     NEW seq, those bytes queue TWICE.
 	 *     BEFORE this guard existed, that specific case -- host gives up,
 	 *     reissues under a new seq -- happened to come out RIGHT: the new
 	 *     request would collect the old send's stale OK/count instead of
