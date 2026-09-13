@@ -339,10 +339,15 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * or REJECTED that attempt.  CONNECTED ALWAYS publishes 0, unconditionally --
  * even if a since-succeeded retry left a transient rejection status (e.g. 30)
  * recorded during the attempt: a CONNECTED attempt was neither ended nor
- * rejected, so this byte must not carry a stale reject alongside it.  Once an
- * attempt reaches CONNECTED this value is frozen at 0; a deauth that arrives
- * AFTER a successful CONNECTED does not update it (there is no post-connect
- * tracking here by design -- see the fuller note on g_wifi_conn's `reason`
+ * rejected, so this byte must not carry a stale reject alongside it.
+ * Reaching CONNECTED also clears the underlying live value, not only the
+ * published one, so it stays 0 afterward too -- including for a LATER
+ * publish that copies the live value again (a host-requested
+ * WIFI_DISCONNECT ending a clean, connected session must read 0, not resurface
+ * an old rejection from earlier in the same attempt).  Once an attempt
+ * reaches CONNECTED this value is frozen at 0; a deauth that arrives AFTER a
+ * successful CONNECTED does not update it (there is no post-connect tracking
+ * here by design -- see the fuller note on g_wifi_conn's `reason`
  * field in hal/ti/cc3501e_hw_ti_wifi.c). */
 int16_t cc3501e_hw_wifi_last_reason(void);
 

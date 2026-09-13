@@ -1172,9 +1172,25 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
 	 * that ENDED or REJECTED that attempt": a CONNECTED attempt was neither, so
 	 * publishing a stale rejection alongside a successful CONNECTED would
 	 * contradict that contract and mislead a host into reading a live
-	 * association as somehow still carrying a past reject. */
-	g_wifi_conn.reason = (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) ? 0 : wifi_last_reason;
-	g_wifi_conn.state  = state;
+	 * association as somehow still carrying a past reject.
+	 *
+	 * CONNECTED also clears the LIVE wifi_last_reason itself, not just the
+	 * frozen g_wifi_conn.reason above -- otherwise the two disagree from this
+	 * point on: a later cc3501e_hw_wifi_disconnect() call publishes
+	 * DISCONNECTED by copying the (still-stale) live value
+	 * (wifi_last_reason), which would re-surface that same old rejection
+	 * status as if it were the reason THIS now-clean disconnect ended,
+	 * exactly the kind of stale/self-inflicted mislabeling the rest of this
+	 * cb already guards against.  Clearing it here keeps "0 unless THIS
+	 * attempt/session actually records one of its own" true continuously,
+	 * not just at this one instant. */
+	if (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) {
+		wifi_last_reason   = 0;
+		g_wifi_conn.reason = 0;
+	} else {
+		g_wifi_conn.reason = wifi_last_reason;
+	}
+	g_wifi_conn.state = state;
 
 	if (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) {
 		(void)event_ring_push((uint8_t)ALP_CC3501E_EVT_WIFI_CONNECTED, NULL, 0u);
