@@ -673,9 +673,17 @@ void worker_run_pending(void)
 	if (go) {
 		cc3501e_bridge_busy(); /* radio op about to kill the slave DMA -> hold host off */
 		/* Whether the slave is armed for the host's next clock.  Starts true:
-		 * the ops that SKIP the re-init below (the two hot socket ops, and the
-		 * three whose HAL bodies re-init themselves) never tore the slave down
-		 * here, so their READY raise is unconditional as before.  Issue #5. */
+		 * the ops that SKIP the re-init below (the socket data and control ops,
+		 * the SPI1 passthrough ops, and the two BLE ops listed there) never tore
+		 * the slave down here, so their READY raise is unconditional as before.
+		 * Issue #5.
+		 *
+		 * Known ceiling of that: if an interrupt-side re-arm fails DURING a long
+		 * skipped body (arm_transfer leaves READY low and bumps g_arm_fail_count),
+		 * the unconditional raise below reports an armed slave that is not, until
+		 * the tick's arm-fail self-heal re-inits it.  Harmless on a board whose
+		 * READY is an unconnected net; the data-op and SPI1 skips have always
+		 * carried the same ceiling. */
 		bool rearmed = true;
 		worker_execute(cmd); /* may block for seconds (Wlan_* init + get) */
 
@@ -774,6 +782,11 @@ void worker_run_pending(void)
 		 * body at all.  If you add or remove a bridge_transport_spi_hw_reinit() in any
 		 * hal/ti/cc3501e_hw_ti_*.c body, RE-CHECK THIS LIST in the same change.
 		 *
+		 * The socket and SPI1 exemptions rest on the OTHER fact: that the body makes
+		 * no Wlan_* call.  Adding one to any cc3501e_hw_sock_* or cc3501e_hw_spi1_*
+		 * body -- a Wlan_Get for RSSI in connect, say -- silently leaves that radio
+		 * op with no re-sync.  Re-check this list for that too.
+		 *
 		 * Re-checked for WIFI_CONNECT_STA, which gained a reinit in its body: it stays
 		 * OFF this list, deliberately.  That body's reinit sits BETWEEN the STA
 		 * role-up and Wlan_Connect, so the whole association -- Wlan_Connect, the 30 s
@@ -798,32 +811,35 @@ void worker_run_pending(void)
 		const bool spi1_passthrough = (cmd == ALP_CC3501E_CMD_SPI1_CONFIGURE) ||
 		                              (cmd == ALP_CC3501E_CMD_SPI1_TRANSFER) ||
 		                              (cmd == ALP_CC3501E_CMD_SPI1_RELEASE);
-		/* Socket CONTROL ops are exempt for the same reason as the data ops: their
+		/* Socket CONTROL ops are exempt for the same reason as the data ops.  Their
 		 * HAL bodies in hal/ti/cc3501e_hw_ti_sock.c are lwIP calls (lwip_socket,
-		 * lwip_connect, lwip_close, lwip_bind, lwip_listen) and make no Wlan_*
-		 * call, so the slave's DMA was never killed and there is nothing to
-		 * re-establish -- only a live slave to close and re-open under the host.
+		 * lwip_connect, lwip_close, lwip_bind, lwip_listen) and the worker makes
+		 * no Wlan_* call for them.  CONNECT and CLOSE do put ARP / SYN / FIN / RST
+		 * frames on the Wi-Fi transmit path through the netif output function --
+		 * but SOCK_SEND drives far more traffic down that same path and has run
+		 * without a re-init since 2026-08-24.  BIND and LISTEN are exempt on code
+		 * reading alone: neither transmits anything.
 		 *
-		 * Silicon-measured on e1m-aen-evk-01 at GPE 0.254.6.0 (#106), station
-		 * mode, alp-console `sock tcp-get` against a LAN host with no listener:
-		 * each call is OPEN, CONNECT refused in ~40 ms, CLOSE -- three fast
-		 * re-inits while the host polls at its 1-2 ms cadence.  6 of 7 such boots
-		 * wedged the link: an op timed out at the host's 15 s budget, and every
-		 * later get_version answered -5 until a power cycle.  Two wedged on the
-		 * very FIRST SOCK_OPEN of the boot, before any connect had run, so the
-		 * trigger is not the long connect block and not AP mode.  Against an
-		 * address nothing answers, the same OPEN + CLOSE pair around a connect
-		 * that blocked 15 s left the link healthy on 3 of 3 boots.  That split is
-		 * CONSISTENT WITH, not proof of, the transport's own documented
-		 * re-init-on-a-live-slave desync (transport_hw_ti_spi.c): a re-init landing
-		 * while the host has fallen back to its slow cadence survives, one landing
-		 * inside the fast poll does not.  The before/after bench run on this
-		 * change is what confirms or refutes it. */
-		const bool socket_control = (cmd == ALP_CC3501E_CMD_SOCK_OPEN) ||
-		                            (cmd == ALP_CC3501E_CMD_SOCK_CONNECT) ||
-		                            (cmd == ALP_CC3501E_CMD_SOCK_CLOSE) ||
-		                            (cmd == ALP_CC3501E_CMD_SOCK_BIND) ||
-		                            (cmd == ALP_CC3501E_CMD_SOCK_LISTEN);
+		 * What the re-init cost them, measured on e1m-aen-evk-01 (#106), station
+		 * console app, `sock tcp-get` against a LAN host with no listener (OPEN,
+		 * CONNECT, CLOSE per call, three calls per boot): 6 of 7 boots wedged --
+		 * an op timed out at the host's 15 s budget and the next get_version
+		 * answered -5.  Of those 7, only 3 had associated; 2 of the 3 wedged, one
+		 * of them (B4) on the FIRST SOCK_OPEN of the boot straight after a good
+		 * get_version, before any connect had run.  So the trigger is neither the
+		 * long connect block nor AP mode.  An OPEN body takes about a millisecond,
+		 * so its re-init lands while the host is still polling at 1-2 ms.
+		 *
+		 * NOT established by that run: a separate style with ONE call per boot
+		 * against an address nothing answers survived 5 of 5, but at the measured
+		 * per-call wedge rate that is plausible by chance, so it does not show a
+		 * slow-cadence re-init is safe.  Nor does anything yet show a 12-21 s
+		 * lwip_connect is survivable WITHOUT the re-init that used to follow it.
+		 * The before/after bench run on this change is what settles both. */
+		const bool socket_control =
+		    (cmd == ALP_CC3501E_CMD_SOCK_OPEN) || (cmd == ALP_CC3501E_CMD_SOCK_CONNECT) ||
+		    (cmd == ALP_CC3501E_CMD_SOCK_CLOSE) || (cmd == ALP_CC3501E_CMD_SOCK_BIND) ||
+		    (cmd == ALP_CC3501E_CMD_SOCK_LISTEN);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !socket_control && !spi1_passthrough && !body_already_reinit) {
 			cc3501e_bridge_busy();
