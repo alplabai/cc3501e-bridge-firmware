@@ -179,7 +179,16 @@ alp_cc3501e_resp_t handle_wifi_get_ip(const uint8_t *req,
  * rssi_dbm is forwarded verbatim from the latch and is ALWAYS 0: the HAL never
  * populates it (see g_wifi_conn in hal/ti/cc3501e_hw_ti_wifi.c).  It is not a
  * measurement and the host must not present it as one -- WIFI_GET_RSSI (0x16) is
- * the only real read.  Issue #1387. */
+ * the only real read.  Issue #1387.
+ *
+ * reserved is the low byte of cc3501e_hw_wifi_last_reason(): the last 802.11
+ * reason code the Wi-Fi event callback recorded on a DISCONNECT (or a negative
+ * driver status on a rejected CONNECT), 0 meaning none recorded.  Additive: the
+ * host already decodes this byte into alp_cc3501e_wifi_status_t::reserved
+ * verbatim (alp-sdk's chips/cc3501e/cc3501e_wifi.c) with no assumed meaning yet
+ * -- <alp/protocol/cc3501e.h> itself calls the byte's meaning "open; neither is
+ * decided here" -- so giving it one needs no wire-version bump and does not
+ * change this firmware's wire vectors (they carry no WIFI_STATUS case). */
 alp_cc3501e_resp_t handle_wifi_status(const uint8_t *req,
                                       size_t         req_len,
                                       uint8_t       *reply_data,
@@ -196,7 +205,7 @@ alp_cc3501e_resp_t handle_wifi_status(const uint8_t *req,
 	reply_data[0]   = state;
 	reply_data[1]   = fail_reason;
 	reply_data[2]   = (uint8_t)rssi;
-	reply_data[3]   = 0u;
+	reply_data[3]   = (uint8_t)((uint16_t)cc3501e_hw_wifi_last_reason() & 0xFFu);
 	*reply_data_len = 4u;
 	return ALP_CC3501E_RESP_OK;
 }

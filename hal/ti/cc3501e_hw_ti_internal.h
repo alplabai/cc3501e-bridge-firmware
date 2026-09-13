@@ -61,8 +61,18 @@ bool bridge_transport_spi_phase_stalled(void);
 
 /* Re-apply the latched radio power-save policy after Wlan_RoleUp(STA) succeeds.
  * Wlan_Set() is rejected while the radio is down, so a POWER_POLICY the host set
- * before the role came up would otherwise be silently lost. */
+ * before the role came up would otherwise be silently lost.  Only ARMS the flag
+ * for the next cc3501e_hw_tick() drain -- see cc3501e_hw_power_apply_radio_now()
+ * for the synchronous apply that actually beats Wlan_Connect now. */
 void cc3501e_hw_power_reapply_radio(void);
+
+/* Apply the effective radio power-save policy SYNCHRONOUSLY, on the calling
+ * TASK, right now.  Wlan_Set() is a blocking vendor call and MUST NOT run in
+ * the SPI-dispatch ISR -- doing so failed every preset and wedged the bridge
+ * on silicon (#1683).  Called from cc3501e_hw_wifi_ensure_sta_role() right
+ * after Wlan_RoleUp(STA) succeeds, before Wlan_Connect's association + DHCP
+ * body runs -- see that call site for the ordering bug this closes. */
+void cc3501e_hw_power_apply_radio_now(void);
 
 /* Drain the latched radio power-save policy on the TASK.  Wlan_Set() is a blocking
  * vendor call and MUST NOT run in the SPI-dispatch ISR -- doing so failed every

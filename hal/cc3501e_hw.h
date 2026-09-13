@@ -275,6 +275,23 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
 void cc3501e_hw_wifi_mark_connecting(void);
 int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rssi_dbm);
 
+/* Last 802.11 reason/status code the Wi-Fi event callback actually saw, for
+ * CMD_WIFI_STATUS's reserved byte -- see @ref alp_cc3501e_wifi_status_t::reserved
+ * in <alp/protocol/cc3501e.h>.  The callback used to flatten WLAN_EVENT_DISCONNECT
+ * / WLAN_EVENT_ASSOCIATION_REJECTED / WLAN_EVENT_AUTHENTICATION_REJECTED to a bare
+ * -1 and keep only event->Id (visible only as GET_DIAG_INFO reserved[0]'s low
+ * byte, the event TYPE, not why it happened).  The vendor delivers a real reason
+ * on DISCONNECT (WlanEventDisconnect_t::ReasonCode, int16_t) and a real negative
+ * status on CONNECT (WlanEventConnect_t::Status, int32_t) -- this stashes
+ * whichever fired last.
+ *
+ * 0 = none recorded (boot default, and the value on the stub / silicon-free
+ * build, which never sees a real WLAN event).  CMD_WIFI_STATUS publishes only
+ * this value's LOW BYTE (a plain 802.11 reason code is one byte's worth in
+ * practice, and the wire field is a single reserved byte) -- callers wanting the
+ * full signed value have no wire path to it yet. */
+int16_t cc3501e_hw_wifi_last_reason(void);
+
 /* --------------------------------------------------------------- */
 /* TCP/UDP sockets (v0.5)                                            */
 /* --------------------------------------------------------------- */

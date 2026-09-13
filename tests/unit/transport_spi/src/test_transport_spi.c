@@ -1532,6 +1532,52 @@ ZTEST(cc3501e_bridge_transport, test_spi1_request_validation)
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "RELEASE with a payload -> INVALID");
 }
 
+/* TEST-ONLY hook into hal/cc3501e_hw_stub.c -- not part of the cc3501e_hw.h
+ * contract (see its definition there).  Lets this suite drive the reason-code
+ * latch the real TI backend's wifi_event_cb() stashes, which the silicon-free
+ * stub can never populate on its own (no radio, no vendor events). */
+extern void cc3501e_hw_wifi_test_set_last_reason(int16_t reason);
+
+ZTEST(cc3501e_bridge_transport, test_wifi_status_publishes_stashed_reason_byte)
+{
+	/* WIFI_STATUS (0x1B) is a direct, non-blocking handler (see
+	 * handle_wifi_status()'s top comment, protocol_wifi.c) -- one transaction
+	 * resolves it, no worker submit/poll dance.
+	 *
+	 * Asserting the reserved byte against a hardcoded 0 would pass even if
+	 * handle_wifi_status() dropped cc3501e_hw_wifi_last_reason() entirely (the
+	 * stub defaults to 0, "none recorded"), so this drives a REAL nonzero value
+	 * through the test-only stub hook first, to actually exercise the plumbing
+	 * -- see this file's top comment on PRODUCTION code paths, not mocks. */
+	const uint8_t status_req[] = { ALP_CC3501E_CMD_WIFI_STATUS, 0x00u, 0x00u, 0x00u };
+	uint8_t       reply[32];
+
+	transport_spi_init();
+
+	/* Baseline: nothing recorded yet -> reserved byte 0. */
+	transaction(status_req, sizeof status_req);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(4u), "WIFI_STATUS reply is header + status + 4 data bytes");
+	assert_reply_header(reply, ALP_CC3501E_CMD_WIFI_STATUS, 5u);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "WIFI_STATUS -> RESP_OK");
+	zassert_equal(reply[8], 0x00u, "no reason recorded yet -> reserved byte 0");
+
+	/* 0x0208: a value that is NOT already a clean single byte by accident, so a
+	 * truncate-to-low-byte bug (e.g. an accidental sign-extend to 0xFFFF or a
+	 * pass-through of the high byte) would show up as a mismatch, not a
+	 * coincidental pass. */
+	cc3501e_hw_wifi_test_set_last_reason((int16_t)0x0208);
+	transaction(status_req, sizeof status_req);
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(4u), "WIFI_STATUS reply is header + status + 4 data bytes");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "WIFI_STATUS -> RESP_OK");
+	zassert_equal(reply[8], 0x08u, "reserved byte carries the stashed reason's LOW byte");
+
+	/* Reset the TU-static latch so a later test never inherits this value --
+	 * same discipline as reset_worker() below. */
+	cc3501e_hw_wifi_test_set_last_reason(0);
+}
+
 /* The worker's `job` is a file-static singleton shared across the whole TU, so a
  * worker-routed test that submits but never collects its result (the body runs
  * synchronously on the stub and caches ERR) would leave the worker non-IDLE and

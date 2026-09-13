@@ -267,6 +267,25 @@ int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rs
 	return CC3501E_HW_OK;
 }
 
+/* No radio on the host stub, so no real WLAN event ever fires -- default 0
+ * ("none recorded", see the contract in hal/cc3501e_hw.h).  Settable ONLY by
+ * cc3501e_hw_wifi_test_set_last_reason() below, which exists purely so the host
+ * suite (tests/unit) can exercise CMD_WIFI_STATUS's reserved-byte plumbing
+ * (protocol_wifi.c) without a silicon-only vendor event -- not part of the
+ * cc3501e_hw.h contract and not declared there. */
+static int16_t stub_wifi_last_reason;
+
+int16_t cc3501e_hw_wifi_last_reason(void)
+{
+	return stub_wifi_last_reason;
+}
+
+/* TEST-ONLY.  See stub_wifi_last_reason's comment above. */
+void cc3501e_hw_wifi_test_set_last_reason(int16_t reason)
+{
+	stub_wifi_last_reason = reason;
+}
+
 /* --------------------------------------------------------------- */
 /* TCP/UDP sockets (v0.5) -- no IP stack on the host stub: report     */
 /* NOTIMPL so the protocol path stays exercisable (handlers parse +   */

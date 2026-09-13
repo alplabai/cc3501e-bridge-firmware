@@ -300,15 +300,90 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 
 /* Re-apply the latched radio policy after a role comes up.  Called from the
  * Wi-Fi path once Wlan_RoleUp(STA) succeeds -- without this a power policy set
- * while the radio was down would be silently lost. */
+ * while the radio was down would be silently lost.
+ *
+ * This only ARMS the flag for the next cc3501e_hw_tick() drain -- it is NOT
+ * where the STA role-up path's policy actually lands any more.  See
+ * cc3501e_hw_power_apply_radio_now() below and its caller in
+ * cc3501e_hw_wifi_ensure_sta_role() (issue: an unconfigured STA whose first
+ * radio op is CONNECT ran the whole association + DHCP body before this
+ * flag was ever drained). */
 void cc3501e_hw_power_reapply_radio(void)
 {
 	pp_radio_dirty = true;
 }
 
+/* Compute the effective radio policy and apply it via pp_apply_radio(), then
+ * publish pp_radio_ok.  ONE copy of the effective-policy rule, shared by:
+ *   - cc3501e_hw_power_apply_radio_now(), the SYNCHRONOUS caller (STA
+ *     role-up, before Wlan_Connect starts the DHCP-critical window), and
+ *   - cc3501e_hw_power_service()'s TASK-context drain (an explicit host
+ *     CMD_POWER_POLICY, or a redundant re-drain after the synchronous path
+ *     already applied it -- see the tick()-ordering note there).
+ *
+ * TASK CONTEXT ONLY, same rule as pp_apply_core (#1683): Wlan_Set() is a
+ * blocking vendor radio call and must never run off the SPI-dispatch ISR.
+ *
+ * An un-configured STA runs ACTIVE, not the BALANCED default.  BALANCED maps
+ * to WLAN_STATION_AUTO_PS_MODE, and applying that before Wlan_Connect puts the
+ * station to sleep exactly when it has to hear a DHCP OFFER.  The AP buffers
+ * broadcast and multicast until a DTIM beacon, and a sleeping station on a
+ * marginal link misses beacons and therefore misses DTIMs: measured on
+ * e1m-aen-evk-01 at -78 dBm, the station associated every time, its
+ * DISCOVERs left every time (DHCP_STATE_SELECTING, tries = 5), and it leased
+ * on roughly one attempt in four.
+ *
+ * The host's power API stays authoritative: once it sends a POWER_POLICY,
+ * pp_host_set_policy latches and that policy is applied verbatim, including
+ * BALANCED.  This only changes what an un-configured station defaults to,
+ * where the alternative is a bridge that cannot reliably get an address.
+ *
+ * AP is excluded from the override deliberately (per the existing rule,
+ * unchanged by this function's introduction): cc3501e_hw_wifi_ap_start()
+ * already forces ALWAYS-ACTIVE with its own direct Wlan_Set(), synchronously,
+ * before its own Wlan_RoleUp(AP) -- a soft-AP cannot tolerate the NWP dozing
+ * at all, so it never depended on this latch/drain to get a safe default in
+ * the first place, and a host-set policy for AP is meant to apply verbatim
+ * once it lands. */
+static void pp_apply_radio_effective(void)
+{
+	const bool    radio_up = (cc3501e_hw_radio_role() != ALP_CC3501E_ROLE_OFF);
+	const uint8_t eff =
+	    (!pp_host_set_policy && cc3501e_hw_radio_role() != (uint8_t)ALP_CC3501E_ROLE_WIFI_AP)
+	        ? (uint8_t)ALP_CC3501E_PP_PERFORMANCE
+	        : pp_policy_latched;
+	const bool ok = pp_apply_radio(eff, pp_idle_ms_latched);
+
+	pp_radio_ok = radio_up ? ok : true;
+}
+
+/* SYNCHRONOUS radio-policy apply -- called from cc3501e_hw_wifi_ensure_sta_role()
+ * right after Wlan_RoleUp(STA) succeeds and before it returns, so the effective
+ * policy (PERFORMANCE/ACTIVE for an unconfigured STA) is in place BEFORE
+ * Wlan_Connect starts association + the DHCP lease poll -- not after, once
+ * cc3501e_hw_tick() next drains cc3501e_hw_power_service().  See the ordering
+ * bug this closes in cc3501e_hw_wifi_ensure_sta_role()'s comment.
+ *
+ * TASK CONTEXT ONLY (see pp_apply_radio_effective()'s #1683 note) -- verified
+ * safe: every caller of ensure_sta_role() is worker-routed off the SPI-dispatch
+ * ISR (src/worker.c: the ISR only submits/polls a job; the blocking HAL body
+ * runs in worker_run_pending(), called from main()'s bringup-task loop), so
+ * this always runs on the task, never the ISR. */
+void cc3501e_hw_power_apply_radio_now(void)
+{
+	pp_apply_radio_effective();
+}
+
 /* TASK-context drain for the latched radio policy.  Called from cc3501e_hw_tick().
  * Applying with no role up is not an error -- Wlan_Set legitimately refuses then,
- * and the STA role-up path re-arms the dirty flag once the radio exists. */
+ * and the STA role-up path re-arms the dirty flag once the radio exists.
+ *
+ * For a STA role-up, this now runs AFTER cc3501e_hw_power_apply_radio_now()
+ * already applied the same effective policy synchronously (see there) --
+ * re-running pp_apply_radio_effective() here is a harmless redundant re-apply
+ * (the SAME Wlan_Set calls with the SAME arguments), not a second real change,
+ * and it stays necessary for the case a CMD_POWER_POLICY lands (SPI-ISR
+ * context, cc3501e_hw_set_power_policy()) in the gap between the two. */
 void cc3501e_hw_power_service(void)
 {
 	if (!pp_radio_dirty && !pp_core_dirty) {
@@ -329,28 +404,7 @@ void cc3501e_hw_power_service(void)
 		return;
 	}
 
-	const bool radio_up = (cc3501e_hw_radio_role() != ALP_CC3501E_ROLE_OFF);
-	/* An un-configured STA runs ACTIVE, not the BALANCED default.  BALANCED maps
-	 * to WLAN_STATION_AUTO_PS_MODE, and applying that here -- which happens right
-	 * after Wlan_RoleUp(STA), before Wlan_Connect -- puts the station to sleep
-	 * exactly when it has to hear a DHCP OFFER.  The AP buffers broadcast and
-	 * multicast until a DTIM beacon, and a sleeping station on a marginal link
-	 * misses beacons and therefore misses DTIMs: measured on e1m-aen-evk-01 at
-	 * -78 dBm, the station associated every time, its DISCOVERs left every time
-	 * (DHCP_STATE_SELECTING, tries = 5), and it leased on roughly one attempt in
-	 * four.
-	 *
-	 * The host's power API stays authoritative: once it sends a POWER_POLICY,
-	 * pp_host_set_policy latches and that policy is applied verbatim, including
-	 * BALANCED.  This only changes what an un-configured station defaults to,
-	 * where the alternative is a bridge that cannot reliably get an address. */
-	const uint8_t eff =
-	    (!pp_host_set_policy && cc3501e_hw_radio_role() != (uint8_t)ALP_CC3501E_ROLE_WIFI_AP)
-	        ? (uint8_t)ALP_CC3501E_PP_PERFORMANCE
-	        : pp_policy_latched;
-	const bool ok = pp_apply_radio(eff, pp_idle_ms_latched);
-
-	pp_radio_ok = radio_up ? ok : true;
+	pp_apply_radio_effective();
 }
 
 bool cc3501e_hw_power_radio_ok(void)

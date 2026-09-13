@@ -140,6 +140,18 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
+/* Last 802.11 reason/status code the cb actually saw -- see the accessor
+ * cc3501e_hw_wifi_last_reason() (declared unconditionally further down, next to
+ * g_wifi_conn, so it links in both the CC3501E_WIFI and non-Wi-Fi ti builds).
+ * 0 = none recorded.  Populated from WlanEventDisconnect_t::ReasonCode on a
+ * DISCONNECT and from WlanEventConnect_t::Status on a CONNECT the NWP itself
+ * reports as negative; ASSOCIATION_REJECTED/AUTHENTICATION_REJECTED carry a
+ * status code under a different union member (AssocStatusCode/AuthStatusCode,
+ * not ReasonCode) and are left alone here -- wifi_last_status still flags the
+ * failure for the sync-obj waiter, this static just has nothing new to add for
+ * those two. */
+static volatile int16_t wifi_last_reason;
+
 static void wifi_event_cb(WlanEvent_t *event)
 {
 	if (event == NULL) {
@@ -191,6 +203,14 @@ static void wifi_event_cb(WlanEvent_t *event)
 	}
 	case WLAN_EVENT_CONNECT:
 		wifi_last_status = (int)event->Data.Connect.Status;
+		/* Status is a driver/NWP result code, not an 802.11 reason -- but it is
+		 * the only code CONNECT carries, and a negative one means this connect
+		 * itself was refused (not a later disconnect), which is worth keeping
+		 * for GET_WIFI_STATUS's reserved byte the same way a DISCONNECT's real
+		 * 802.11 ReasonCode is below. */
+		if (event->Data.Connect.Status < 0) {
+			wifi_last_reason = (int16_t)event->Data.Connect.Status;
+		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	case WLAN_EVENT_DISCONNECT:
@@ -199,6 +219,11 @@ static void wifi_event_cb(WlanEvent_t *event)
 		/* A connect attempt that the FW rejects arrives as one of these
 		 * rather than CONNECT(Status<0); surface it as a failure. */
 		wifi_last_status = -1;
+		if (event->Id == WLAN_EVENT_DISCONNECT) {
+			/* The only one of these three the vendor gives a real 802.11 reason
+			 * for -- see WlanEventDisconnect_t::ReasonCode (wlan_if.h). */
+			wifi_last_reason = event->Data.Disconnect.ReasonCode;
+		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	default:
@@ -212,6 +237,12 @@ static void wifi_event_cb(WlanEvent_t *event)
 uint32_t cc3501e_hw_wifi_last_event_id(void)
 {
 	return wifi_cb_last_id;
+}
+
+/* See the contract on the declaration in hal/cc3501e_hw.h. */
+int16_t cc3501e_hw_wifi_last_reason(void)
+{
+	return wifi_last_reason;
 }
 
 /* See the contract on the declaration in hal/cc3501e_hw.h. */
@@ -459,6 +490,13 @@ uint32_t cc3501e_hw_wifi_last_event_id(void)
 	 * define it too (matches cc3501e_hw_stub.c). */
 	return 0u;
 }
+int16_t cc3501e_hw_wifi_last_reason(void)
+{
+	/* No radio linked in this build -- no Wi-Fi events, so no reason code was
+	 * ever recorded.  CMD_WIFI_STATUS reads this unconditionally (protocol_wifi.c),
+	 * so the non-Wi-Fi ti build must define it too (matches cc3501e_hw_stub.c). */
+	return 0;
+}
 void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
 {
 	/* No lwIP linked in this build, so there is no DHCP client to report on.
@@ -605,9 +643,44 @@ static int cc3501e_hw_wifi_ensure_sta_role(void)
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_sta_role_up = true;
-	/* The radio only accepts a power-save configuration once a role is up, so a
-	 * POWER_POLICY the host set earlier was dropped on the floor.  Re-apply the
-	 * latched policy here -- see pp_apply_radio() in cc3501e_hw_ti_power.c. */
+	/* Apply the radio power policy SYNCHRONOUSLY, right here, before returning --
+	 * NOT just latched for cc3501e_hw_tick()'s later drain.  That used to be the
+	 * whole story (cc3501e_hw_power_reapply_radio() below just sets a dirty flag,
+	 * consumed only once cc3501e_hw_power_service() next runs from the tick), and
+	 * it is an ordering bug on the CONNECT-FIRST path:
+	 *
+	 * cc3501e_hw_wifi_connect_sta() calls THIS function and then, in the SAME
+	 * worker-job body -- no return to main()'s bringup loop in between -- goes
+	 * straight into Wlan_Connect and its association/EAPOL-SAE handshake and the
+	 * bounded DHCP-lease poll.  cc3501e_hw_tick() (which drains the service that
+	 * used to apply this) only runs AFTER worker_run_pending() returns, i.e. AFTER
+	 * that whole body already ran under whatever Wlan_Start left behind: AUTO_PS
+	 * (vendor wlan_if.c:867).  An AUTO_PS station sleeps between DTIM beacons; the
+	 * AP buffers the DHCP OFFER (broadcast/multicast) until the next one; a
+	 * marginal link misses it.  Bench: `wifi scan` first (same ensure_sta_role(),
+	 * but the scan job's tick has a chance to apply ACTIVE before a LATER connect
+	 * job runs) associated 16/16; a bare connect-first `wifi connect` failed
+	 * roughly half the time -- `fail: 2` (REJECTED) after WLAN_EVENT_DISCONNECT,
+	 * or a DHCP timeout, because ACTIVE landed only after the body had already
+	 * latched its verdict.
+	 *
+	 * cc3501e_hw_power_apply_radio_now() (cc3501e_hw_ti_power.c) shares the exact
+	 * effective-policy rule cc3501e_hw_power_service() uses -- one function, not a
+	 * second copy of the rule -- and is TASK CONTEXT ONLY, same constraint as
+	 * pp_apply_core (#1683): Wlan_Set() blocks and must never run off the SPI-
+	 * dispatch ISR.  Safe here: every caller of THIS function --
+	 * cc3501e_hw_wifi_scan_run() (WIFI_SCAN_START), cc3501e_hw_wifi_connect_sta()
+	 * (WIFI_CONNECT_STA), and the currently-uncalled cc3501e_hw_wifi_boot_start()
+	 * -- is worker-routed off the ISR: src/worker.c's header comment states the
+	 * ISR only SUBMITS a job and POLLS its cached result, while the blocking HAL
+	 * body (this function included) runs in worker_run_pending(), invoked from
+	 * main()'s bringup-task loop, not from SPI dispatch. */
+	cc3501e_hw_power_apply_radio_now();
+	/* Still latch pp_radio_dirty for the LATER cc3501e_hw_tick() drain too: a
+	 * CMD_POWER_POLICY that lands (SPI-ISR context) in the gap between the
+	 * synchronous apply above and that drain must still take effect, and if none
+	 * lands the drain just re-applies the SAME effective policy via the SAME
+	 * Wlan_Set calls -- idempotent, harmless, not a second real change. */
 	cc3501e_hw_power_reapply_radio();
 	return CC3501E_HW_OK;
 }
@@ -1224,7 +1297,20 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	 *
 	 * Best-effort by design (return ignored, as in the BLE path): if the NWP
 	 * rejects the set, the AP should still come up -- just possibly with the
-	 * #1562 lifetime. A hard failure here would turn a degraded AP into no AP. */
+	 * #1562 lifetime. A hard failure here would turn a degraded AP into no AP.
+	 *
+	 * AUDITED for the STA path's connect-first ordering bug (this file's
+	 * cc3501e_hw_wifi_ensure_sta_role()): AP does NOT have it.  Unlike STA, the
+	 * AP role-up path never went through the latch/drain
+	 * (cc3501e_hw_power_reapply_radio() / cc3501e_hw_power_service()) to reach a
+	 * safe default in the first place -- this Wlan_Set() call already runs
+	 * SYNCHRONOUSLY, inline, BEFORE Wlan_RoleUp(AP) below, so there is no window
+	 * where beaconing could start under a stale ELP/AUTO_PS setting.  A host-set
+	 * CMD_POWER_POLICY still lands for AP the existing way, asynchronously via
+	 * cc3501e_hw_tick() -> cc3501e_hw_power_service() (AP is excluded from that
+	 * service's un-configured-role override, so it applies pp_policy_latched
+	 * verbatim once the drain runs) -- unchanged by, and independent of, this
+	 * commit's STA fix. */
 	WlanPowerManagement_e pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE; /* = 0 */
 	(void)Wlan_Set(WLAN_SET_POWER_MANAGEMENT, (void *)&pm);
 
