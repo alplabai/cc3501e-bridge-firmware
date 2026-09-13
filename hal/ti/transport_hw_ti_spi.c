@@ -24,6 +24,55 @@
  * it still cannot clock a transfer itself, so the bridge simply cannot be
  * serviced WHILE a radio op runs.
  *
+ * CORRECTION (2026-09-13, #106): the "Wlan_Start (or a short Wlan_Get) ...
+ * GLOBALLY" claim two paragraphs up is NOT supported by TI's SimpleLink Wi-Fi
+ * SDK 10.10.01.08 source for a Wlan_Get specifically.  Read directly against
+ * that source (paths relative to source/ti/drivers/net/wifi/, not inferred):
+ *   - The radio's host interface uses ONLY DMA channel 11
+ *     (HOSTDMA_DRIVER_CH_HIF, wifi_platform/cc35xx/inc_common/
+ *     dma_channel_usage.h:47), wired into the HIF's own DMA handle in
+ *     wifi_platform/cc35xx/plat/bus_hif.c:50.  The bridge SPI uses channels
+ *     12/13 -- a disjoint set.
+ *   - A Wlan_Get round trip's DMA calls (HIFRead/HIFWrite,
+ *     wifi_platform/cc35xx/plat/hif.c:206-396: DMAConfigureChannelFlags,
+ *     DMAStartTransaction, DMAGetChannelStatus) all take that same
+ *     channel-11 handle and touch only channel 11's registers
+ *     (source/ti/devices/cc35xx/driverlib/dma.c:108-155,
+ *     driverlib/dma.h:429-446) -- never channel 12 or 13's.
+ *   - The transport lock a Wlan_Get runs under
+ *     (trnspt_EnterCriticalSection, wifi_host_driver/trnspt_layer/
+ *     trnspt_thread.c:494-499) is a plain RTOS mutex (osi_LockObjLock ->
+ *     SemaphoreP_pend), not an interrupt mask -- the bridge SPI's own
+ *     DMA-completion interrupt (SPI_MIS_DMARX, drivers/spi/
+ *     SPIWFF3DMA.c:421) keeps running underneath it.
+ *   - The SDK's ONE global DMA reset, DMAWFF3_initHw() (drivers/dma/
+ *     DMAWFF3.c:109-120: disables/clears all DMA interrupts, then writes
+ *     CHCTL0 = CHCTL1 = 0xFFFFFFFF), runs once behind an isInitialized
+ *     latch, and its ONLY caller in the whole SDK is the bridge's OWN SPI
+ *     driver (SPIWFF3DMA.c:1647) -- no Wi-Fi source calls it, ever.
+ *   - The prebuilt libraries agree (arm-none-eabi-nm -u): wifi_host_driver.a
+ *     and wifi_stack.a (the upper-MAC/network-stack libs) reference no real
+ *     DMA symbol; wifi_platform_cc35xx.a references only
+ *     DMAConfigureChannel/DMAGetChannelStatus/DMAInitChannel/
+ *     DMAStartTransaction, all the scoped-channel calls above.
+ *   - The one register a Wi-Fi call CAN share with channels 12/13 is CHCTL1
+ *     (DMAInitChannel's read-modify-write of its own channel's 4-bit field,
+ *     hif.c:141 inside HIFConfigure, hif.c:139) -- but that runs ONLY from
+ *     HIFInit() (hif.c:114, i.e. Wlan_Start) and the PowerWFF3_AWAKE_SLEEP
+ *     wake notify (hif.c:167), NEVER from a per-command Wlan_Get.  This
+ *     firmware holds PowerWFF3_DISALLOW_SLEEP for every preset
+ *     (hal/ti/cc3501e_hw_ti_power.c), so the wake path never fires either.
+ * Wlan_Start's bench-observed kill (measured, not read from source) stands;
+ * this audit does not explain ITS mechanism -- HIFConfigure's CHCTL1 write
+ * above and the NWP firmware download in
+ * wifi_platform/cc35xx/plat/init_device.c are candidates, not confirmed
+ * causes, and are named here only so a future reader has somewhere to look,
+ * not as an answer.  Do NOT read this correction as clearing every Wlan_*
+ * call -- it applies to the specific DMA/interrupt/lock paths a Wlan_Get
+ * exercises, verified above.  See src/worker.c's WIFI_GET_RSSI skip (#106),
+ * which this correction supports but which still awaits its own bench
+ * confirmation.
+ *
  * The architecture that works WITH this constraint (submit -> radio-op
  * [bridge down] -> recover -> poll):
  *   1. Wlan_Start runs ONCE at boot, before any host traffic

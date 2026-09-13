@@ -531,6 +531,51 @@ static volatile struct {
 	int8_t  rssi;        /* NEVER POPULATED -- always 0      */
 } g_wifi_conn = { (uint8_t)ALP_CC3501E_WIFI_DISCONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0 };
 
+/* Handoff to src/worker.c's drain (issue #106, connect flavour): whether THIS
+ * run's SUCCESS exit already re-armed the slave itself, and whether that
+ * reinit actually armed it.  Set together, immediately before the
+ * SUCCESS-path wifi_conn_set(CONNECTED) below; read-and-cleared once by
+ * cc3501e_hw_wifi_connect_sta_take_reinit().  Both run on the SAME thread
+ * (the worker drain) with nothing else touching either field in between --
+ * worker_run_pending() calls worker_execute() (which calls this body to
+ * completion) and only then reads the flag, so plain (non-volatile) access is
+ * enough; there is no ISR side to this one, unlike g_wifi_conn above. */
+static bool g_connect_reinit_pending;
+static bool g_connect_reinit_armed;
+
+bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out)
+{
+	const bool pending = g_connect_reinit_pending;
+	if (pending) {
+		if (armed_out != 0) {
+			*armed_out = g_connect_reinit_armed;
+		}
+		g_connect_reinit_pending = false; /* one-shot: consumed */
+	}
+	return pending;
+}
+
+/* Handoff to src/worker.c's drain (issue #106, RSSI flavour): whether THIS
+ * run of cc3501e_hw_wifi_get_rssi() may have its drain reinit skipped.  Set
+ * unconditionally near the top of that function, before either radio call in
+ * it can fail, so every exit (success or IO error) reports the same fact.
+ * Read-and-cleared once by cc3501e_hw_wifi_get_rssi_take_reinit_skip(); same
+ * same-thread, no-ISR reasoning as the connect handoff above applies. */
+static bool g_rssi_reinit_skip_pending;
+static bool g_rssi_reinit_skip_ok;
+
+bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out)
+{
+	const bool pending = g_rssi_reinit_skip_pending;
+	if (pending) {
+		if (skip_ok_out != 0) {
+			*skip_ok_out = g_rssi_reinit_skip_ok;
+		}
+		g_rssi_reinit_skip_pending = false; /* one-shot: consumed */
+	}
+	return pending;
+}
+
 void cc3501e_hw_wifi_mark_connecting(void)
 {
 	g_wifi_conn.fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
@@ -1016,8 +1061,10 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * that weight tears the slave's DMA down -- the same teardown lazy_start()
 	 * reinits after Wlan_Start, and the same one cc3501e_hw_wifi_scan_run() reinits
 	 * after its own role-up + Wlan_Scan.  This body had a reinit AFTER it, from the
-	 * worker drain (src/worker.c, WIFI_CONNECT_STA is not on the exemption list), but
-	 * none BETWEEN the role-up and Wlan_Connect: it went straight into a 30 s
+	 * worker drain (src/worker.c; on a FAILURE exit it still does -- see
+	 * cc3501e_hw_wifi_connect_sta_take_reinit() below for the SUCCESS exit, which
+	 * as of #106 re-arms the slave itself and skips the drain's copy), but none
+	 * BETWEEN the role-up and Wlan_Connect: it went straight into a 30 s
 	 * osi_SyncObjWait with the slave down.
 	 *
 	 * Bench-measured asymmetry, published v0.8.0.  CONNECT as the first radio op of a
@@ -1046,8 +1093,12 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * call reachable in a shipped image for the first time.  See prebuilt/CHANGELOG.md.
 	 * Reinit-only is the proven-safe half: it is what GET_MAC and the scan already do.
 	 *
-	 * The drain's post-body reinit is still required and stays: this one is BEFORE
-	 * Wlan_Connect, the drain's is after the body returns. */
+	 * A FAILURE exit below still needs a reinit from somewhere and gets it from the
+	 * drain, same as always.  This one is BEFORE Wlan_Connect; the drain's runs after
+	 * worker_execute() returns.  Only the SUCCESS exit is different since #106: it
+	 * pays a SECOND reinit itself, right before publishing CONNECTED, and that one --
+	 * not this one -- is what the drain now skips.  See the SUCCESS exit below and
+	 * cc3501e_hw_wifi_connect_sta_take_reinit(). */
 	if (!role_up_was_latched) {
 		bridge_transport_spi_hw_reinit();
 	}
@@ -1178,6 +1229,70 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT);
 		return CC3501E_HW_ERR_IO;
 	}
+
+	/* #106 connect flavour: re-arm the SPI slave HERE, before CONNECTED
+	 * publishes below, instead of leaving it to src/worker.c's post-body
+	 * drain reinit.  wifi_conn_set(CONNECTED) is what the host's WIFI_STATUS
+	 * poll is watching for -- a FIXED 50 ms cadence, CC3501E_WIFI_STATUS_POLL_GAP_MS
+	 * in chips/cc3501e/cc3501e_wifi.c (NOT the CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS
+	 * knob -- that is the 1 ms-default floor for a DIFFERENT poll, the
+	 * poll_by_repeat backoff an already-issued op like WIFI_GET_RSSI retries
+	 * on).  Observed on boot 05A (wedged at read 0, on the RSSI the console
+	 * performs right after "wifi connected"), and matching run6's S25 / SF07 /
+	 * SF09: this function used to publish CONNECTED from below BEFORE the
+	 * drain's reinit could run (the drain cannot start it until
+	 * worker_execute() -- i.e. this whole function -- returns), so the host
+	 * saw CONNECTED, dropped straight to its dense post-connect WIFI_GET_RSSI
+	 * poll, and clocked into a slave still down from Wlan_Connect's own DMA
+	 * teardown.
+	 *
+	 * Placed after the LAST radio (Wlan_*) op on this path.  Wlan_Connect and
+	 * the association wait above are the last ones.  network_set_up() and the
+	 * DHCP-kick loop above are lwIP/netif calls, not Wlan_* NWP calls; INFERRED
+	 * (not separately measured) to leave the slave's DMA alone, by analogy with
+	 * src/worker.c's socket_control / socket-data skips, which measured that
+	 * ARP/SYN/FIN/RST traffic on the SAME transmit path does not need a
+	 * reinit -- DHCP traffic reaches the radio over that same host interface,
+	 * but nobody has bench-isolated the DHCP-kick loop on its own the way the
+	 * socket ops were isolated.
+	 *
+	 * Re-assert busy() immediately before the reinit, matching how every BLE
+	 * HAL body re-asserts it before ITS reinit (src/worker.c's drain comment
+	 * explains why: the drain's own busy() bracket around worker_execute() may
+	 * already have been cancelled by something else's ready(), though nothing
+	 * else in THIS function raises ready() before this point).
+	 *
+	 * Do NOT raise ready() here -- record the armed outcome and let the DRAIN
+	 * raise it, same as it does for the FAILURE exits.  src/worker.c's own
+	 * ordering rule (worker_run_pending, the CONNECT/AP_START comment) is that
+	 * worker_reset() must run BEFORE cc3501e_bridge_ready(): once READY is high
+	 * the host may clock a new CONNECT, and if the job slot still held THIS
+	 * attempt's result that new CONNECT would be collected as a stale submit
+	 * instead of starting fresh.  worker_reset() cannot run until this whole
+	 * function returns, so raising ready() from here (a version of this fix
+	 * briefly did) jumps that ordering -- a CONNECT landing between this line
+	 * and the drain's worker_reset() would race the exact bug that rule exists
+	 * to prevent.  It also re-enabled the attention pulse (event_ring_push's
+	 * cc3501e_bridge_attn_pulse() below, off wifi_conn_set's EVT_WIFI_CONNECTED
+	 * push) a whole function-return early, because the pulse self-suppresses
+	 * only while READY reads LOW (src/event_ring.c).  Leaving READY low here
+	 * keeps the pulse suppressed until the drain raises it in the correct
+	 * place, same as before this whole change.
+	 *
+	 * cc3501e_hw_wifi_connect_sta_take_reinit() hands the armed outcome to the
+	 * drain so it can skip paying a SECOND SPI_close/SPI_open for the same
+	 * event and still raise READY correctly, in the right place, off the real
+	 * arm state -- see src/worker.c's body_already_reinit / wifi_connect_body_
+	 * reinit and its worker_reset()-then-ready() sequencing.  Every FAILURE
+	 * exit above (bad SSID, role-up fail, Wlan_Connect reject, association
+	 * timeout, the no-DHCP-lease exit just above this one) never reaches here,
+	 * so take_reinit() reports false for them and the drain's own post-body
+	 * reinit (and its own ready()) still runs for every one of those,
+	 * unchanged. */
+	cc3501e_bridge_busy();
+	g_connect_reinit_armed   = bridge_transport_spi_hw_reinit();
+	g_connect_reinit_pending = true;
+
 	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE);
 	return CC3501E_HW_OK;
 }
@@ -1333,6 +1448,24 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out)
 	if (rssi_dbm_out == 0) {
 		return CC3501E_HW_ERR_INVAL;
 	}
+	/* #106 skip-gating fix: capture wifi_started BEFORE lazy_start() below can
+	 * flip it -- see cc3501e_hw_wifi_get_rssi_take_reinit_skip() / worker.c's
+	 * rssi_read for what this decides.  Only when Wi-Fi was ALREADY started
+	 * does this call's radio op reduce to JUST the short Wlan_Get below, with
+	 * no reinit anywhere in this body -- the shape the #106 run6/run7 evidence
+	 * describes.  If Wi-Fi was NOT yet started, lazy_start() runs Wlan_Start()
+	 * and ITS OWN reinit (this file, cc3501e_hw_wifi_lazy_start(), ~line 308),
+	 * then THROWS AWAY that reinit's armed/not-armed return value -- so nothing
+	 * here knows whether the slave came back up, and letting the drain skip
+	 * its reinit on top of that would raise READY unconditionally over an
+	 * unknown state (the #1133 condition).  Set the handoff unconditionally
+	 * here (before either radio call below can fail) so every exit of this
+	 * function -- success or CC3501E_HW_ERR_IO -- reports the same
+	 * already-started fact to the drain. */
+	const bool wifi_was_already_started = wifi_started;
+	g_rssi_reinit_skip_ok               = wifi_was_already_started;
+	g_rssi_reinit_skip_pending          = true;
+
 	const int wifi_rv = cc3501e_hw_wifi_lazy_start();
 	if (wifi_rv != CC3501E_HW_OK) {
 		return wifi_rv;
