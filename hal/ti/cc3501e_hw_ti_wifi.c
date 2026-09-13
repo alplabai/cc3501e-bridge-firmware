@@ -328,12 +328,36 @@ void cc3501e_hw_wifi_boot_start(void)
 {
 	cc3501e_bridge_busy(); /* configure GPIO17 + hold the host off through the boot radio init */
 	(void)cc3501e_hw_wifi_lazy_start();
-	/* Bring the STA role up ONCE here at boot, before the host polls.  RoleUp is a
-	 * HEAVY radio op that needs the bridge quiesced (suspend) to kick; doing it in
-	 * the scan hot path made the scan's bridge-down window ~30s and churned the
-	 * link (the suspend's SPI_close/open) past re-sync.  Pre-cached here, each later scan is just a LIGHT
-	 * Wlan_Scan (role already up) that kicks with NO suspend -- like GET_MAC's
-	 * Wlan_Get.  Suspend for the RoleUp, then reinit the bridge clean. */
+	/* Bring the STA role up ONCE here at boot, before the host polls, so each later
+	 * scan is a LIGHT Wlan_Scan (role already up) rather than carrying the role-up.
+	 *
+	 * CORRECTION -- an earlier version of this comment said RoleUp "needs the bridge
+	 * quiesced (suspend) to kick".  Measurement refutes that:
+	 * cc3501e_hw_wifi_scan_run() performs the SAME ensure_sta_role(), equally
+	 * unguarded, and a scan issued as the first radio operation of a boot returns
+	 * records 5 of 5 cold-booted runs (prebuilt/CHANGELOG.md).  What the role-up
+	 * needs is the reinit AFTER it, not a suspend before it.  The suspend below is
+	 * also INERT at this call site when spi == NULL -- it degenerates to two flag
+	 * writes and never reaches SPI_transferCancel -- so it is not what holds this
+	 * function together either.
+	 *
+	 * WHY THIS FUNCTION IS STILL NOT CALLED, since the correction above makes it
+	 * look newly safe and it is not.  src/main.c leaves it out deliberately, and
+	 * the blocking reason is NOT the suspend:
+	 *
+	 *   1. The MCUboot trial accept is gated on g_host_txn_count > 0 -- one fully
+	 *      drained host reply (cc3501e_hw_ti.c) -- deliberately, so an image that
+	 *      boots but wedges the bridge never becomes permanent.  Moving radio
+	 *      bring-up ahead of transport_spi_init() therefore puts a possible hang
+	 *      in front of an accept that cannot fire yet, and on a freshly flashed
+	 *      TRIAL image that is the 2026-06-18 no-launch state.
+	 *   2. This function reaches bridge_transport_spi_hw_reinit() while spi == NULL,
+	 *      which opens and arms the slave; transport_spi_init() then opens it
+	 *      again, and SPI_open on an already-open index returns NULL.  Nothing
+	 *      closes in between.
+	 *
+	 * The first-radio-op wedge it would have addressed is ~2 in 16 cold boots and
+	 * is handled host-side instead -- see prebuilt/CHANGELOG.md's residual list. */
 	bridge_transport_spi_hw_suspend();
 	(void)cc3501e_hw_wifi_ensure_sta_role();
 	bridge_transport_spi_hw_reinit();
