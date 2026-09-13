@@ -674,16 +674,26 @@ void worker_run_pending(void)
 		cc3501e_bridge_busy(); /* radio op about to kill the slave DMA -> hold host off */
 		/* Whether the slave is armed for the host's next clock.  Starts true:
 		 * the ops that SKIP the re-init below UNCONDITIONALLY (the socket data
-		 * and control ops, the SPI1 passthrough ops, WIFI_GET_RSSI, and the two
-		 * BLE ops listed there) never tore the slave down here, so their READY
-		 * raise stays unconditional as before.  Issue #5.
+		 * and control ops, the SPI1 passthrough ops, and the two BLE ops listed
+		 * there) never tore the slave down here, so their READY raise stays
+		 * unconditional as before.  Issue #5.
 		 *
-		 * WIFI_CONNECT_STA is NOT in that unconditional group.  On its SUCCESS
-		 * path the body re-arms the slave ITSELF and hands this drain the real
-		 * outcome via cc3501e_hw_wifi_connect_sta_take_reinit() below, which
-		 * OVERWRITES this starting `true` with that outcome -- so a body reinit
-		 * that failed to arm still leaves `rearmed` false here.  It is exempt
-		 * from paying a SECOND reinit, not from tracking the real state.
+		 * WIFI_GET_RSSI and WIFI_CONNECT_STA are NOT in that unconditional
+		 * group, for two different reasons -- neither is "never tore the slave
+		 * down" the way sockets/SPI1/the two BLE ops are.  RSSI's HAL body DOES
+		 * make one Wlan_Get() NWP call; hal/ti/transport_hw_ti_spi.c's file
+		 * header used to claim (uncorrected, see the dated correction there)
+		 * that a short Wlan_Get disrupts the bridge SPI's DMA the same as
+		 * Wlan_Start.  RSSI's skip below is CONDITIONAL (only when Wi-Fi was
+		 * already running when the run began) and UNMEASURED by bench, though a
+		 * 2026-09-13 SDK source audit supports it -- see rssi_read below.
+		 * CONNECT_STA's SUCCESS path re-arms the slave
+		 * ITSELF and hands this drain the real outcome via
+		 * cc3501e_hw_wifi_connect_sta_take_reinit() below, which OVERWRITES
+		 * this starting `true` with that outcome -- so a body reinit that
+		 * failed to arm still leaves `rearmed` false here.  Both are exempt (in
+		 * their respective conditions) from paying a SECOND reinit, not from
+		 * tracking the real state.
 		 *
 		 * Known ceiling of the unconditional-skip group: if an interrupt-side
 		 * re-arm fails DURING a long skipped body (arm_transfer leaves READY
@@ -882,18 +892,23 @@ void worker_run_pending(void)
 		    (cmd == ALP_CC3501E_CMD_SOCK_CLOSE) || (cmd == ALP_CC3501E_CMD_SOCK_BIND) ||
 		    (cmd == ALP_CC3501E_CMD_SOCK_LISTEN);
 		/* WIFI_GET_RSSI is its OWN group, exempt for a DIFFERENT reason than every
-		 * group above.  Its HAL body (cc3501e_hw_wifi_get_rssi, hal/ti/
-		 * cc3501e_hw_ti_wifi.c) DOES make one Wlan_Get(WLAN_GET_RSSI) NWP call --
-		 * lazy_start (a no-op once associated: the role is already up) plus one
-		 * synchronous interrogate round trip, milliseconds long -- so this is not a
-		 * "body makes no Wlan_* call" case like sockets/SPI1 above.  It is exempt
-		 * because paying the re-init AFTER it is what broke associated boots, not
-		 * because the op itself is radio-free.
+		 * group above, and CONDITIONALLY: only when Wi-Fi was ALREADY started
+		 * when this run's body began.  Its HAL body (cc3501e_hw_wifi_get_rssi,
+		 * hal/ti/cc3501e_hw_ti_wifi.c) DOES make one Wlan_Get(WLAN_GET_RSSI) NWP
+		 * call -- lazy_start (a no-op once Wi-Fi has been started AT ALL; it
+		 * checks wifi_started, not the STA role) plus one synchronous interrogate
+		 * round trip, milliseconds long -- so this is not a "body makes no Wlan_*
+		 * call" case like sockets/SPI1 above.  cc3501e_hw_wifi_get_rssi_take_
+		 * reinit_skip() reports the already-started fact for the run that just
+		 * completed; if Wi-Fi was NOT yet started, lazy_start() ran Wlan_Start()
+		 * and its OWN reinit and threw the result away, so this drain must NOT
+		 * skip its own reinit then (see that function and cc3501e_hw.h).
 		 *
 		 * #106 run6: every associated-boot link wedge (6 of 6) began with a
 		 * WIFI_GET_RSSI worker op failing; every RSSI read on a non-wedged boot
-		 * succeeded (16 of 16).  run7 isolated the mechanism: two host images
-		 * identical but for the poll_by_repeat backoff floor
+		 * succeeded (16 of 16).  run7 isolated the TRIGGER to the drain's re-init
+		 * landing inside the host's dense poll window, not the radio call itself:
+		 * two host images identical but for the poll_by_repeat backoff floor
 		 * (CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS), each associated boot reading
 		 * `wifi status` (which performs an RSSI read) up to 30 times at 1 s spacing
 		 * -- floor 1 ms (the default) wedged 7 of 7 associated boots, at reads as
@@ -901,17 +916,34 @@ void worker_run_pending(void)
 		 * wedged 0 of 5 (155 RSSI ops, 30/30 clean each boot).  Wedge signature:
 		 * rssi -4 after the host's 10 s budget, then ip -5, then get_version -5 --
 		 * the same transport-desync signature the socket_control measurement above
-		 * shows for the same mechanism (a re-init landing inside the host's dense
-		 * poll window, not the radio call itself).
+		 * shows for the same mechanism.  BOTH run7 images still re-inited after
+		 * every RSSI read, so run7 alone shows the RE-INIT-UNDER-DENSE-POLLING
+		 * mechanism, not that skipping the re-init is safe.
 		 *
-		 * FALSIFIER: if a Wlan_Get interrogate itself disturbs the slave's DMA --
-		 * rather than the drain's re-init landing in the host's dense poll window
-		 * being the whole story -- wedges will move to the op AFTER a successful
-		 * RSSI read: either RSSI itself starts wedging even with this skip in
-		 * place, or the NEXT worker-routed op following a clean RSSI read starts
-		 * wedging instead.  Neither has been observed on any run to date; both
-		 * remain open to a future bench run. */
-		const bool rssi_read = (cmd == ALP_CC3501E_CMD_WIFI_GET_RSSI);
+		 * The skip itself (as opposed to the trigger run7 found) is now supported
+		 * by a 2026-09-13 reading of TI's SimpleLink Wi-Fi SDK 10.10.01.08 source
+		 * -- see the dated correction in hal/ti/transport_hw_ti_spi.c's file
+		 * header for the full citation trail.  In short: a Wlan_Get's DMA traffic
+		 * is scoped to channel 11 (HOSTDMA_DRIVER_CH_HIF) only, never touches the
+		 * bridge's channels 12/13, runs under a plain mutex (not an interrupt
+		 * mask, so the bridge's own DMA-completion ISR keeps running), and the
+		 * SDK's one GLOBAL DMA reset (DMAWFF3_initHw) is called ONLY by the
+		 * bridge's own SPI driver, never by any Wi-Fi source.  This is still a
+		 * SOURCE reading, not a bench result: it is UNMEASURED, not established.
+		 * Wlan_Start's bench-observed kill (the claim this whole skip descends
+		 * from) stands, but its mechanism is UNEXPLAINED by that same source
+		 * audit -- so the audit narrows what needs a bench run without settling
+		 * it. The pending bench run has two possible outcomes: (a) wedges
+		 * disappear even at the 1 ms poll floor once this conditional skip ships,
+		 * confirming the skip is safe; or (b) the link still goes dead after an
+		 * RSSI read regardless of poll floor, which would mean a Wlan_Get DOES
+		 * disturb the slave by some mechanism this source audit missed and the
+		 * skip must be reverted. */
+		bool       rssi_already_started = false;
+		const bool rssi_reported_skip =
+		    (cmd == ALP_CC3501E_CMD_WIFI_GET_RSSI) &&
+		    cc3501e_hw_wifi_get_rssi_take_reinit_skip(&rssi_already_started);
+		const bool rssi_read = rssi_reported_skip && rssi_already_started;
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read) {
 			cc3501e_bridge_busy();
