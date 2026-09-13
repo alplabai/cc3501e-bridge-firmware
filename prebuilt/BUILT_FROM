@@ -87,7 +87,7 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.5.0 (measured 2026-09-13).
+# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.6.0 (measured 2026-09-13).
 #
 # That unit (module 2026W36-0003) was warm-programmed THREE TIMES that evening,
 # 0.254.2.0 -> 0.254.3.0 -> 0.254.4.0, the last streaming 1105668 bytes in
@@ -100,13 +100,15 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 #     0.254.0.0 set in cc3501e-release-0.254.0.0.  Both are rollbacks on it now.
 #   - 0.254.2.0 and 0.254.3.0 are ALSO rollbacks on it now -- each intermediate
 #     flash is spent the moment the next one lands.
-#   - any future image for it must be STRICTLY ABOVE 0.254.5.0.  A stamp chosen
-#     between 0.254.2.0 and 0.254.5.0 looks new against an older log entry and
+#   - any future image for it must be STRICTLY ABOVE 0.254.6.0.  A stamp chosen
+#     between 0.254.2.0 and 0.254.6.0 looks new against an older log entry and
 #     permanently bricks the part, which is why this entry is kept current rather
 #     than appended to.
 #
-#   - the final flash was the RELEASED v0.8.0 blob itself (GPE 0.254.5.0, sha256
-#     c67ad58a...), so this unit is now running exactly what ships.  It streamed
+#   - it ran the RELEASED v0.8.0 blob (GPE 0.254.5.0, sha256 c67ad58a...) and
+#     that was validated on it, but a LATER bench build at 0.254.6.0 has since
+#     superseded it, so the released artifact is now a ROLLBACK on this one unit
+#     and cannot be re-flashed here without a fresh cut.  The v0.8.0 run streamed
 #     1105668 bytes in 17.479 s with PROGRAM_RC=0 and answered across 16 cold
 #     power cycles, each edge verified electrically via the SW-DP rather than
 #     from telemetry.
@@ -139,7 +141,10 @@ gpe-floor:    0.254.5.0
 # build/ti/cc3501e-bridge.bin with this commit applied and the stage-1 hash is
 # BYTE-IDENTICAL to raw-sha256 above --
 #   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
-inert: a55d6610da3d32d007fb826e2f43cae56fbd53de
+# That rebuild was taken on the PR branch's commit a55d661; this line names the
+# squash commit that landed (#128).  `git diff a55d661 b6da302 -- src hal ti` is
+# empty, so the attested source is the same.
+inert: b6da302c9403d7eb012c4b346c92eaa2b748688f
 #
 # built-from names the commit that bumps firmware-version.txt to 0.8.0. That
 # bump is split into its own commit deliberately: it feeds the fw_version
