@@ -59,6 +59,43 @@ link loss rather than a logic defect; a host that retries once reaches roughly
 98%, and the driver now reports enough to decide -- a distinct no-address status,
 the DHCP state and the retry count.
 
+### The first-radio-op wedge is a KNOWN condition, handled host-side
+
+Roughly 2 in 16 cold boots, the first worker-routed radio opcode of a boot times
+out (`-4`) and the link then reads `-5` until a cold cycle. **The rule: if the
+FIRST radio op of a boot fails that way, issue one hard reset and retry.** That
+takes 2 in 16 to about 1 in 128 and costs no new mechanism -- it is the same
+primitive already used for the ~20% Puya cold-boot miss.
+
+**Do not "fix" this by calling `cc3501e_hw_wifi_boot_start()`.** It is the
+obvious move and it is wrong, for reasons that are not the ones you will guess:
+
+- The MCUboot trial accept is gated on `g_host_txn_count > 0` -- one fully
+  drained host reply -- deliberately, so an image that boots but wedges the
+  bridge never becomes permanent. Bringing the radio up before
+  `transport_spi_init()` puts a possible hang in front of an accept that cannot
+  fire yet, which on a freshly flashed TRIAL image is the 2026-06-18 no-launch
+  state. At a 2-in-16 hang rate that is roughly a 12% chance per fresh flash of
+  needing an SWD recovery, to win 2 in 16.
+- `boot_start()` reaches `bridge_transport_spi_hw_reinit()` while `spi == NULL`,
+  which opens and arms the slave; `transport_spi_init()` then opens it again,
+  and `SPI_open` on an already-open index returns NULL. Nothing closes between.
+- The host's blind post-reset settle is 3500 ms, and `Wlan_Start` plus `RoleUp`
+  measures around 4.5 s here, so boot-time radio needs a host change too.
+
+Note the suspend hazard is NOT the blocker at that call site: with `spi == NULL`
+`bridge_transport_spi_hw_suspend()` degenerates to two flag writes and never
+reaches `SPI_transferCancel`.
+
+**The cheapest next evidence, if this is ever worth reopening,** is not a fix but
+a discriminator: flash the existing `CC3501E_WEDGE_PROBE` build and read
+`probe_ticks` after a wedge. Frozen means the worker task itself is stuck -- most
+likely an unbounded `Wlan_Start`, whose `HIFInit` kills the bridge DMA before it
+returns, so the recovering reinit never runs. Advancing means the task is alive
+and only the slave is dead, which is the OTA pump's quiesce/retire/release/reinit
+shape rather than anything in this list. The two signatures recorded so far are
+consistent with two different causes, and one run separates them.
+
 Also in this cut: the lease budget covers lwIP's fourth DISCOVER rather than
 stopping four seconds short of it; `GET_DIAG_INFO` grew from 16 to 18 bytes to
 report the STA DHCP state and retry count (an older host reads 16 and is
