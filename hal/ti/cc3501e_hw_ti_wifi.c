@@ -531,6 +531,30 @@ static volatile struct {
 	int8_t  rssi;        /* NEVER POPULATED -- always 0      */
 } g_wifi_conn = { (uint8_t)ALP_CC3501E_WIFI_DISCONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0 };
 
+/* Handoff to src/worker.c's drain (issue #106, connect flavour): whether THIS
+ * run's SUCCESS exit already re-armed the slave itself, and whether that
+ * reinit actually armed it.  Set together, immediately before the
+ * SUCCESS-path wifi_conn_set(CONNECTED) below; read-and-cleared once by
+ * cc3501e_hw_wifi_connect_sta_take_reinit().  Both run on the SAME thread
+ * (the worker drain) with nothing else touching either field in between --
+ * worker_run_pending() calls worker_execute() (which calls this body to
+ * completion) and only then reads the flag, so plain (non-volatile) access is
+ * enough; there is no ISR side to this one, unlike g_wifi_conn above. */
+static bool g_connect_reinit_pending;
+static bool g_connect_reinit_armed;
+
+bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out)
+{
+	const bool pending = g_connect_reinit_pending;
+	if (pending) {
+		if (armed_out != 0) {
+			*armed_out = g_connect_reinit_armed;
+		}
+		g_connect_reinit_pending = false; /* one-shot: consumed */
+	}
+	return pending;
+}
+
 void cc3501e_hw_wifi_mark_connecting(void)
 {
 	g_wifi_conn.fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
@@ -1001,8 +1025,10 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * that weight tears the slave's DMA down -- the same teardown lazy_start()
 	 * reinits after Wlan_Start, and the same one cc3501e_hw_wifi_scan_run() reinits
 	 * after its own role-up + Wlan_Scan.  This body had a reinit AFTER it, from the
-	 * worker drain (src/worker.c, WIFI_CONNECT_STA is not on the exemption list), but
-	 * none BETWEEN the role-up and Wlan_Connect: it went straight into a 30 s
+	 * worker drain (src/worker.c; on a FAILURE exit it still does -- see
+	 * cc3501e_hw_wifi_connect_sta_take_reinit() below for the SUCCESS exit, which
+	 * as of #106 re-arms the slave itself and skips the drain's copy), but none
+	 * BETWEEN the role-up and Wlan_Connect: it went straight into a 30 s
 	 * osi_SyncObjWait with the slave down.
 	 *
 	 * Bench-measured asymmetry, published v0.8.0.  CONNECT as the first radio op of a
@@ -1031,8 +1057,12 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * call reachable in a shipped image for the first time.  See prebuilt/CHANGELOG.md.
 	 * Reinit-only is the proven-safe half: it is what GET_MAC and the scan already do.
 	 *
-	 * The drain's post-body reinit is still required and stays: this one is BEFORE
-	 * Wlan_Connect, the drain's is after the body returns. */
+	 * A FAILURE exit below still needs a reinit from somewhere and gets it from the
+	 * drain, same as always.  This one is BEFORE Wlan_Connect; the drain's runs after
+	 * worker_execute() returns.  Only the SUCCESS exit is different since #106: it
+	 * pays a SECOND reinit itself, right before publishing CONNECTED, and that one --
+	 * not this one -- is what the drain now skips.  See the SUCCESS exit below and
+	 * cc3501e_hw_wifi_connect_sta_take_reinit(). */
 	if (!role_up_was_latched) {
 		bridge_transport_spi_hw_reinit();
 	}
@@ -1163,6 +1193,52 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT);
 		return CC3501E_HW_ERR_IO;
 	}
+
+	/* #106 connect flavour: re-arm the SPI slave HERE, before CONNECTED
+	 * publishes below, instead of leaving it to src/worker.c's post-body
+	 * drain reinit.  wifi_conn_set(CONNECTED) is what the host's WIFI_STATUS
+	 * poll (50 ms cadence, per host config CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS)
+	 * is watching for -- observed on boot 05A (wedged at read 0, on the RSSI
+	 * the console performs right after "wifi connected"), and matching run6's
+	 * S25 / SF07 / SF09: this function used to publish CONNECTED from below
+	 * BEFORE the drain's reinit could run (the drain cannot start it until
+	 * worker_execute() -- i.e. this whole function -- returns), so the host
+	 * saw CONNECTED, dropped straight to its dense post-connect WIFI_GET_RSSI
+	 * poll, and clocked into a slave still down from Wlan_Connect's own DMA
+	 * teardown.
+	 *
+	 * Placed after the LAST radio (Wlan_*) op on this path.  Wlan_Connect and
+	 * the association wait above are the last ones; network_set_up() and the
+	 * DHCP-kick loop above are lwIP/netif calls, not Wlan_* NWP calls, and
+	 * never touch the slave's DMA -- the same fact src/worker.c's
+	 * socket_control / socket-data skips already rest on for ARP/SYN/FIN/RST
+	 * traffic on the same transmit path.  Nothing radio-side runs between here
+	 * and the publish below.
+	 *
+	 * Re-assert busy() immediately before the reinit, matching how every BLE
+	 * HAL body re-asserts it before ITS reinit (src/worker.c's drain comment
+	 * explains why: the drain's own busy() bracket around worker_execute() may
+	 * already have been cancelled by something else's ready(), though nothing
+	 * else in THIS function raises ready() before this point).  Only raise
+	 * ready() if bridge_transport_spi_hw_reinit() reports the slave actually
+	 * armed -- raising it unconditionally would repeat the #1133 lie the
+	 * drain's own gate exists to avoid.
+	 *
+	 * cc3501e_hw_wifi_connect_sta_take_reinit() hands this outcome to the
+	 * drain so it can skip paying a SECOND SPI_close/SPI_open for the same
+	 * event and still raise READY correctly off the real arm state -- see
+	 * src/worker.c's body_already_reinit / wifi_connect_body_reinit.  Every
+	 * FAILURE exit above (bad SSID, role-up fail, Wlan_Connect reject,
+	 * association timeout, the no-DHCP-lease exit just above this one) never
+	 * reaches here, so take_reinit() reports false for them and the drain's
+	 * own post-body reinit still runs for every one of those, unchanged. */
+	cc3501e_bridge_busy();
+	g_connect_reinit_armed   = bridge_transport_spi_hw_reinit();
+	g_connect_reinit_pending = true;
+	if (g_connect_reinit_armed) {
+		cc3501e_bridge_ready();
+	}
+
 	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE);
 	return CC3501E_HW_OK;
 }

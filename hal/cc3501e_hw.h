@@ -258,6 +258,26 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
  * same order for both, unchanged from the pre-v9 STA-only body. */
 int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
 
+/* ---- drain reinit handoff (issue #106, connect flavour) -------------------- *
+ * cc3501e_hw_wifi_connect_sta's SUCCESS path re-arms the SPI slave ITSELF,
+ * right before it publishes CONNECTED, instead of waiting for src/worker.c's
+ * drain to do it after the body returns -- the drain's reinit landed too late,
+ * after the host's WIFI_STATUS poll had already seen CONNECTED and started
+ * clocking WIFI_GET_RSSI at its dense post-connect cadence into a slave the
+ * connect's own Wlan_Connect + association wait had left torn down.  See the
+ * body for the full evidence.
+ *
+ * take_reinit() is a ONE-SHOT read-and-clear, not a state query: it reports
+ * true (and clears the latch) only for the run whose SUCCESS exit just took
+ * that reinit, so the drain can skip paying it a second time and instead
+ * trust @p armed_out for whether the slave actually came up armed.  A run
+ * that took a FAILURE exit (bad args, role-up fail, Wlan_Connect reject,
+ * association timeout, no DHCP lease) never reaches that reinit, so this
+ * reports false for it and the drain's own reinit still runs, unchanged from
+ * before #106.  The stub / silicon-free build always reports false (no body
+ * ever takes the reinit there). */
+bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out);
+
 /* ---- async-connect status latch (CMD_WIFI_STATUS) -------------------------- *
  * The connect body (cc3501e_hw_wifi_connect_sta) BLOCKS for seconds on the
  * association event, so it is worker-routed off the SPI ISR.  The host no longer

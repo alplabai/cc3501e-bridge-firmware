@@ -673,17 +673,25 @@ void worker_run_pending(void)
 	if (go) {
 		cc3501e_bridge_busy(); /* radio op about to kill the slave DMA -> hold host off */
 		/* Whether the slave is armed for the host's next clock.  Starts true:
-		 * the ops that SKIP the re-init below (the socket data and control ops,
-		 * the SPI1 passthrough ops, and the two BLE ops listed there) never tore
-		 * the slave down here, so their READY raise is unconditional as before.
-		 * Issue #5.
+		 * the ops that SKIP the re-init below UNCONDITIONALLY (the socket data
+		 * and control ops, the SPI1 passthrough ops, WIFI_GET_RSSI, and the two
+		 * BLE ops listed there) never tore the slave down here, so their READY
+		 * raise stays unconditional as before.  Issue #5.
 		 *
-		 * Known ceiling of that: if an interrupt-side re-arm fails DURING a long
-		 * skipped body (arm_transfer leaves READY low and bumps g_arm_fail_count),
-		 * the unconditional raise below reports an armed slave that is not, until
-		 * the tick's arm-fail self-heal re-inits it.  Harmless on a board whose
-		 * READY is an unconnected net; the data-op and SPI1 skips have always
-		 * carried the same ceiling. */
+		 * WIFI_CONNECT_STA is NOT in that unconditional group.  On its SUCCESS
+		 * path the body re-arms the slave ITSELF and hands this drain the real
+		 * outcome via cc3501e_hw_wifi_connect_sta_take_reinit() below, which
+		 * OVERWRITES this starting `true` with that outcome -- so a body reinit
+		 * that failed to arm still leaves `rearmed` false here.  It is exempt
+		 * from paying a SECOND reinit, not from tracking the real state.
+		 *
+		 * Known ceiling of the unconditional-skip group: if an interrupt-side
+		 * re-arm fails DURING a long skipped body (arm_transfer leaves READY
+		 * low and bumps g_arm_fail_count), the unconditional raise below
+		 * reports an armed slave that is not, until the tick's arm-fail
+		 * self-heal re-inits it.  Harmless on a board whose READY is an
+		 * unconnected net; the data-op and SPI1 skips have always carried the
+		 * same ceiling. */
 		bool rearmed = true;
 		worker_execute(cmd); /* may block for seconds (Wlan_* init + get) */
 
@@ -787,15 +795,48 @@ void worker_run_pending(void)
 		 * body -- a Wlan_Get for RSSI in connect, say -- silently leaves that radio
 		 * op with no re-sync.  Re-check this list for that too.
 		 *
-		 * Re-checked for WIFI_CONNECT_STA, which gained a reinit in its body: it stays
-		 * OFF this list, deliberately.  That body's reinit sits BETWEEN the STA
-		 * role-up and Wlan_Connect, so the whole association -- Wlan_Connect, the 30 s
-		 * event wait, DHCP, and the failure-exit Wlan_Disconnect -- still runs after
-		 * it, and the drain's reinit here is what recovers the slave from all of THAT.
-		 * The body's is not a substitute for it.  Same reasoning would apply to
-		 * WIFI_SCAN_START, which has had a body reinit since long before this list. */
-		const bool body_already_reinit =
-		    (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) || (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT);
+		 * WIFI_GET_RSSI (#106) is the counter-example to that OTHER fact: its body
+		 * DOES call Wlan_Get(WLAN_GET_RSSI) and is still exempt below.  It rests on
+		 * neither the "no radio op" fact nor a "body already reinit" fact -- it is
+		 * exempt because paying the re-init AFTER it is what wedged associated
+		 * boots, measured directly (see rssi_read below).  Do not fold it into the
+		 * socket/SPI1 "no Wlan_* call" reasoning above, and do not assume a future
+		 * cc3501e_hw_sock_* or cc3501e_hw_spi1_* body picking up a Wlan_Get gets
+		 * the same pass for free -- that would need its own measurement, same as
+		 * this one.
+		 *
+		 * WIFI_CONNECT_STA has TWO body reinits, and only the SECOND one changed
+		 * this list.  The FIRST (between the STA role-up and Wlan_Connect, gated on
+		 * role_up_was_latched -- see cc3501e_hw_wifi_connect_sta) predates #106 and
+		 * does not appear here: the whole association after it -- Wlan_Connect, the
+		 * 30 s event wait, DHCP, and every FAILURE exit's Wlan_Disconnect cleanup --
+		 * still runs afterward and still needs a reinit from somewhere, which stays
+		 * this drain's job for every one of those exits.
+		 *
+		 * The SECOND (#106, right before the body's SUCCESS-path wifi_conn_set
+		 * (CONNECTED)) is what wifi_connect_body_reinit below skips.  Unlike
+		 * BLE_SCAN_STOP / BLE_DISCONNECT it is not a static per-opcode fact -- it is
+		 * signalled PER RUN by cc3501e_hw_wifi_connect_sta_take_reinit(), because
+		 * only the SUCCESS exit takes that reinit.  Do NOT fold WIFI_CONNECT_STA
+		 * into a static `cmd ==` entry here: that would wrongly skip the drain's
+		 * reinit on every FAILURE exit too, which still needs it exactly as before
+		 * #106.
+		 *
+		 * Same static-exemption caution applies to WIFI_SCAN_START, which has had a
+		 * body reinit (between its own role-up and Wlan_Scan) since long before this
+		 * list and is NOT on it: its own post-body drain reinit is still required. */
+		bool       armed_by_connect_body = false;
+		const bool wifi_connect_body_reinit =
+		    (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) &&
+		    cc3501e_hw_wifi_connect_sta_take_reinit(&armed_by_connect_body);
+		if (wifi_connect_body_reinit) {
+			/* Trust the body's own arm outcome over the optimistic `true` this
+			 * function started with -- see the comment on `rearmed`'s declaration. */
+			rearmed = armed_by_connect_body;
+		}
+		const bool body_already_reinit = (cmd == ALP_CC3501E_CMD_BLE_SCAN_STOP) ||
+		                                 (cmd == ALP_CC3501E_CMD_BLE_DISCONNECT) ||
+		                                 wifi_connect_body_reinit;
 		/* SPI1 host passthrough is exempt for the SAME reason as the two socket
 		 * data ops above, and it is the cleanest case in the list: these opcodes
 		 * drive a SEPARATE MASTER instance (GPIO_31/32/33/34 + GPIO_15) and make
@@ -840,8 +881,39 @@ void worker_run_pending(void)
 		    (cmd == ALP_CC3501E_CMD_SOCK_OPEN) || (cmd == ALP_CC3501E_CMD_SOCK_CONNECT) ||
 		    (cmd == ALP_CC3501E_CMD_SOCK_CLOSE) || (cmd == ALP_CC3501E_CMD_SOCK_BIND) ||
 		    (cmd == ALP_CC3501E_CMD_SOCK_LISTEN);
+		/* WIFI_GET_RSSI is its OWN group, exempt for a DIFFERENT reason than every
+		 * group above.  Its HAL body (cc3501e_hw_wifi_get_rssi, hal/ti/
+		 * cc3501e_hw_ti_wifi.c) DOES make one Wlan_Get(WLAN_GET_RSSI) NWP call --
+		 * lazy_start (a no-op once associated: the role is already up) plus one
+		 * synchronous interrogate round trip, milliseconds long -- so this is not a
+		 * "body makes no Wlan_* call" case like sockets/SPI1 above.  It is exempt
+		 * because paying the re-init AFTER it is what broke associated boots, not
+		 * because the op itself is radio-free.
+		 *
+		 * #106 run6: every associated-boot link wedge (6 of 6) began with a
+		 * WIFI_GET_RSSI worker op failing; every RSSI read on a non-wedged boot
+		 * succeeded (16 of 16).  run7 isolated the mechanism: two host images
+		 * identical but for the poll_by_repeat backoff floor
+		 * (CONFIG_ALP_SDK_CC3501E_POLL_GAP_MIN_MS), each associated boot reading
+		 * `wifi status` (which performs an RSSI read) up to 30 times at 1 s spacing
+		 * -- floor 1 ms (the default) wedged 7 of 7 associated boots, at reads as
+		 * early as 0 and as late as 26 (67 RSSI ops total, all 7 boots); floor 50 ms
+		 * wedged 0 of 5 (155 RSSI ops, 30/30 clean each boot).  Wedge signature:
+		 * rssi -4 after the host's 10 s budget, then ip -5, then get_version -5 --
+		 * the same transport-desync signature the socket_control measurement above
+		 * shows for the same mechanism (a re-init landing inside the host's dense
+		 * poll window, not the radio call itself).
+		 *
+		 * FALSIFIER: if a Wlan_Get interrogate itself disturbs the slave's DMA --
+		 * rather than the drain's re-init landing in the host's dense poll window
+		 * being the whole story -- wedges will move to the op AFTER a successful
+		 * RSSI read: either RSSI itself starts wedging even with this skip in
+		 * place, or the NEXT worker-routed op following a clean RSSI read starts
+		 * wedging instead.  Neither has been observed on any run to date; both
+		 * remain open to a future bench run. */
+		const bool rssi_read = (cmd == ALP_CC3501E_CMD_WIFI_GET_RSSI);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
-		    !socket_control && !spi1_passthrough && !body_already_reinit) {
+		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}
