@@ -141,7 +141,10 @@ gpe-floor:    0.254.5.0
 # build/ti/cc3501e-bridge.bin with this commit applied and the stage-1 hash is
 # BYTE-IDENTICAL to raw-sha256 above --
 #   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
-inert: a55d6610da3d32d007fb826e2f43cae56fbd53de
+# That rebuild was taken on the PR branch's commit a55d661; this line names the
+# squash commit that landed (#128).  `git diff a55d661 b6da302 -- src hal ti` is
+# empty, so the attested source is the same.
+inert: b6da302c9403d7eb012c4b346c92eaa2b748688f
 #
 # built-from names the commit that bumps firmware-version.txt to 0.8.0. That
 # bump is split into its own commit deliberately: it feeds the fw_version
