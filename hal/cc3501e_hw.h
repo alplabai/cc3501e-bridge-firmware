@@ -280,27 +280,36 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * <alp/protocol/cc3501e.h> (that header's own byte-meaning update is a
  * separate host-side alp-sdk PR; this is the firmware half only).
  *
- * Exactly: the low byte of the IEEE 802.11 reason code from the last
- * NON-user-initiated DISCONNECT, or the status code from an
- * ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED, recorded for THIS attempt
- * (cleared by cc3501e_hw_wifi_mark_connecting(), frozen by wifi_conn_set() at
- * the terminal transition so a later cleanup disconnect cannot overwrite it --
- * see cc3501e_hw_ti_wifi.c).  0 = none recorded: the boot default, the value
- * on the stub / silicon-free build (which never sees a real WLAN event), and
- * what a fresh attempt reads until it records one of its own.
+ * Exactly: the low byte of the IEEE 802.11 reason code from a DISCONNECT, or
+ * the status code from an ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED,
+ * recorded ONLY while THIS attempt is OPEN -- between
+ * cc3501e_hw_wifi_mark_connecting() (which also clears this to 0 for the new
+ * attempt) and the terminal wifi_conn_set() that freezes it.  A DISCONNECT
+ * carrying WLAN_DISCONNECT_USER_INITIATED (200) is never recorded, in any
+ * state -- it is a vendor placeholder, not a real 802.11 reason.  0 = none
+ * recorded: the boot default, the value on the stub / silicon-free build
+ * (which never sees a real WLAN event), and what a fresh attempt reads until
+ * it records one of its own.
  *
- * "Non-user-initiated" excludes a DISCONNECT this firmware itself asked for
- * (the host's WIFI_DISCONNECT, or the #1437 stale-association cleanup after a
- * failed connect).  This is tracked with a FIRMWARE-owned flag
- * (wifi_own_disconnect_pending, hal/ti/cc3501e_hw_ti_wifi.c), not the vendor's
- * own WlanEventDisconnect_t::IsStaIsDiscnctInitiator: the vendor only sets
- * that flag (and hardcodes ReasonCode to WLAN_DISCONNECT_USER_INITIATED, 200)
- * when its station state machine is idle at the time of the disconnect
- * request.  A disconnect issued while actually connected or mid-association
- * -- exactly the host-WIFI_DISCONNECT and #1437-cleanup cases this excludes
- * -- routes through a different vendor path that sends a REAL 802.11 reason
- * (WLAN_REASON_DEAUTH_LEAVING, 3) with the vendor's own flag left at 0,
- * indistinguishable from an AP-initiated deauth without our own tracking.
+ * This is an OBSERVABILITY byte: it is scoped to "was an attempt open when
+ * this arrived", not to "did WE cause it".  A disconnect this firmware itself
+ * issues while actually connected or mid-association (a host WIFI_DISCONNECT
+ * while connected, or the #1437 stale-association cleanup after a failed
+ * connect) is excluded not because it is specially flagged, but because
+ * neither can run while an attempt is open: the cleanup always runs AFTER its
+ * caller's own wifi_conn_set(FAILED, ...), and a host WIFI_DISCONNECT only
+ * ever fires from CONNECTED. Both leave the gate closed the whole time they
+ * run.
+ *
+ * RESIDUAL (read this before trusting an exact match): if a NEW connect
+ * attempt starts (mark_connecting()) before one of those OWN disconnects'
+ * delayed vendor DISCONNECT event arrives, that event's reason -- REAL 802.11
+ * reason 3, WLAN_REASON_DEAUTH_LEAVING, not 200, so the always-ignore-200 rule
+ * above does not catch it -- can land inside the NEW attempt's now-open
+ * window and be recorded against it. A reader that sees exactly reason 3
+ * should treat it as POSSIBLY self-inflicted (a just-prior disconnect this
+ * firmware issued), not necessarily a real AP-side deauth of the current
+ * attempt.
  *
  * SCOPE: covers the CONNECT ATTEMPT only -- the reason or status that ENDED
  * or REJECTED that attempt.  Once an attempt reaches CONNECTED this value is
@@ -528,14 +537,24 @@ int cc3501e_hw_ota_status(uint8_t *state, uint32_t *bytes_written, uint32_t *tot
  * what it can and returns OK. */
 int cc3501e_hw_set_power_policy(uint8_t policy, uint8_t wake_events, uint32_t idle_ms_before_sleep);
 
-/* Whether the LAST realised radio power-save apply succeeded.
+/* Whether the LAST realised radio power-save apply succeeded AND was honoured
+ * verbatim.
  *
  * cc3501e_hw_set_power_policy() runs in SPI-DISPATCH (ISR) context, where the
  * vendor radio call it needs is illegal, so the radio half is deferred to the
  * task.  Its RESP_OK therefore means QUEUED, not APPLIED -- the same semantic
  * OTA_BEGIN has.  This reports the outcome of the previous apply, so a host can
- * tell "the policy was accepted" from "the radio actually took it".  Backends
- * with no radio return true. */
+ * tell "the policy was accepted" from "the radio actually took it".
+ *
+ * ALSO false while an AP role is up and the requested policy was BALANCED /
+ * LOW_POWER / DEEP_SLEEP: device-wide power management cannot be put to sleep
+ * while a soft-AP is beaconing (#1562), so the HAL forces ALWAYS_ACTIVE
+ * instead and reports that substitution here, even though every underlying
+ * radio call succeeded.  A host polling this after such a policy sees false
+ * and should read it as "not what you asked for", not as a wire failure --
+ * the POWER_POLICY call itself still returned RESP_OK.
+ *
+ * Backends with no radio return true. */
 bool cc3501e_hw_power_radio_ok(void);
 
 /* Set firmware log verbosity (0 = off).  OK means ACCEPTED AND RECORDED, not
