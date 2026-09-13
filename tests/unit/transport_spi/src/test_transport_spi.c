@@ -1027,15 +1027,15 @@ ZTEST(cc3501e_bridge_transport, test_sock_send_is_exempt_from_the_generic_latch)
 	              "send_a's cached reply");
 }
 
-/* worker_peek_terminal_req_byte()'s guard (protocol_sockets.c), the abandoned-
+/* worker_discard_stale_terminal()'s guard (protocol_sockets.c), the abandoned-
  * send case test_sock_send_is_exempt_from_the_generic_latch above does NOT
  * reach: that test always COLLECTS send_a (a second transaction(send_a))
  * before ever sending send_b, so send_a's job is IDLE again by the time
  * send_b arrives and there is nothing left for the guard to discard.  This
  * test walks away after send_a's SUBMIT ack instead -- exactly
- * alp-sdk#107/#1746's abandoned-seq-A scenario -- so send_a's ERR is still
- * sitting in the slot, uncollected AND uncached (only a RESP_OK caches, see
- * handle_sock_send), when send_b arrives.
+ * cc3501e-bridge-firmware#107/alp-sdk#1746's abandoned-seq-A scenario -- so
+ * send_a's ERR is still sitting in the slot, uncollected AND uncached (only a
+ * RESP_OK caches, see handle_sock_send), when send_b arrives.
  *
  * The ERR variant: the stub HAL's cc3501e_hw_sock_send() always returns
  * CC3501E_HW_ERR_NOTIMPL (no real socket stack here), so WORKER_DONE is
@@ -1142,20 +1142,15 @@ ZTEST(cc3501e_bridge_transport, test_sock_send_same_seq_collects)
 	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "same-seq poll collects the in-flight send");
 }
 
-/* NOT COVERED HERE, and saying so rather than shipping a test that passes
- * either way (same policy as the generic-latch invalidation gap documented
- * above test_sock_send_is_exempt_from_the_generic_latch): "a re-issue after
- * collect is served from the cache" needs handle_sock_send() to actually
- * reach its `if (st == ALP_CC3501E_RESP_OK)` cache-store arm at least once,
- * and RESP_OK is structurally unreachable for SOCK_SEND on this stub --
- * cc3501e_hw_sock_send() (hal/cc3501e_hw_stub.c) always returns
+/* "A re-issue after collect is served from the cache" needs handle_sock_send()
+ * to actually reach its `if (st == ALP_CC3501E_RESP_OK)` cache-store arm at
+ * least once, and RESP_OK is structurally unreachable for SOCK_SEND on THIS
+ * stub -- cc3501e_hw_sock_send() (hal/cc3501e_hw_stub.c) always returns
  * CC3501E_HW_ERR_NOTIMPL, there being no real socket stack on the host.
- * This predates the guard above (issue #88's cache has been untestable here
- * since it landed) and the guard does not touch it either way: the cache
- * check in handle_sock_send() runs BEFORE worker_peek_terminal_req_byte(),
- * so a genuine cache hit returns straight out of that first `if` and never
- * reaches the guard at all.  Proving the cache's own retry-serves-hit
- * behaviour needs a real socket -- the bench, or the TI backend. */
+ * Covered instead by tests/unit/sock_send_done/, a separate executable that
+ * links the same sources with `-Wl,--wrap=cc3501e_hw_sock_send` so a real
+ * WORKER_DONE (and therefore a real, cacheable RESP_OK) is reachable over
+ * the wire; see test_same_seq_after_collect_served_from_cache there. */
 
 ZTEST(cc3501e_bridge_transport, test_diag_log_level_ok)
 {

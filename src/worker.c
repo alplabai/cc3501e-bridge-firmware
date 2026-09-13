@@ -656,17 +656,20 @@ void worker_reset(void)
 	worker_critical_exit(key);
 }
 
-int worker_peek_terminal_req_byte(uint8_t cmd, size_t req_off, uint8_t *req_byte)
+int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte)
 {
-	const unsigned long key = worker_critical_enter();
-	int                 ok  = 0;
+	const unsigned long key       = worker_critical_enter();
+	int                 discarded = 0;
 	if (job.job_cmd == cmd && (job.state == WORKER_DONE || job.state == WORKER_ERR) &&
-	    req_off < (size_t)job.req_len) {
-		if (req_byte != NULL) *req_byte = job.req[req_off];
-		ok = 1;
+	    req_off < (size_t)job.req_len && job.req[req_off] != req_byte) {
+		job.state      = WORKER_IDLE;
+		job.job_cmd    = 0u;
+		job.result_len = 0u;
+		job.err        = 0;
+		discarded      = 1;
 	}
 	worker_critical_exit(key);
-	return ok;
+	return discarded;
 }
 
 void worker_run_pending(void)
