@@ -705,9 +705,12 @@ void worker_run_pending(void)
 		 * 3-22 B/s.  (An earlier "this changes nothing" reading was wrong -- both
 		 * sides of that comparison had the skip.)
 		 *
-		 * Deliberately conservative: OPEN / CONNECT / CLOSE keep the re-init,
-		 * because connect in particular can drive the stack hard enough to touch
-		 * the HIF.  Only the two hot data ops are exempt. */
+		 * The socket CONTROL ops are now exempt too -- see socket_control below.
+		 * This comment used to call keeping the re-init on OPEN / CONNECT / CLOSE
+		 * "deliberately conservative, because connect can drive the stack hard
+		 * enough to touch the HIF".  That was never measured, and it did not hold
+		 * up: SEND drives far more traffic through the stack than any control op,
+		 * and it runs with no re-init at all at the rate quoted above. */
 		/* Re-assert BUSY immediately before the re-init.  The bracket taken above
 		 * has almost certainly been released by now: every BLE HAL body ends with
 		 * its own cc3501e_bridge_ready() (cc3501e_hw_ti_ble.c:116, :133, :166,
@@ -795,8 +798,34 @@ void worker_run_pending(void)
 		const bool spi1_passthrough = (cmd == ALP_CC3501E_CMD_SPI1_CONFIGURE) ||
 		                              (cmd == ALP_CC3501E_CMD_SPI1_TRANSFER) ||
 		                              (cmd == ALP_CC3501E_CMD_SPI1_RELEASE);
+		/* Socket CONTROL ops are exempt for the same reason as the data ops: their
+		 * HAL bodies in hal/ti/cc3501e_hw_ti_sock.c are lwIP calls (lwip_socket,
+		 * lwip_connect, lwip_close, lwip_bind, lwip_listen) and make no Wlan_*
+		 * call, so the slave's DMA was never killed and there is nothing to
+		 * re-establish -- only a live slave to close and re-open under the host.
+		 *
+		 * Silicon-measured on e1m-aen-evk-01 at GPE 0.254.6.0 (#106), station
+		 * mode, alp-console `sock tcp-get` against a LAN host with no listener:
+		 * each call is OPEN, CONNECT refused in ~40 ms, CLOSE -- three fast
+		 * re-inits while the host polls at its 1-2 ms cadence.  6 of 7 such boots
+		 * wedged the link: an op timed out at the host's 15 s budget, and every
+		 * later get_version answered -5 until a power cycle.  Two wedged on the
+		 * very FIRST SOCK_OPEN of the boot, before any connect had run, so the
+		 * trigger is not the long connect block and not AP mode.  Against an
+		 * address nothing answers, the same OPEN + CLOSE pair around a connect
+		 * that blocked 15 s left the link healthy on 3 of 3 boots.  That split is
+		 * CONSISTENT WITH, not proof of, the transport's own documented
+		 * re-init-on-a-live-slave desync (transport_hw_ti_spi.c): a re-init landing
+		 * while the host has fallen back to its slow cadence survives, one landing
+		 * inside the fast poll does not.  The before/after bench run on this
+		 * change is what confirms or refutes it. */
+		const bool socket_control = (cmd == ALP_CC3501E_CMD_SOCK_OPEN) ||
+		                            (cmd == ALP_CC3501E_CMD_SOCK_CONNECT) ||
+		                            (cmd == ALP_CC3501E_CMD_SOCK_CLOSE) ||
+		                            (cmd == ALP_CC3501E_CMD_SOCK_BIND) ||
+		                            (cmd == ALP_CC3501E_CMD_SOCK_LISTEN);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
-		    !spi1_passthrough && !body_already_reinit) {
+		    !socket_control && !spi1_passthrough && !body_already_reinit) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}
