@@ -648,6 +648,73 @@ ZTEST(cc3501e_bridge_transport, test_wifi_get_rssi_not_ready)
 	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "re-issued GET_RSSI on stub -> NOT_READY");
 }
 
+/* A poll carrying the SAME opcode AND the SAME 5-bit retry seq (flags bits
+ * 3..7, ALP_CC3501E_FLAG_REQ_SEQ_SHIFT) as the in-flight job collects it --
+ * the ordinary poll_by_repeat() shape, unaffected by this fix. */
+ZTEST(cc3501e_bridge_transport, test_same_seq_collects)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+	const uint8_t r[] = { ALP_CC3501E_CMD_WIFI_GET_RSSI, 0x08u, 0x00u, 0x00u }; /* seq 1 */
+
+	transaction(r, sizeof r);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "seq-1 submit reply = header + status");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "seq-1 submits -> BUSY");
+
+	transaction(r, sizeof r); /* identical frame: an ordinary poll_by_repeat retry */
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "seq-1 collect reply = header + status");
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "same-seq poll collects the in-flight job");
+}
+
+/* The ERR variant of this fix (worker.c's job.seq guard): a same-opcode
+ * WORKER_ERR tagged with a DIFFERENT seq is exactly as uncollectable as a
+ * DONE would be (see test_stale_seq_done_result_is_discarded_not_collected
+ * for the DONE variant, on SPI1_CONFIGURE).  Modelled on the failure this
+ * closes: the host issues WIFI_SCAN_START under seq 1, its poll_by_repeat
+ * deadline expires before it ever collects (the job runs synchronously to
+ * WORKER_ERR -- NOTIMPL on the radio-less stub -- but nobody polls seq 1
+ * again), and it later issues a NEW scan under seq 2.  Before this fix that
+ * new request was silently handed seq 1's stale NOT_READY and never
+ * actually submitted; a fresh scan with different parameters would have
+ * been dropped on the floor exactly like SOCK_SEND's data in the bug this
+ * fix closes. */
+ZTEST(cc3501e_bridge_transport, test_stale_seq_err_result_is_discarded_not_collected)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+	const uint8_t seq1[] = { ALP_CC3501E_CMD_WIFI_SCAN_START, 0x08u, 0x00u, 0x00u }; /* seq 1 */
+	const uint8_t seq2[] = { ALP_CC3501E_CMD_WIFI_SCAN_START, 0x10u, 0x00u, 0x00u }; /* seq 2 */
+
+	/* Submit under seq 1 and walk away -- the stub runs it synchronously to
+	 * WORKER_ERR before this reply is even framed, but seq 1 is never polled
+	 * again (the abandoned-deadline case). */
+	transaction(seq1, sizeof seq1);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "seq-1 submit reply = header + status");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "seq-1 submits -> BUSY");
+
+	/* A genuinely NEW request under seq 2: the seq-1/seq-2 mismatch discards
+	 * the stale ERR and this request submits fresh -> BUSY.  Before this fix
+	 * worker_poll() matched on opcode alone and this returned NOT_READY --
+	 * seq 1's stale answer -- without ever submitting seq 2's request. */
+	transaction(seq2, sizeof seq2);
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "seq-2 submit reply = header + status");
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "seq-1's stale ERR is discarded; seq-2 submits fresh instead of collecting it");
+
+	/* seq 2 collects ITS OWN result on the next poll (same seq). */
+	transaction(seq2, sizeof seq2);
+	n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(0u), "seq-2 collect reply = header + status");
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "seq-2 collects its own result, not seq-1's");
+}
+
 ZTEST(cc3501e_bridge_transport, test_wifi_connect_sta_parses_then_not_ready)
 {
 	uint8_t reply[32];
@@ -1530,6 +1597,54 @@ ZTEST(cc3501e_bridge_transport, test_spi1_request_validation)
 	transaction(rel_with_payload, sizeof rel_with_payload);
 	(void)drain(reply, sizeof reply);
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_INVALID, "RELEASE with a payload -> INVALID");
+}
+
+/* The DONE variant of this fix (worker.c's job.seq guard) -- see
+ * test_stale_seq_err_result_is_discarded_not_collected for the ERR variant.
+ * SPI1_CONFIGURE is the vehicle: cc3501e_hw_spi1_configure() always returns
+ * CC3501E_HW_OK on the stub, so it lands on WORKER_DONE, not WORKER_ERR.
+ *
+ * seq 1's CONFIGURE is submitted and abandoned (never collected under seq
+ * 1); a genuinely new CONFIGURE under seq 2 must NOT be handed seq 1's
+ * stale OK -- that would set g_configured from a request the worker never
+ * actually ran under seq 2's identity.  It must discard and submit fresh. */
+ZTEST(cc3501e_bridge_transport, test_stale_seq_done_result_is_discarded_not_collected)
+{
+	uint8_t reply[64];
+	transport_spi_init();
+	spi1_release(reply, sizeof reply); /* known state, independent of test order */
+
+	uint8_t seq1[sizeof spi1_configure_req];
+	memcpy(seq1, spi1_configure_req, sizeof seq1);
+	seq1[1] = 0x08u; /* seq 1 */
+	uint8_t seq2[sizeof spi1_configure_req];
+	memcpy(seq2, spi1_configure_req, sizeof seq2);
+	seq2[1] = 0x10u; /* seq 2 */
+
+	/* Submit under seq 1 and walk away -- the stub runs it synchronously to
+	 * WORKER_DONE before this reply is even framed, but seq 1 is never polled
+	 * again (the abandoned-deadline case). g_configured stays false: this
+	 * submit's own BUSY ack is not the result. */
+	transaction(seq1, sizeof seq1);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "seq-1 submits -> BUSY");
+
+	/* A genuinely new CONFIGURE under seq 2: the mismatch discards seq 1's
+	 * stale DONE and this request submits fresh -> BUSY, not OK.  Before this
+	 * fix worker_poll() matched on opcode alone and this would have returned
+	 * OK immediately, straight out of seq 1's cached result. */
+	transaction(seq2, sizeof seq2);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "seq-1's stale DONE is discarded; seq-2 submits fresh instead of collecting it");
+
+	/* seq 2 collects ITS OWN result on the next poll (same seq). */
+	transaction(seq2, sizeof seq2);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "seq-2 collects its own result, not seq-1's");
+
+	spi1_release(reply, sizeof reply); /* leave the bus closed for later tests */
 }
 
 /* The worker's `job` is a file-static singleton shared across the whole TU, so a

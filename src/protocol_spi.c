@@ -153,10 +153,22 @@ alp_cc3501e_resp_t handle_spi1_transfer(const uint8_t *req,
 	const size_t min_cap = sizeof(alp_cc3501e_spi1_transfer_resp_t) + (no_rx ? 0u : (size_t)len);
 	if (reply_cap < min_cap) return ALP_CC3501E_RESP_ERR_NO_MEM;
 
-	size_t            n   = 0u;
-	int8_t            err = 0;
-	enum worker_state st =
-	    worker_poll(ALP_CC3501E_CMD_SPI1_TRANSFER, reply_data, reply_cap, &n, &err);
+	/* protocol.c's per-dispatch 5-bit retry seq (issue #102) -- NOT @p seq
+	 * above, which is this opcode's OWN 8-bit request identity (req[3]).
+	 * Passed to worker_poll()/worker_submit_payload() below for the SAME
+	 * reason every other worker-routed opcode passes it (see worker.c): it
+	 * is constant across retries of one poll_by_repeat() call and fresh per
+	 * genuinely new one, so it cannot false-negative a real retry, and it is
+	 * a defense-in-depth layer underneath this handler's OWN, stronger
+	 * @p seq check below -- that check is unconditionally the one that
+	 * decides whether to serve a cached transfer or re-clock the bus; this
+	 * one only decides whether worker_poll() itself hands back a DONE/ERR
+	 * to inspect at all. */
+	const uint8_t     generic_req_seq = protocol_current_req_seq();
+	size_t            n               = 0u;
+	int8_t            err             = 0;
+	enum worker_state st              = worker_poll(
+	    ALP_CC3501E_CMD_SPI1_TRANSFER, generic_req_seq, reply_data, reply_cap, &n, &err);
 
 	if (st == WORKER_DONE) {
 		/* DUPLICATE SUPPRESSION.  The worker slot IS the cache: worker_poll does
@@ -202,7 +214,8 @@ alp_cc3501e_resp_t handle_spi1_transfer(const uint8_t *req,
 	case WORKER_IDLE:
 		/* The whole frame (header + inline TX) goes to the worker, which
 		 * re-parses it in the drain -- the same hand-off the socket family uses. */
-		(void)worker_submit_payload(ALP_CC3501E_CMD_SPI1_TRANSFER, req, (uint16_t)req_len);
+		(void)worker_submit_payload(
+		    ALP_CC3501E_CMD_SPI1_TRANSFER, generic_req_seq, req, (uint16_t)req_len);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* QUEUED / RUNNING, or another opcode holding the slot */
 		return ALP_CC3501E_RESP_ERR_BUSY;

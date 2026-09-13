@@ -80,9 +80,13 @@ __attribute__((weak)) void cc3501e_bridge_attn_pulse(void)
 static struct {
 	volatile enum worker_state state;
 	volatile uint8_t           job_cmd;
-	volatile uint8_t           result[ALP_CC3501E_MAX_PAYLOAD];
-	volatile uint16_t          result_len;
-	volatile int8_t            err;
+	/* The request frame's identity (protocol.c's s_current_req_seq), tagged on
+	 * at submit and checked back at collect (worker_poll) -- see the comment
+	 * there for the failure this closes.  Meaningless while state == IDLE. */
+	volatile uint8_t  seq;
+	volatile uint8_t  result[ALP_CC3501E_MAX_PAYLOAD];
+	volatile uint16_t result_len;
+	volatile int8_t   err;
 	/* Request payload for jobs that carry one (WIFI_CONNECT_STA / WIFI_AP_START).
 	 * Parameterless jobs (GET_MAC / scan / ble) leave req_len 0.  Written by the
 	 * ISR in worker_submit_payload while state goes IDLE->QUEUED; read by the drain
@@ -533,7 +537,7 @@ void worker_init(void)
 	worker_critical_exit(key);
 }
 
-int worker_submit(uint8_t cmd)
+int worker_submit(uint8_t cmd, uint8_t seq)
 {
 	const unsigned long key = worker_critical_enter();
 	if (job.state != WORKER_IDLE) {
@@ -541,6 +545,7 @@ int worker_submit(uint8_t cmd)
 		return 0; /* a job is already in flight (single in-flight, v0.2) */
 	}
 	job.job_cmd    = cmd;
+	job.seq        = seq;
 	job.result_len = 0u;
 	job.err        = 0;
 	job.state      = WORKER_QUEUED;
@@ -559,7 +564,7 @@ int worker_submit(uint8_t cmd)
 	return 1;
 }
 
-int worker_submit_payload(uint8_t cmd, const uint8_t *payload, uint16_t len)
+int worker_submit_payload(uint8_t cmd, uint8_t seq, const uint8_t *payload, uint16_t len)
 {
 	if (len > ALP_CC3501E_MAX_PAYLOAD) {
 		return 0; /* would overflow job.req -- caller validated, but stay defensive */
@@ -570,6 +575,7 @@ int worker_submit_payload(uint8_t cmd, const uint8_t *payload, uint16_t len)
 		return 0; /* a job is already in flight (single in-flight, v0.2) */
 	}
 	job.job_cmd    = cmd;
+	job.seq        = seq;
 	job.result_len = 0u;
 	job.err        = 0;
 	if (len > 0u && payload != NULL) {
@@ -588,7 +594,7 @@ int worker_submit_payload(uint8_t cmd, const uint8_t *payload, uint16_t len)
 }
 
 enum worker_state
-worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *err)
+worker_poll(uint8_t cmd, uint8_t seq, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *err)
 {
 	if (out_len != NULL) *out_len = 0u;
 	if (err != NULL) *err = 0;
@@ -626,6 +632,31 @@ worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *
 		}
 		worker_critical_exit(key);
 		return ret;
+	}
+
+	/* Same opcode.  A TERMINAL result is only claimable by the request that
+	 * is actually waiting for it -- one carrying the SAME seq the job was
+	 * tagged with at submit (worker_submit/_payload).  Same opcode + a
+	 * DIFFERENT seq means the host that owned this job gave up (its
+	 * poll_by_repeat deadline expired) before ever seeing DONE/ERR, and has
+	 * since moved on to a NEW logical command that only happens to reuse the
+	 * opcode -- e.g. a second CMD_SOCK_SEND with fresh data after the first
+	 * timed out.  Before this check that new request would be handed the
+	 * OLD job's answer straight out of the switch below (RESP_OK plus the
+	 * PREVIOUS send's queued-byte count) and its own payload would never be
+	 * submitted at all -- issue #88 reintroduced one level up, with a wider
+	 * blast radius: not just SOCK_SEND, every one of the ~25 other opcodes
+	 * that funnel through handle_worker_routed*.  A QUEUED/RUNNING job is
+	 * still genuinely in flight regardless of seq -- there is no result yet
+	 * for anyone to misclaim -- so this only fires for DONE/ERR, exactly
+	 * mirroring the different-opcode orphan-discard above. */
+	if ((st == WORKER_DONE || st == WORKER_ERR) && job.seq != seq) {
+		job.state      = WORKER_IDLE;
+		job.job_cmd    = 0u;
+		job.result_len = 0u;
+		job.err        = 0;
+		worker_critical_exit(key);
+		return WORKER_IDLE;
 	}
 
 	if (st == WORKER_DONE) {

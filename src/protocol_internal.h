@@ -141,6 +141,13 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
                                                       size_t            reply_cap,
                                                       size_t           *reply_data_len);
 
+/* The current request frame's identity (protocol.c's s_current_req_seq,
+ * extracted once per protocol_dispatch() call -- see the comment there).
+ * Exposed for protocol_spi.c's handle_spi1_transfer(), which calls
+ * worker_poll()/worker_submit_payload() directly rather than through the
+ * three helpers above and so needs this value itself. */
+uint8_t protocol_current_req_seq(void);
+
 /* --------------------------------------------------------------- */
 /* Per-family command handlers                                       */
 /* --------------------------------------------------------------- */

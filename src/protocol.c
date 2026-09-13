@@ -218,6 +218,20 @@ uint32_t g_retry_latch_hits;
 
 static uint8_t s_current_req_seq;
 
+/* protocol_spi.c's handle_spi1_transfer() calls worker_poll()/
+ * worker_submit_payload() directly (it hand-rolls its own poll loop rather
+ * than routing through the three helpers below -- see its own comment on
+ * why), so it needs this same per-dispatch seq too: SPI1_TRANSFER's host
+ * wrapper (cc3501e_spi1_transfer()) uses poll_by_repeat() exactly like
+ * every other worker-routed op, so s_current_req_seq is constant across
+ * retries of one logical transfer and fresh per genuinely new one, the
+ * same guarantee the three helpers below rely on.  Exposed as a function
+ * rather than `extern`ing the static so this TU keeps sole write access. */
+uint8_t protocol_current_req_seq(void)
+{
+	return s_current_req_seq;
+}
+
 /*
  * The single most-recently-COLLECTED worker-routed outcome, cached so a
  * matching-(cmd,seq) retry -- a lost/misframed reply that made
@@ -446,7 +460,8 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
-	const enum worker_state st  = worker_poll((uint8_t)cmd, reply_data, reply_cap, &n, &err);
+	const enum worker_state st =
+	    worker_poll((uint8_t)cmd, s_current_req_seq, reply_data, reply_cap, &n, &err);
 
 	switch (st) {
 	case WORKER_DONE:
@@ -476,7 +491,7 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
 		/* No job in flight: queue one and ask the host to re-issue. */
-		(void)worker_submit((uint8_t)cmd);
+		(void)worker_submit((uint8_t)cmd, s_current_req_seq);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* WORKER_QUEUED / WORKER_RUNNING (incl. another cmd in flight) */
 		return ALP_CC3501E_RESP_ERR_BUSY;
@@ -502,7 +517,7 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
-	const enum worker_state st  = worker_poll((uint8_t)cmd, NULL, 0u, &n, &err);
+	const enum worker_state st  = worker_poll((uint8_t)cmd, s_current_req_seq, NULL, 0u, &n, &err);
 
 	switch (st) {
 	case WORKER_DONE:
@@ -540,7 +555,7 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 		if (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) {
 			cc3501e_hw_wifi_mark_connecting();
 		}
-		(void)worker_submit_payload((uint8_t)cmd, req, (uint16_t)req_len);
+		(void)worker_submit_payload((uint8_t)cmd, s_current_req_seq, req, (uint16_t)req_len);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* QUEUED / RUNNING (incl. another cmd in flight) */
 		return ALP_CC3501E_RESP_ERR_BUSY;
@@ -572,7 +587,8 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 
 	size_t                  n   = 0u;
 	int8_t                  err = 0;
-	const enum worker_state st  = worker_poll((uint8_t)cmd, reply_data, reply_cap, &n, &err);
+	const enum worker_state st =
+	    worker_poll((uint8_t)cmd, s_current_req_seq, reply_data, reply_cap, &n, &err);
 
 	switch (st) {
 	case WORKER_DONE:
@@ -602,7 +618,7 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
 		/* No job in flight: queue THIS one (with its payload) + return BUSY. */
-		(void)worker_submit_payload((uint8_t)cmd, req, (uint16_t)req_len);
+		(void)worker_submit_payload((uint8_t)cmd, s_current_req_seq, req, (uint16_t)req_len);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* QUEUED / RUNNING (incl. another cmd in flight) */
 		return ALP_CC3501E_RESP_ERR_BUSY;
