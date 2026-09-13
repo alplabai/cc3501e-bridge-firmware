@@ -218,6 +218,19 @@ uint32_t g_retry_latch_hits;
 
 static uint8_t s_current_req_seq;
 
+/* Exposed for protocol_sockets.c's handle_sock_recv(): its own lazy-commit
+ * replay check (issue: silent SOCK_RECV data loss on a CRC-rejected reply,
+ * host review) needs this SAME per-dispatch seq -- alp_cc3501e_sock_recv_t
+ * carries none of its own, unlike SOCK_SEND's per-frame seq -- but
+ * s_current_req_seq is file-static here and SOCK_RECV is deliberately
+ * excluded from the generic retry latch below (retry_latch_applies()), so
+ * there is no other seam already carrying it out of this TU.  A function
+ * rather than `extern`ing the static keeps this TU the sole writer. */
+uint8_t protocol_current_req_seq(void)
+{
+	return s_current_req_seq;
+}
+
 /*
  * The single most-recently-COLLECTED worker-routed outcome, cached so a
  * matching-(cmd,seq) retry -- a lost/misframed reply that made

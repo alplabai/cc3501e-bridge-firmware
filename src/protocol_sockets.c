@@ -359,6 +359,19 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 	    ALP_CC3501E_CMD_SOCK_SEND, req, req_len, 2u, reply_data, reply_cap, reply_data_len);
 }
 
+/* LAZY-COMMIT replay identity for the fast path below (silent SOCK_RECV
+ * data loss on a CRC-rejected reply, host review): alp_cc3501e_sock_recv_t
+ * carries no seq of its own, so a poll_by_repeat() retry of a CRC-rejected
+ * reply is byte-identical to the request that produced it EXCEPT for the
+ * generic 5-bit header seq (protocol.c's s_current_req_seq), which
+ * poll_by_repeat() holds constant across every retry of one logical call.
+ * DISPATCH CONTEXT ONLY, same as the ring itself -- see
+ * hal/ti/cc3501e_hw_ti_sock.c's CONCURRENCY comment above rx_ring; the task-
+ * side pump never reads or writes these, so no volatile and no cross-
+ * context ordering concern. */
+static uint8_t  last_recv_seq;
+static uint16_t last_recv_handle;
+
 /* SOCK_RECV (0x23): req = alp_cc3501e_sock_recv_t { handle | max_len } = 4 B.
  * Reply DATA = alp_cc3501e_sock_recv_resp_t (24 B) + received bytes inline. */
 alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
@@ -382,7 +395,19 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * ONE bridge transaction with no worker round trip and no wait for the
 	 * worker loop to come round.  cc3501e_hw_sock_recv_ring returns -1 when this
 	 * handle is not the prefetched one, and then we fall through to the original
-	 * worker path unchanged. */
+	 * worker path unchanged.
+	 *
+	 * KNOWN FOLLOW-UP, NOT FIXED HERE: the fallback below --
+	 * handle_worker_routed_payload_reply() for a handle that is NOT the
+	 * prefetched one (UDP sockets, and STREAM sockets accepted but never
+	 * armed for prefetch) -- has the SAME CRC-rejected-reply data-loss hole
+	 * this fast path just closed: cc3501e_hw_sock_recv()'s lwip_recvfrom()
+	 * also has no way to re-deliver bytes a lost reply already consumed from
+	 * the socket.  It is excluded from the generic retry latch for the same
+	 * "stream-consuming, not idempotent" reason SOCK_RECV as a whole is (see
+	 * protocol.c's retry_latch_applies()), and it is worker-routed rather
+	 * than a single synchronous call, which does not fit this fast path's
+	 * lazy-commit shape (there is no ring to hold bytes back in). */
 	{
 		const uint16_t handle  = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
 		const uint16_t max_len = (uint16_t)((uint16_t)req[2] | ((uint16_t)req[3] << 8));
@@ -390,9 +415,32 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 		if (reply_cap > hdr) {
 			size_t room = reply_cap - hdr;
 			if (max_len != 0u && room > (size_t)max_len) room = (size_t)max_len;
+
+			/* seq 0 (ALP_CC3501E_REQ_SEQ_NONE) never claims a replay, same
+			 * reservation the generic retry latch uses -- a host that does not
+			 * assign one (every bare cc3501e_request() call site, or a pre-v8
+			 * host) would otherwise read every frame as "seq 0, same as last",
+			 * i.e. always a replay of whatever was last served. */
+			const uint8_t seq = protocol_current_req_seq();
+			const bool replay = (seq != 0u && seq == last_recv_seq && handle == last_recv_handle);
+
 			uint16_t  got = 0u;
 			const int rc =
-			    cc3501e_hw_sock_recv_ring(handle, &reply_data[hdr], (uint16_t)room, &got);
+			    cc3501e_hw_sock_recv_ring(handle, &reply_data[hdr], (uint16_t)room, replay, &got);
+
+			/* Record THIS call's identity for the NEXT one to compare against --
+			 * but only when this handle actually engaged the ring (rc != -1).
+			 * Recording it unconditionally would let an UNRELATED handle's
+			 * SOCK_RECV (one this ring does not own, rc == -1, worker-routed
+			 * below) overwrite last_recv_seq/last_recv_handle in between the
+			 * prefetched handle's own original serve and its retry, making
+			 * that retry's replay check compare against the wrong call and
+			 * miss the very case this fix exists for. */
+			if (rc != -1) {
+				last_recv_seq    = seq;
+				last_recv_handle = handle;
+			}
+
 			if (rc == -2) {
 				/* Armed for this handle but momentarily empty.  The pump is the
 				 * ONLY reader of this fd -- do NOT fall through and submit a

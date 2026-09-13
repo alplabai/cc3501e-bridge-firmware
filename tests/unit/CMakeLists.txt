@@ -91,6 +91,7 @@ set(FW_SOURCES
     ${FW}/src/protocol_ota.c
     ${FW}/src/worker.c
     ${FW}/src/event_ring.c
+    ${FW}/src/sock_recv_commit.c
     ${FW}/hal/cc3501e_hw_stub.c
 )
 
@@ -197,3 +198,22 @@ target_compile_options(test_sock_send_done PRIVATE ${TEST_FLAGS})
 target_link_options(test_sock_send_done PRIVATE -Wl,--wrap=cc3501e_hw_sock_send)
 target_link_libraries(test_sock_send_done PRIVATE ztest_shim)
 add_test(NAME sock_send_done COMMAND test_sock_send_done)
+
+# sock_recv_commit: the pure tail/uncommitted arithmetic behind the SOCK_RECV
+# lazy-commit fix (silent data loss on a CRC-rejected reply, host review).
+# Deliberately NOT built from FW_SOURCES: src/sock_recv_commit.c has no
+# dependency on the rest of the firmware (no protocol.c, no worker.c, no HAL)
+# by design -- see its own header for why it was split out exactly this way
+# -- and the actual ring it serves (hal/ti/cc3501e_hw_ti_sock.c's rx_ring)
+# needs the TI SimpleLink SDK and is never linked into a host build at all,
+# so this is the only piece of the fix host-testable full stop.
+add_executable(test_sock_recv_commit
+    sock_recv_commit/src/test_sock_recv_commit.c
+    ${FW}/src/sock_recv_commit.c
+)
+target_include_directories(test_sock_recv_commit PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_sock_recv_commit PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_recv_commit PRIVATE ztest_shim)
+add_test(NAME sock_recv_commit COMMAND test_sock_recv_commit)

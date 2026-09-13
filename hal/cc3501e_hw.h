@@ -366,8 +366,22 @@ void cc3501e_hw_sock_prefetch(uint16_t handle, bool on);
  * EXCLUSIVITY RULE (#7): exactly one code path may call lwip_* on a prefetched
  * fd, and for an armed handle that path is cc3501e_hw_sock_pump().  Falling
  * through to the worker's cc3501e_hw_sock_recv() on an armed-but-empty ring made
- * two readers race the same socket and silently dropped a chunk of the stream. */
-int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len);
+ * two readers race the same socket and silently dropped a chunk of the stream.
+ *
+ * @p replay -- LAZY-COMMIT (a CRC-rejected reply's bytes must survive a
+ * retry, see src/sock_recv_commit.h): true when the caller has determined
+ * THIS request is a byte-identical re-issue of the immediately preceding
+ * one (same header seq, same handle -- protocol_sockets.c's
+ * handle_sock_recv()), i.e. the host never collected the last reply and is
+ * asking again rather than moving on.  On a replay this re-serves the SAME
+ * bytes (or more, if new data arrived) instead of advancing past bytes the
+ * host may never have received; on a non-replay it first retires the
+ * previous call's served bytes, then serves the next unconsumed chunk. */
+int cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                              uint8_t  *buf,
+                              uint16_t  cap,
+                              bool      replay,
+                              uint16_t *out_len);
 
 /* --------------------------------------------------------------- */
 /* BLE 5.4 (v0.3)                                                    */

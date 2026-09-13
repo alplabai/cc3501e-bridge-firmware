@@ -466,4 +466,12 @@ extern uint32_t g_frames_err;
  * DEFINED there.  protocol_diag.c reads both for DIAG_GET_STATS. */
 extern uint32_t g_retry_latch_hits;
 
+/* The current request frame's 5-bit retry seq (protocol.c's
+ * s_current_req_seq, extracted once per protocol_dispatch() call -- see the
+ * comment there).  Exposed for protocol_sockets.c's handle_sock_recv(),
+ * which needs its own request-identity check (SOCK_RECV's lazy-commit
+ * replay detection) but is excluded from the generic retry latch above and
+ * carries no seq of its own in alp_cc3501e_sock_recv_t. */
+uint8_t protocol_current_req_seq(void);
+
 #endif /* CC3501E_BRIDGE_PROTOCOL_INTERNAL_H */

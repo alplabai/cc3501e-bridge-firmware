@@ -356,11 +356,16 @@ void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 	(void)on;
 }
 
-int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len)
+int cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                              uint8_t  *buf,
+                              uint16_t  cap,
+                              bool      replay,
+                              uint16_t *out_len)
 {
 	(void)handle;
 	(void)buf;
 	(void)cap;
+	(void)replay;
 	if (out_len != 0) *out_len = 0u;
 	return -1; /* no prefetch on the stub -- caller uses the worker path */
 }
