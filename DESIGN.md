@@ -249,8 +249,8 @@ half of the policy may run there:
 
 Running either inline did not merely fail: on silicon every preset returned `-4`
 and the bridge itself went to `PING -> -5`. Both are therefore latched by the ISR
-handler and drained by `cc3501e_hw_power_service()` from `cc3501e_hw_tick()`, core
-first then radio.
+handler (`pp_core_dirty` / `pp_radio_dirty`) and drained by
+`cc3501e_hw_power_service()` from `cc3501e_hw_tick()`, core first then radio.
 
 **The wire consequence: a `RESP_OK` to `POWER_POLICY` means QUEUED, not APPLIED** --
 the same semantic `OTA_BEGIN` turned out to have. The reply carries one data byte
@@ -260,8 +260,25 @@ accepted-and-applied policy from an accepted-and-silently-rejected one, which is
 exactly how a broken radio apply went unnoticed on the bench.
 
 `Wlan_Set()` is also rejected while the radio is down, so the latched policy is
-re-applied after `Wlan_RoleUp(STA)` succeeds; otherwise a policy set before Wi-Fi
-came up is dropped.
+re-applied once `Wlan_RoleUp(STA)` succeeds; otherwise a policy set before Wi-Fi
+came up is dropped.  The RADIO half of that re-apply is no longer only a
+tick-drained latch, though: `cc3501e_hw_wifi_ensure_sta_role()` calls
+`cc3501e_hw_power_apply_radio_now()` SYNCHRONOUSLY, on the same task, right after
+`Wlan_RoleUp(STA)` succeeds and before returning -- so an unconfigured STA's
+effective policy (PERFORMANCE/ACTIVE) is in place before `Wlan_Connect` starts
+association and the DHCP lease poll, not after the next `cc3501e_hw_tick()`.
+`cc3501e_hw_power_service()`'s drain still exists for an explicit host
+`POWER_POLICY` (which always runs from the ISR and must defer both halves,
+same as above) and, with no STA role up yet, `pp_apply_radio_effective()`
+skips calling `Wlan_Set()` at all rather than risk marking a policy applied
+that the vendor SDK's own `WLAN_SET_POWER_SAVE` path silently drops with no
+STA interface.  That skip does NOT leave anything latched for a later drain to
+retry -- `cc3501e_hw_power_service()` clears its dirty flag regardless of
+whether the apply underneath it actually ran.  The policy is not lost anyway:
+`cc3501e_hw_wifi_ensure_sta_role()` calls the same effective-policy apply
+UNCONDITIONALLY on every STA role-up, re-reading the latched policy VALUES
+fresh each time rather than depending on the flag, so the first role-up after
+a policy was set with no role up always applies it for real.
 
 > **[#1691](https://github.com/alplabai/alp-sdk/issues/1691):** repeated BLE
 > advertise/stop cycles can wedge the bridge. It is NOT power-related — it
