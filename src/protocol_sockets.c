@@ -32,8 +32,8 @@
  * does on BUSY/IO -- was indistinguishable, once the worker had already
  * finished the job and freed its slot, from a brand-new request:
  * handle_worker_routed_payload_reply()'s WORKER_IDLE edge submits whatever it
- * is handed.  For CMD_SOCK_SEND that meant a lost/misframed RESP_OK reply
- * caused the payload to be TRANSMITTED AGAIN.
+ * is handed.  For CMD_SOCK_SEND that meant a lost/misframed reply caused the
+ * payload to be TRANSMITTED AGAIN.
  *
  * protocol_spi.c solves the analogous problem for SPI1_TRANSFER by serving a
  * matching-seq retry straight out of the WORKER JOB SLOT.  That shape does
@@ -43,45 +43,91 @@
  * host collects it (see the comment there) -- an interleaved poll between a
  * send completing and its retry landing would silently defeat an in-slot
  * cache.  A dedicated static cache sidesteps that entirely, and it is cheap:
- * the send reply is a 2-byte queued-count, so this is 4 bytes of static RAM
- * (valid flag + seq + the 2 reply bytes), nothing like SPI1's 4 KB (see
- * protocol_spi.c's own note on that cost, offered as the upgrade path if a
- * host ever needs more than the single most-recent send cached).
+ * the reply is at most a 2-byte queued-count, so this is a handful of bytes
+ * of static RAM, nothing like SPI1's 4 KB (see protocol_spi.c's own note on
+ * that cost, offered as the upgrade path if a host ever needs more than the
+ * single most-recent send cached).
  *
- * FILLED FROM TWO PLACES.  handle_sock_send()'s own COLLECT below (a normal
- * poll that reaches WORKER_DONE) is one.  The other is
- * protocol_sock_send_on_worker_complete() further down -- worker.c's
- * worker_execute() calls it the INSTANT a SOCK_SEND job goes terminal, so
- * the cache is filled even if THIS handler never gets to collect it at all:
- * a DIFFERENT opcode's poll can discard an uncollected SOCK_SEND job via
- * worker_poll()'s orphan-discard arm before the host's own same-seq
- * re-issue ever arrives (host review, alp-sdk#2035-era) -- without the
- * completion-time fill, that re-issue would find nothing to collect AND
- * nothing cached, and queue the same bytes twice.  Both writers converge on
- * this SAME cache, so a lookup here does not need to know or care which one
- * filled it. */
-static bool    g_sock_send_cached;
-static uint8_t g_sock_send_seq;
-static uint8_t g_sock_send_reply[2];
+ * FILLED EXACTLY ONE WAY: protocol_sock_send_on_worker_complete() (further
+ * down), called from worker.c's worker_execute() the INSTANT a SOCK_SEND job
+ * reaches a terminal state -- DONE or ERR -- inside the SAME critical
+ * section that publishes job.state, strictly BEFORE it flips.  That ordering
+ * is what makes the cache authoritative before ANY poll, on any context, for
+ * any opcode, can first observe the job as terminal: even worker_poll()'s
+ * orphan-discard arm (a DIFFERENT opcode's poll throwing an uncollected
+ * SOCK_SEND job away) can never run ahead of the cache being filled (host
+ * review, alp-sdk#2035-era).  handle_sock_send() below never stores into
+ * this cache itself any more -- a same-seq poll always finds the
+ * completion-time entry FIRST, so a separate collect-time store would be
+ * unreachable dead code (confirmed by a reviewer mutation: neutering an
+ * earlier version of that store left every test green).
+ *
+ * BOTH OUTCOMES ARE CACHED, not just success: a same seq is BY DEFINITION a
+ * retry of the identical logical send (the host assigns it once per send,
+ * cc3501e_sock_send()), so whatever the first execution produced -- OK with
+ * a queued count, or a decoded ERR -- IS the correct answer for every later
+ * poll of that same seq.  lwIP can fail AFTER queueing (the SimpleLink SDK's
+ * api_msg.c has a real path where tcp_write() succeeds and a LATER
+ * tcp_output() still returns ERR_RTE, which the SDK's sockets.c surfaces as
+ * a plain failed send() despite bytes already having been written, and
+ * hal/ti/cc3501e_hw_ti_sock.c maps that to CC3501E_HW_ERR_IO) -- so treating
+ * ERR as "safe to just retry" would risk the SAME duplicate-bytes class this
+ * cache exists to prevent.  A cached ERR is therefore just as sticky as a
+ * cached OK.
+ *
+ * INVALIDATED ON A DIFFERENT SEQ (mirrors protocol.c's retry_latch_serve()'s
+ * "different seq: drop it" rule, issue #102): a request whose seq does NOT
+ * match what is cached proves the host has moved on to a new logical send,
+ * so handle_sock_send() drops the stale entry before anything else --
+ * unlike the generic latch (any worker-routed op's completion can refresh
+ * it), this cache only changes on a SOCK_SEND completion, so an old entry
+ * could otherwise survive indefinitely.  Safe because the host never
+ * re-issues an OLDER seq after a NEWER one, and cc3501e_sock_send()'s
+ * sock_busy serialises sends per ctx -- seq only ever moves forward (then
+ * wraps).
+ *
+ * RESIDUAL: SEQ-WRAP ALIASING, NOT FULLY CLOSED.  The cache is keyed on an
+ * 8-bit seq alone.  If 255 frames in a row fail to refresh it (no
+ * intervening SOCK_SEND completion under a DIFFERENT seq), the host's
+ * per-ctx counter wraps back to a value that is STILL cached, and a
+ * genuinely NEW send assigned that same seq is indistinguishable from a
+ * retry of the old one -- it would be answered the stale cached outcome
+ * WITHOUT EXECUTING.  Nothing narrower than a wider identity (more than 8
+ * bits) closes that; the different-seq invalidation above at least bounds
+ * the staleness window to "no different seq observed since", not
+ * "forever". */
+static volatile bool               g_sock_send_cached;
+static volatile uint8_t            g_sock_send_seq;
+static volatile alp_cc3501e_resp_t g_sock_send_status;
+static volatile uint8_t            g_sock_send_reply[2]; /* valid iff g_sock_send_status == OK */
 
-/* See worker.h for the full contract.  ERR is deliberately NOT cached: as
- * worker.c's own SOCK_SEND case shows (the `if (rv == CC3501E_HW_OK)` guard
- * around the ONLY place it ever fills the reply with a queued-byte count),
- * cc3501e_hw_sock_send() reports bytes queued ONLY on success -- a non-OK
- * @p hw_rv means NOTHING reached the socket.  Re-submitting the same
- * payload under the same seq after a discarded ERR is therefore a plain,
- * safe retry, not a duplicate-bytes hazard -- exactly how a COLLECTED ERR
- * already behaves today (the `if (st == ALP_CC3501E_RESP_OK)` guard in
- * handle_sock_send() below has only ever cached a success).  Caching ERR
- * here would be a behaviour change -- making a failed send's status sticky
- * across what is otherwise an ordinary resubmit -- that this fix does not
- * need to make. */
+/* Mirrors handle_worker_routed_payload_reply()'s WORKER_ERR mapping
+ * (protocol.c) byte-for-byte, so a cached ERR answers identically to what a
+ * genuine collect through that path would have produced.  SOCK_SEND's own
+ * HAL body (cc3501e_hw_sock_send) has not been observed to return
+ * CC3501E_HW_ERR_STATE -- that code is BLE_GATT_REGISTER / sock_listen's --
+ * but the mapping stays complete rather than assume it never will. */
+static alp_cc3501e_resp_t sock_send_hw_err_to_resp(int hw_rv)
+{
+	if (hw_rv == CC3501E_HW_ERR_NOTIMPL) return ALP_CC3501E_RESP_ERR_NOT_READY;
+	if (hw_rv == CC3501E_HW_ERR_INVAL) return ALP_CC3501E_RESP_ERR_INVALID;
+	if (hw_rv == CC3501E_HW_ERR_STATE) return ALP_CC3501E_RESP_ERR_STATE;
+	return ALP_CC3501E_RESP_ERR_RADIO;
+}
+
+/* See worker.h for the full contract.  Caches the FINAL outcome either way
+ * -- RESP_OK with the queued-count reply, or the decoded RESP_ERR_* -- see
+ * the cache block comment above for why a cached ERR is correct here, not
+ * merely tolerated. */
 void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t *data, size_t len)
 {
-	if (hw_rv != CC3501E_HW_OK) return;
-	if (len != sizeof(g_sock_send_reply)) return; /* defensive; worker.c always passes 2 */
-
-	memcpy(g_sock_send_reply, data, sizeof(g_sock_send_reply));
+	if (hw_rv == CC3501E_HW_OK) {
+		if (len != sizeof(g_sock_send_reply)) return; /* defensive; worker.c always passes 2 */
+		memcpy((void *)g_sock_send_reply, data, sizeof(g_sock_send_reply));
+		g_sock_send_status = ALP_CC3501E_RESP_OK;
+	} else {
+		g_sock_send_status = sock_send_hw_err_to_resp(hw_rv);
+	}
 	g_sock_send_seq    = seq;
 	g_sock_send_cached = true;
 }
@@ -168,16 +214,16 @@ alp_cc3501e_resp_t handle_sock_listen(const uint8_t *req,
 }
 
 /* SOCK_SEND (0x22): req = alp_cc3501e_sock_send_t (8 B) + data_len inline bytes.
- * Reply DATA = uint16_t LE queued-byte count.
+ * Reply DATA = uint16_t LE queued-byte count (RESP_OK only).
  *
  * req[3] is alp_cc3501e_sock_send_t.seq (v7; formerly `reserved`, always 0
  * through v6 -- see the wire-compat note on CC3501E_FW_IMPLEMENTS_PROTOCOL in
- * protocol_meta.c).  A retry of an already-completed send carries the SAME
- * seq (the host assigns it once per logical send, see alp-sdk's
- * cc3501e_sock_send()), so a matching seq is served from g_sock_send_reply
- * WITHOUT touching the worker at all -- no submit, no re-transmit.  Anything
- * else (a genuinely new send, or the very first one) falls through to the
- * worker-routed path unchanged, exactly as before this fix. */
+ * protocol_meta.c).  The host assigns it once per logical send
+ * (cc3501e_sock_send()), so a poll carrying that SAME seq is, by definition,
+ * the SAME logical send -- answered from the cache above WITHOUT touching
+ * the worker at all, whatever that send's outcome was (OK or a decoded
+ * ERR -- see the cache block's comment).  A DIFFERENT seq invalidates
+ * whatever was cached and falls through toward the worker-routed path. */
 alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
                                     size_t         req_len,
                                     uint8_t       *reply_data,
@@ -192,95 +238,93 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 	}
 
 	const uint8_t seq = req[3];
-	if (g_sock_send_cached && seq == g_sock_send_seq) {
-		if (reply_cap < sizeof(g_sock_send_reply)) return ALP_CC3501E_RESP_ERR_NO_MEM;
-		memcpy(reply_data, g_sock_send_reply, sizeof(g_sock_send_reply));
-		*reply_data_len = sizeof(g_sock_send_reply);
-		return ALP_CC3501E_RESP_OK;
+
+	/* A different seq than what is cached proves the host has moved on to a
+	 * new logical send; drop the stale entry here rather than leave it to
+	 * linger until some LATER send happens to overwrite it (see the cache
+	 * block's INVALIDATED ON A DIFFERENT SEQ comment above). */
+	if (g_sock_send_cached && seq != g_sock_send_seq) {
+		g_sock_send_cached = false;
 	}
 
-	/* STALE-SEND GUARD (mirrors protocol_spi.c's SPI1_TRANSFER seq check,
-	 * one level up): the cache above only catches a RETRY of a send this
-	 * handler already collected.  It does NOT catch the send this handler
-	 * never got to collect at all -- the host issued SOCK_SEND under seq A,
-	 * gave up on poll_by_repeat before the worker finished, and has now
-	 * moved on to a genuinely NEW send under seq B.  worker_poll() inside
+	if (g_sock_send_cached) {
+		/* This exact poll is what would once have reached
+		 * handle_worker_routed_payload_reply()'s own WORKER_DONE/WORKER_ERR
+		 * -> worker_reset() path -- now short-circuited by the cache hit
+		 * above.  Reclaim the slot here instead of leaving that to chance:
+		 * without it, a finished SOCK_SEND job would sit there, terminal,
+		 * until some UNRELATED opcode's poll happened to orphan-discard it
+		 * (worker_poll()'s own arm). */
+		(void)worker_reclaim_matching_terminal(
+		    ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), seq);
+		if (g_sock_send_status == ALP_CC3501E_RESP_OK) {
+			if (reply_cap < sizeof(g_sock_send_reply)) return ALP_CC3501E_RESP_ERR_NO_MEM;
+			memcpy(reply_data, (const void *)g_sock_send_reply, sizeof(g_sock_send_reply));
+			*reply_data_len = sizeof(g_sock_send_reply);
+		}
+		return g_sock_send_status;
+	}
+
+	/* STALE-JOB GUARD (mirrors protocol_spi.c's SPI1_TRANSFER seq check, one
+	 * level up): reaching here means this request's seq is NOT cached -- it
+	 * just invalidated whatever was cached above, or nothing ever was.  This
+	 * is either the very first SOCK_SEND ever, or the host has moved on to a
+	 * genuinely NEW send under a NEW seq while an OLDER send's job may still
+	 * be sitting in the worker slot: submitted, finished, but this handler
+	 * never got the chance to answer it before the host gave up on
+	 * poll_by_repeat.  worker_poll() inside
 	 * handle_worker_routed_payload_reply() below matches the job slot by
-	 * OPCODE ALONE, so without this check that call would hand seq A's
-	 * finished (but never collected, never cached) result back as if it
-	 * were seq B's -- RESP_OK plus seq A's queued-byte count -- and seq B's
+	 * OPCODE ALONE, so without this check that call would hand the OLD job's
+	 * finished result back as if it were THIS request's answer -- RESP_OK
+	 * (or a decoded ERR) plus the OLD send's own reply -- and THIS request's
 	 * actual payload would never be submitted to the worker at all.
 	 *
 	 * worker_discard_stale_terminal() ATOMICALLY compares the sitting job's
 	 * ORIGINALLY-submitted seq (worker.c's job.req at this same offset)
 	 * against THIS request's seq and, on a mismatch, evicts it -- one
 	 * critical section, so the compare-and-reset cannot race the drain/ISR
-	 * even in principle (see worker.h).  A terminal SOCK_SEND job whose own
-	 * seq differs from THIS request's is exactly the abandoned-seq-A case
-	 * above: evicting it here makes the fall-through below see WORKER_IDLE
-	 * and submit seq B fresh, instead of handle_worker_routed_payload_reply()
-	 * collecting seq A's stale answer.  A terminal job whose seq MATCHES
-	 * THIS request's own seq is left alone -- it is the ordinary
-	 * poll_by_repeat retry the fall-through below is meant to collect.
-	 * QUEUED/RUNNING is also left alone regardless of seq: there is no
-	 * terminal result yet for either seq to misclaim, so the fall-through
-	 * correctly reports BUSY.
+	 * even in principle (see worker.h).  QUEUED/RUNNING is left alone
+	 * regardless of seq: there is no terminal result yet for it to
+	 * misclaim, so the fall-through correctly reports BUSY.
 	 *
 	 * RESIDUAL, BOTH DIRECTIONS, STATED PLAINLY -- this narrows the failure
-	 * cc3501e-bridge-firmware#107's abandoned-seq-A scenario names, it does
+	 * cc3501e-bridge-firmware#107's abandoned-seq scenario names, it does
 	 * not close it to zero, and it is a TRADE, not a strict improvement:
 	 *
-	 *   - Once seq A's bytes are genuinely QUEUED into lwIP (the worker body
-	 *     ran, MSG_DONTWAIT accepted some or all of them), that queuing
-	 *     already happened -- evicting the sitting job here only stops this
-	 *     firmware from MISREPORTING seq A's outcome as seq B's, it cannot
-	 *     un-send bytes already handed to the socket.  The host's own
-	 *     post-timeout collect grace (alp-sdk#2035's cc3501e_sock_send(),
-	 *     chips/cc3501e/cc3501e_sockets.c) exists precisely to collect seq A
-	 *     before giving up; if that grace ALSO fails and the host then
-	 *     reissues the SAME remaining bytes under a NEW seq B, those bytes
-	 *     queue TWICE.  BEFORE this guard, that specific case -- host gives
-	 *     up, reissues under a new seq -- happened to come out RIGHT: seq
-	 *     B's request would collect seq A's stale OK/count instead of
+	 *   - Once an old send's bytes are genuinely QUEUED into lwIP (the
+	 *     worker body ran, MSG_DONTWAIT accepted some or all of them), that
+	 *     queuing already happened -- evicting the sitting job here only
+	 *     stops this firmware from MISREPORTING that outcome as THIS
+	 *     request's, it cannot un-send bytes already handed to the socket.
+	 *     The host's own post-timeout collect grace (alp-sdk#2035's
+	 *     cc3501e_sock_send(), chips/cc3501e/cc3501e_sockets.c) exists
+	 *     precisely to collect (and thereby cache) the old send before
+	 *     giving up; if that grace ALSO fails and the host then reissues the
+	 *     SAME remaining bytes under a NEW seq, those bytes queue TWICE.
+	 *     BEFORE this guard existed, that specific case -- host gives up,
+	 *     reissues under a new seq -- happened to come out RIGHT: the new
+	 *     request would collect the old send's stale OK/count instead of
 	 *     submitting, so the resend was silently swallowed rather than
 	 *     duplicated.  This guard trades that (wrong for every OTHER reason:
-	 *     seq B's own data is never sent, and a genuinely different send
-	 *     gets someone else's byte count) for the duplicate-bytes outcome
-	 *     above in this one narrow window.  No counter tracks how often
-	 *     either side fires; this paragraph is the only record of the trade.
+	 *     the new request's own data is never sent, and a genuinely
+	 *     different send gets someone else's byte count) for the
+	 *     duplicate-bytes outcome above in this one narrow window.  No
+	 *     counter tracks how often either side fires; this paragraph is the
+	 *     only record of the trade.
 	 *   - In the CC3501E_WIRE_CRC=OFF build the wire has no CRC trailer, so a
 	 *     single bit flip landing in req[3] on an ordinary retry reads as a
 	 *     DIFFERENT seq: this guard evicts the job's own still-good result
-	 *     and the fall-through submits again, queuing the same bytes twice.
+	 *     (and the cache-invalidation above drops its cached answer too) and
+	 *     the fall-through submits again, queuing the same bytes twice.
 	 *     SPI1_TRANSFER (protocol_spi.c) carries the identical exposure from
 	 *     its own req[3]-seq check under the same build option -- this is
 	 *     not a new class of risk, just the same one CRC-off already
-	 *     accepts, now shared by a second opcode.
-	 *
-	 * A THIRD path this guard alone does NOT close: a DIFFERENT opcode's poll
-	 * discarding THIS job (worker_poll()'s own orphan-discard arm) before the
-	 * host's own same-seq re-issue of THIS send ever arrives.  That is closed
-	 * separately -- see g_sock_send_cached's comment above and
-	 * protocol_sock_send_on_worker_complete() (worker.h) -- by filling the
-	 * cache at COMPLETION time, not only on collect, so a same-seq re-issue
-	 * still finds its answer even after this job has been discarded out from
-	 * under it. */
+	 *     accepts, now shared by a second opcode. */
 	(void)worker_discard_stale_terminal(
 	    ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), seq);
 
-	const alp_cc3501e_resp_t st = handle_worker_routed_payload_reply(
+	return handle_worker_routed_payload_reply(
 	    ALP_CC3501E_CMD_SOCK_SEND, req, req_len, 2u, reply_data, reply_cap, reply_data_len);
-	if (st == ALP_CC3501E_RESP_OK) {
-		/* The worker body (worker.c's ALP_CC3501E_CMD_SOCK_SEND case) always
-		 * publishes exactly 2 result bytes on success, so *reply_data_len is 2
-		 * here; cache defensively on the actual length anyway. */
-		if (*reply_data_len == sizeof(g_sock_send_reply)) {
-			memcpy(g_sock_send_reply, reply_data, sizeof(g_sock_send_reply));
-			g_sock_send_seq    = seq;
-			g_sock_send_cached = true;
-		}
-	}
-	return st;
 }
 
 /* SOCK_RECV (0x23): req = alp_cc3501e_sock_recv_t { handle | max_len } = 4 B.

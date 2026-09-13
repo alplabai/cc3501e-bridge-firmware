@@ -2,11 +2,13 @@
  * Copyright 2026 Alp Lab AB
  * SPDX-License-Identifier: Apache-2.0
  *
- * Unit test for worker.c's worker_discard_stale_terminal() (protocol_sockets.c's
- * SOCK_SEND stale-send guard): it must discard a same-opcode DONE/ERR job
- * tagged with a different request byte, but leave a QUEUED/RUNNING job
- * COMPLETELY ALONE regardless of that byte -- there is no terminal result
- * yet for anything to misclaim.
+ * Unit tests for worker.c's worker_discard_stale_terminal() and
+ * worker_reclaim_matching_terminal() (protocol_sockets.c's SOCK_SEND cache /
+ * stale-send guard): the first must discard a same-opcode DONE/ERR job
+ * tagged with a DIFFERENT request byte, the second must reclaim one tagged
+ * with a MATCHING byte, and both must leave a QUEUED/RUNNING job COMPLETELY
+ * ALONE either way -- there is no terminal result yet for anything to
+ * misclaim or reclaim.
  *
  * tests/unit/transport_spi/src/test_transport_spi.c and
  * tests/unit/sock_send_done/src/test_sock_send_done.c both link the
@@ -68,6 +70,64 @@ ZTEST(cc3501e_worker_seq, test_queued_sock_send_with_different_seq_stays_busy)
 	int8_t            err     = 0;
 	enum worker_state st      = worker_poll(ALP_CC3501E_CMD_SOCK_SEND, NULL, 0u, &out_len, &err);
 	zassert_equal(st, WORKER_QUEUED, "the QUEUED job is exactly where the submit left it");
+}
+
+/* worker_reclaim_matching_terminal()'s own correctness (the mirror image of
+ * worker_discard_stale_terminal(), added for protocol_sockets.c's cache-hit
+ * reclaim): direct, worker.c-level coverage, because NO wire-observable test
+ * can distinguish "reclaimed immediately at the cache hit" from "left
+ * sitting until some OTHER mechanism (a mismatched-seq discard, or an
+ * unrelated opcode's orphan-discard) cleans it up" -- both converge on the
+ * SAME final wire behaviour in every scenario this suite's sibling targets
+ * can construct, since every one of those other mechanisms already resets a
+ * stale terminal job as a side effect.  This test is what actually proves
+ * the reclaim helper's own match/mismatch/QUEUED logic, independent of
+ * whether any caller's wire-level effect happens to be redundant with it. */
+ZTEST(cc3501e_worker_seq, test_reclaim_matching_terminal)
+{
+	worker_init();
+
+	uint8_t req[9]                                   = { 0 };
+	req[offsetof(alp_cc3501e_sock_send_t, seq)]      = 5u;
+	req[offsetof(alp_cc3501e_sock_send_t, data_len)] = 1u;
+	req[sizeof(alp_cc3501e_sock_send_t)]             = 0x55u;
+
+	zassert_equal(worker_submit_payload(ALP_CC3501E_CMD_SOCK_SEND, req, (uint16_t)sizeof req),
+	              1,
+	              "submit accepts IDLE -> QUEUED");
+
+	/* Still QUEUED (CC3501E_WIFI: no auto-execute) -- reclaim must be a
+	 * no-op even though the seq WOULD match once terminal. */
+	zassert_equal(worker_reclaim_matching_terminal(
+	                  ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), 5u),
+	              0,
+	              "a QUEUED job is not reclaimed even on a matching seq");
+
+	/* Run the drain for real: the stub HAL's cc3501e_hw_sock_send() is
+	 * CC3501E_HW_ERR_NOTIMPL, so this takes the job to WORKER_ERR -- a
+	 * genuine terminal state, not a wire-level fake. */
+	worker_run_pending();
+
+	/* A MISMATCHED seq must not reclaim a terminal job -- same rule
+	 * worker_discard_stale_terminal() follows, just the opposite verdict. */
+	zassert_equal(worker_reclaim_matching_terminal(
+	                  ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), 6u),
+	              0,
+	              "a mismatched seq does not reclaim");
+	size_t out_len = 0;
+	int8_t err     = 0;
+	zassert_equal(worker_poll(ALP_CC3501E_CMD_SOCK_SEND, NULL, 0u, &out_len, &err),
+	              WORKER_ERR,
+	              "the job is still there, terminal, after the mismatched attempt");
+
+	/* The MATCHING seq reclaims it. */
+	zassert_equal(worker_reclaim_matching_terminal(
+	                  ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), 5u),
+	              1,
+	              "a matching seq reclaims the terminal job");
+	zassert_equal(worker_poll(ALP_CC3501E_CMD_SOCK_SEND, NULL, 0u, &out_len, &err),
+	              WORKER_IDLE,
+	              "reclaimed -> IDLE");
 }
 
 static void reset_worker(void *fixture)

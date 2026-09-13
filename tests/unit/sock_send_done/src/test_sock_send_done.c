@@ -20,13 +20,22 @@
  * a real WORKER_DONE (and therefore a real, cacheable RESP_OK) into an
  * ordinary code path this suite can drive over the wire.
  *
- * Covers the three DONE-path cases the plain stub suite cannot:
+ * Covers the DONE-path cases the plain stub suite cannot:
  *   - a DONE job with a different seq is discarded and the new send submits;
- *   - the SAME seq after a collect is served from the #88 cache (proven via
- *     g_worker_execs -- DIAG_GET_STATS -- NOT incrementing on the cache hit);
- *   - a NEW seq after a collect submits fresh (the ordinary case: the prior
- *     collect already reset the slot, so this is a sanity/regression check,
- *     not a case the guard itself has to do anything for).
+ *   - the SAME seq is served from the #88 cache -- filled at COMPLETION, not
+ *     collect (see protocol_sock_send_on_worker_complete(), worker.h) -- and
+ *     that same poll also RECLAIMS the terminal job sitting in the slot
+ *     (worker_reclaim_matching_terminal()), proven via g_worker_execs -- via
+ *     DIAG_GET_STATS -- NOT incrementing on the cache hit;
+ *   - a NEW seq, arriving after a CLEAN reclaim (not an abandoned job), finds
+ *     the slot genuinely IDLE and submits fresh -- a regression check that
+ *     the cache/reclaim machinery leaves the everyday case alone;
+ *   - a send orphan-discarded by an UNRELATED opcode's poll (before its own
+ *     same-seq re-issue arrives) still answers from the cache;
+ *   - a seq reused after a DIFFERENT seq was seen executes fresh rather than
+ *     being served the older, now-invalidated cache entry (the seq-wrap-
+ *     aliasing mitigation; see the cache block's own RESIDUAL comment for
+ *     what this does NOT close).
  */
 
 #include <stddef.h>
@@ -174,20 +183,24 @@ ZTEST(cc3501e_sock_send_done, test_stale_seq_is_discarded_and_new_send_submits)
 	build_send(send_a, 1u, 0xAAu);
 	build_send(send_b, 2u, 0xBBu);
 
-	/* Submit send_a and WALK AWAY -- no second transaction(send_a) to collect
-	 * it.  __wrap_cc3501e_hw_sock_send() makes the stub's synchronous submit
-	 * reach a REAL WORKER_DONE this time, but this handler's own ack is
-	 * always BUSY on the IDLE->QUEUED edge regardless, so that terminal DONE
-	 * is left sitting in the slot, never collected, never cached. */
+	/* Submit send_a and WALK AWAY -- no second transaction(send_a) to poll it
+	 * under its OWN seq.  __wrap_cc3501e_hw_sock_send() makes the stub's
+	 * synchronous submit reach a REAL WORKER_DONE this time, and
+	 * protocol_sock_send_on_worker_complete() caches it under seq 1
+	 * immediately -- but this handler's own ack is always BUSY on the
+	 * IDLE->QUEUED edge regardless, so that terminal DONE is left sitting IN
+	 * THE WORKER SLOT, uncollected, even though the CACHE already has it. */
 	transaction(send_a, sizeof send_a);
 	(void)drain(reply, sizeof reply);
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_a submits -> BUSY");
 
-	/* send_b: a genuinely different logical send.  Before this guard,
-	 * worker_poll() would match the slot by OPCODE ALONE and collect send_a's
-	 * abandoned DONE as send_b's own answer (RESP_OK + send_a's queued
-	 * count), with send_b's payload never submitted.  With the guard, the
-	 * seq mismatch (1 vs 2) discards send_a's DONE, so the fall-through
+	/* send_b: a genuinely different logical send under a DIFFERENT seq.
+	 * handle_sock_send() invalidates seq 1's cache entry (seq mismatch), so
+	 * the cache lookup misses; without the STALE-JOB GUARD below that,
+	 * worker_poll() would then match the slot by OPCODE ALONE and collect
+	 * send_a's abandoned DONE as send_b's own answer (RESP_OK + send_a's
+	 * queued count), with send_b's payload never submitted.  With the guard,
+	 * the seq mismatch (1 vs 2) discards send_a's DONE, so the fall-through
 	 * meets WORKER_IDLE and submits send_b fresh -> BUSY, not OK. */
 	transaction(send_b, sizeof send_b);
 	(void)drain(reply, sizeof reply);
@@ -217,9 +230,14 @@ ZTEST(cc3501e_sock_send_done, test_same_seq_after_collect_served_from_cache)
 	(void)drain(reply, sizeof reply);
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_c submits -> BUSY");
 
-	transaction(send_c, sizeof send_c); /* collect -- stores the #88 cache */
+	/* The cache was already filled at COMPLETION (during the submit call
+	 * above, before it even returned BUSY) -- this second, same-seq poll is
+	 * ITSELF a cache hit, not a "collect" through the generic worker-routed
+	 * helper any more.  worker_reclaim_matching_terminal() (called from
+	 * inside the cache-hit branch) is what frees the slot here. */
+	transaction(send_c, sizeof send_c);
 	(void)drain(reply, sizeof reply);
-	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "send_c collects -> OK, and caches");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "send_c's cache hit -> OK, and reclaims the slot");
 
 	const uint32_t execs_before = worker_execs();
 
@@ -247,16 +265,21 @@ ZTEST(cc3501e_sock_send_done, test_new_seq_after_collect_submits_fresh)
 
 	transaction(send_e, sizeof send_e);
 	(void)drain(reply, sizeof reply);
-	transaction(send_e, sizeof send_e); /* collect send_e -- resets the slot to IDLE */
+	/* send_e's own same-seq poll: a cache hit that ALSO reclaims the slot
+	 * (worker_reclaim_matching_terminal(), called from inside the cache-hit
+	 * branch) -- a CLEAN reclaim, not an abandoned job later orphan-
+	 * discarded by someone else. */
+	transaction(send_e, sizeof send_e);
 	(void)drain(reply, sizeof reply);
-	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "send_e collects -> OK");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "send_e's cache hit -> OK, and reclaims the slot");
 
-	/* send_f: a genuinely new send under a new seq, arriving AFTER a clean
-	 * collect (not an abandoned one).  The slot is already IDLE -- the prior
-	 * collect's own WORKER_DONE branch reset it -- so this is the ordinary
-	 * submit path, not a case the guard has to intervene in.  Kept as an
-	 * explicit regression check that the guard's presence does not perturb
-	 * the everyday collect-then-new-send cycle. */
+	/* send_f: a genuinely new send under a new seq, arriving AFTER that
+	 * clean reclaim.  The slot is already IDLE -- so this is the ordinary
+	 * submit path, not a case either guard has to intervene in (the cache
+	 * invalidates on the seq mismatch, and worker_discard_stale_terminal()
+	 * finds nothing to discard: job_cmd is no longer SOCK_SEND at all).
+	 * Kept as an explicit regression check that the cache/reclaim machinery
+	 * does not perturb the everyday clean-reclaim-then-new-send cycle. */
 	transaction(send_f, sizeof send_f);
 	(void)drain(reply, sizeof reply);
 	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_f submits fresh -> BUSY");
@@ -329,6 +352,62 @@ ZTEST(cc3501e_sock_send_done, test_orphan_discarded_send_still_answers_from_cach
 	              execs_before + 2u,
 	              "exactly two worker bodies ran total (send_g once, RSSI once); the cached "
 	              "re-issue did not run cc3501e_hw_sock_send() again");
+}
+
+/* Seq-wrap aliasing mitigation (see the cache block's INVALIDATED ON A
+ * DIFFERENT SEQ / RESIDUAL comments in protocol_sockets.c): the cache is
+ * keyed on an 8-bit seq alone, so if the host's per-ctx counter ever wraps
+ * back to a seq that is STILL cached, a genuinely new send assigned that
+ * same value must not be served the old, unrelated answer.  This does not
+ * reproduce a full 255-frame wrap (impractical here) -- it proves the
+ * NARROWER, always-true half of the mitigation: seq S cached, then a
+ * DIFFERENT seq T is seen (invalidating S's entry), then S is reused.  S
+ * must execute fresh, not be served ITS OWN stale answer from before T
+ * arrived.  Seq values chosen (20, 21) are not reused by any test above, so
+ * this is independent of suite execution order. */
+ZTEST(cc3501e_sock_send_done, test_seq_reused_after_a_different_seq_executes_not_cached)
+{
+	uint8_t reply[32];
+	uint8_t send_s[13];
+	uint8_t send_t[13];
+	build_send(send_s, 20u, 0xA1u); /* S */
+	build_send(send_t, 21u, 0xA2u); /* T, different */
+
+	/* Cache seq S (walk away -- uncollected, exactly like send_a/send_g
+	 * above, so S's job is still sitting in the slot too). */
+	transaction(send_s, sizeof send_s);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_s submits -> BUSY");
+
+	/* T arrives: invalidates S's cache entry (different seq) and, since S's
+	 * job is still uncollected in the slot, worker_discard_stale_terminal()
+	 * evicts it as stale before T submits fresh. */
+	transaction(send_t, sizeof send_t);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_t submits -> BUSY");
+
+	const uint32_t execs_before_reuse = worker_execs();
+
+	/* S again.  Were the cache still (incorrectly) keyed on S, this would be
+	 * served the OLD queued-count WITHOUT executing -- the seq-wrap-aliasing
+	 * hazard.  Because T's arrival already invalidated S's entry, this must
+	 * instead submit and genuinely execute. */
+	transaction(send_s, sizeof send_s);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "seq S, reused after a different seq was seen, submits fresh instead of "
+	              "being served the stale cached entry");
+
+	transaction(send_s, sizeof send_s); /* S's own new cache hit (+ reclaim) */
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(2u), "collect reply = header + status + 2B queued-count");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "seq S's re-execution answers its own new DONE");
+
+	zassert_equal(worker_execs(),
+	              execs_before_reuse + 1u,
+	              "seq S's reuse actually ran cc3501e_hw_sock_send() again, not served from "
+	              "the stale pre-T cache entry");
 }
 
 static void reset_worker(void *fixture)

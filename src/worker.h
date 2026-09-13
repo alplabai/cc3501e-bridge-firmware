@@ -153,22 +153,45 @@ void worker_reset(void);
 int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte);
 
 /*
+ * worker_reclaim_matching_terminal -- the mirror image of
+ * worker_discard_stale_terminal(): ATOMICALLY, in ONE critical section, if
+ * a TERMINAL (DONE/ERR) job for @p cmd is sitting in the slot AND the
+ * request byte it was originally submitted with at job.req[@p req_off]
+ * MATCHES @p req_byte (rather than differs), resets the worker to IDLE and
+ * returns 1.  Otherwise touches nothing and returns 0 -- including when
+ * the job is QUEUED/RUNNING, left alone regardless of @p req_byte for the
+ * same reason worker_discard_stale_terminal() leaves it alone: there is no
+ * terminal result yet for anything to reclaim.
+ *
+ * Needed because protocol_sock_send_on_worker_complete() (below) fills
+ * protocol_sockets.c's #88 cache BEFORE job.state flips (worker_execute()),
+ * so a poll carrying the SAME seq as a job that has just gone terminal
+ * finds the cache hit FIRST and never reaches
+ * handle_worker_routed_payload_reply()'s own WORKER_DONE/WORKER_ERR ->
+ * worker_reset() path any more -- that path used to be what freed the
+ * slot.  Without this, a finished SOCK_SEND job would sit in the slot,
+ * terminal, until some UNRELATED opcode's poll happened to orphan-discard
+ * it.  handle_sock_send() calls this right after a cache hit to reclaim
+ * the slot itself instead of leaving that to chance. */
+int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte);
+
+/*
  * protocol_sock_send_on_worker_complete -- SOCK_SEND-ONLY completion hook.
  * DEFINED in protocol_sockets.c (owner of the #88 seq-keyed reply cache:
- * g_sock_send_cached / g_sock_send_seq / g_sock_send_reply), CALLED from
- * HERE -- worker.c's worker_execute() -- the instant a SOCK_SEND job
- * reaches a terminal state, inside the SAME critical section that
- * publishes job.state (see worker_execute()).  That placement is load-
- * bearing, not cosmetic: it guarantees the cache entry for @p seq exists
- * BEFORE any poll, on any context, for any opcode, can first observe this
- * job as terminal -- so even worker_poll()'s orphan-discard arm (a
- * DIFFERENT opcode's poll throwing this uncollected job away) can never
- * run ahead of the cache being filled.  Closes the remaining duplicate-
- * bytes gap worker_discard_stale_terminal() alone does not: a SOCK_SEND
- * result that a different opcode's poll discards before the host's own
- * same-seq re-issue arrives used to leave that re-issue with nothing to
- * collect AND nothing cached (the #88 cache was filled only on collect),
- * so it re-submitted and queued the same bytes twice.
+ * g_sock_send_cached / g_sock_send_seq / g_sock_send_status /
+ * g_sock_send_reply), CALLED from HERE -- worker.c's worker_execute() --
+ * the instant a SOCK_SEND job reaches a terminal state, inside the SAME
+ * critical section that publishes job.state (see worker_execute()).  That
+ * placement is load-bearing, not cosmetic: it guarantees the cache entry
+ * for @p seq exists BEFORE any poll, on any context, for any opcode, can
+ * first observe this job as terminal -- so even worker_poll()'s orphan-
+ * discard arm (a DIFFERENT opcode's poll throwing this uncollected job
+ * away) can never run ahead of the cache being filled.  Closes the
+ * remaining duplicate-bytes gap worker_discard_stale_terminal() alone does
+ * not: a SOCK_SEND result that a different opcode's poll discards before
+ * the host's own same-seq re-issue arrives used to leave that re-issue with
+ * nothing to collect AND nothing cached (the #88 cache was filled only on
+ * collect), so it re-submitted and queued the same bytes twice.
  *
  * @p seq is the completed job's OWN request seq, read from job.req at the
  * wire offset alp_cc3501e_sock_send_t.seq occupies -- safe to read without
@@ -182,10 +205,20 @@ int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte)
  * everywhere else worker.c's callers already do it.  @p data / @p len are
  * the 2-byte queued-count reply, valid on CC3501E_HW_OK only.
  *
- * A non-OK @p hw_rv is NOT cached (see protocol_sockets.c's definition for
- * why: nothing was queued on failure, so re-submitting under the same seq
- * after a discarded ERR is a safe, ordinary retry, not a duplicate-bytes
- * hazard -- exactly how a COLLECTED ERR already behaves today). */
+ * BOTH OUTCOMES ARE CACHED -- a non-OK @p hw_rv is stored too, not skipped.
+ * A same seq is BY DEFINITION the same logical send (the host assigns one
+ * per send, cc3501e_sock_send()), so whatever the first execution produced
+ * is the correct, final answer for every later poll of that seq, ERR
+ * included: lwIP can fail AFTER queueing bytes (the SimpleLink SDK's
+ * api_msg.c has a real path where tcp_write() succeeds and a LATER
+ * tcp_output() still returns ERR_RTE, which the SDK's sockets.c surfaces as
+ * a plain failed send() despite bytes already having been written, and
+ * hal/ti/cc3501e_hw_ti_sock.c maps that to CC3501E_HW_ERR_IO) -- so treating
+ * a non-OK result as "safe to just retry" would risk duplicating those
+ * already-queued bytes, the exact class of bug this cache exists to
+ * prevent.  See protocol_sockets.c's definition for the HW-code mapping and
+ * the cache's own comment for the different-seq invalidation rule that
+ * keeps a stale entry from outliving its seq. */
 void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t *data, size_t len);
 
 /*

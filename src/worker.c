@@ -685,6 +685,22 @@ int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte)
 	return discarded;
 }
 
+int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte)
+{
+	const unsigned long key       = worker_critical_enter();
+	int                 reclaimed = 0;
+	if (job.job_cmd == cmd && (job.state == WORKER_DONE || job.state == WORKER_ERR) &&
+	    req_off < (size_t)job.req_len && job.req[req_off] == req_byte) {
+		job.state      = WORKER_IDLE;
+		job.job_cmd    = 0u;
+		job.result_len = 0u;
+		job.err        = 0;
+		reclaimed      = 1;
+	}
+	worker_critical_exit(key);
+	return reclaimed;
+}
+
 void worker_run_pending(void)
 {
 	/* Promote QUEUED -> RUNNING atomically so the ISR can't double-submit
