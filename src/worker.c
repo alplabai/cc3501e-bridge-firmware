@@ -955,16 +955,39 @@ void worker_run_pending(void)
 		 * CMD_WIFI_STATUS), so the host never collects their DONE/ERR through this
 		 * single-job slot.  Free the slot to IDLE here so a SUBSEQUENT connect can
 		 * submit -- otherwise the slot would stay DONE/ERR and the next CONNECT would
-		 * re-collect the stale result instead of starting a fresh association.  This
-		 * MUST happen BEFORE cc3501e_bridge_ready() below: once READY is HIGH the host
-		 * may clock a transaction, and a second CONNECT landing while the slot still
-		 * held this attempt's DONE/ERR would be collected as the new submit (returning
-		 * RESP_OK off the stale result, skipping mark_connecting -> a stale latch and
-		 * NO fresh association).  Resetting first makes the slot IDLE the instant the
-		 * host is allowed to clock, so any next CONNECT hits the IDLE edge (fresh
-		 * submit + mark_connecting).  All the other worker-routed ops (GET_MAC / SCAN /
-		 * RSSI / BLE) stay poll-by-repeat: the host collects their DONE/ERR, which
-		 * resets the slot in protocol.c (handle_worker_routed). */
+		 * re-collect the stale result instead of starting a fresh association.
+		 *
+		 * CORRECTED (2026-09-13): this used to say resetting here "MUST happen
+		 * BEFORE cc3501e_bridge_ready() below", as if THAT ordering were what
+		 * closes a stale-pickup race.  It is not, and by the time execution
+		 * reaches this line READY has typically ALREADY been raised.  The reinit
+		 * that set `rearmed` for this job -- either this cmd's own body
+		 * (WIFI_CONNECT_STA's SUCCESS path, cc3501e_hw_wifi_connect_sta) or the
+		 * drain's own reinit call just above -- goes through
+		 * bridge_transport_spi_hw_reinit() -> spi_open_and_arm() ->
+		 * arm_request_header() -> arm_transfer(), and arm_transfer() raises
+		 * READY itself, as a side effect, on a successful arm
+		 * (hal/ti/transport_hw_ti_spi.c ~572) -- independently of this
+		 * function's own `if (rearmed) cc3501e_bridge_ready();` a few lines
+		 * down.  On top of that, the SPI ISR's own per-transaction re-arm cycle
+		 * (on_transfer's re-arm on every SERVICED request) has typically already
+		 * raised READY more than once DURING the body, well before this point --
+		 * see the matching correction on cc3501e_hw_wifi_connect_sta()'s own
+		 * reinit comment for that case.  So a host CONNECT landing before this
+		 * reset had that opportunity before #106 and still does; this reset is
+		 * not what stands between it and a stale pickup.
+		 *
+		 * Resetting the slot HERE remains correct and worth keeping regardless
+		 * of READY timing: without it the slot stays DONE/ERR forever (nothing
+		 * ever polls CONNECT/AP_START to collect and clear it), which jams every
+		 * SUBSEQUENT connect attempt behind a stale result on slot occupancy
+		 * alone.  If the stale-CONNECT-pickup race ever needs closing for real,
+		 * the fix belongs in worker_execute()'s own publish critical section
+		 * (publish CONNECT/AP_START as IDLE there directly instead of DONE/ERR),
+		 * not in ordering this reset against cc3501e_bridge_ready().  All the
+		 * other worker-routed ops (GET_MAC / SCAN / RSSI / BLE) stay
+		 * poll-by-repeat: the host collects their DONE/ERR, which resets the
+		 * slot in protocol.c (handle_worker_routed). */
 		if (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA || cmd == ALP_CC3501E_CMD_WIFI_AP_START) {
 			worker_reset();
 		}
