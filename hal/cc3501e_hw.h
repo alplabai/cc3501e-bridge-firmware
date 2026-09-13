@@ -293,6 +293,19 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * (which never sees a real WLAN event), and what a fresh attempt reads until
  * it records one of its own.
  *
+ * FIRST REAL CODE WINS for a DISCONNECT specifically: it is recorded only
+ * while this value is still 0 for the attempt.  ASSOCIATION_REJECTED status
+ * 30 (WITH the AP's comeback-time IE) is non-terminal -- the vendor driver
+ * retries the association itself -- and a retry sequence that ultimately
+ * fails ends with a DISCONNECT carrying a generic, self-inflicted reason
+ * (802.11 reason 3, WLAN_REASON_DEAUTH_LEAVING, from the supplicant's own
+ * give-up path) that would otherwise overwrite the earlier, more specific
+ * rejection status with a less informative one.  ASSOCIATION_REJECTED /
+ * AUTHENTICATION_REJECTED are NOT given this same guard: each one is itself
+ * a real, specific status worth recording, even a later one differing from
+ * an earlier one in the same attempt, unlike a terminal DISCONNECT's generic
+ * closing reason.
+ *
  * This is an OBSERVABILITY byte: it is scoped to "was an attempt open when
  * this arrived", not to "did WE cause it".  A disconnect this firmware itself
  * issues while actually connected or mid-association (a host WIFI_DISCONNECT
@@ -323,10 +336,14 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * belonging to the prior attempt, not necessarily the current one.
  *
  * SCOPE: covers the CONNECT ATTEMPT only -- the reason or status that ENDED
- * or REJECTED that attempt.  Once an attempt reaches CONNECTED this value is
- * frozen; a deauth that arrives AFTER a successful CONNECTED does not update
- * it (there is no post-connect tracking here by design -- see the fuller note
- * on g_wifi_conn's `reason` field in hal/ti/cc3501e_hw_ti_wifi.c). */
+ * or REJECTED that attempt.  CONNECTED ALWAYS publishes 0, unconditionally --
+ * even if a since-succeeded retry left a transient rejection status (e.g. 30)
+ * recorded during the attempt: a CONNECTED attempt was neither ended nor
+ * rejected, so this byte must not carry a stale reject alongside it.  Once an
+ * attempt reaches CONNECTED this value is frozen at 0; a deauth that arrives
+ * AFTER a successful CONNECTED does not update it (there is no post-connect
+ * tracking here by design -- see the fuller note on g_wifi_conn's `reason`
+ * field in hal/ti/cc3501e_hw_ti_wifi.c). */
 int16_t cc3501e_hw_wifi_last_reason(void);
 
 /* --------------------------------------------------------------- */
