@@ -291,9 +291,22 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  *
  * "Non-user-initiated" excludes a DISCONNECT this firmware itself asked for
  * (the host's WIFI_DISCONNECT, or the #1437 stale-association cleanup after a
- * failed connect): the vendor hardcodes ReasonCode ==
- * WLAN_DISCONNECT_USER_INITIATED (200) for those, which is not a real 802.11
- * reason and must not overwrite one a REAL rejection already recorded. */
+ * failed connect).  This is tracked with a FIRMWARE-owned flag
+ * (wifi_own_disconnect_pending, hal/ti/cc3501e_hw_ti_wifi.c), not the vendor's
+ * own WlanEventDisconnect_t::IsStaIsDiscnctInitiator: the vendor only sets
+ * that flag (and hardcodes ReasonCode to WLAN_DISCONNECT_USER_INITIATED, 200)
+ * when its station state machine is idle at the time of the disconnect
+ * request.  A disconnect issued while actually connected or mid-association
+ * -- exactly the host-WIFI_DISCONNECT and #1437-cleanup cases this excludes
+ * -- routes through a different vendor path that sends a REAL 802.11 reason
+ * (WLAN_REASON_DEAUTH_LEAVING, 3) with the vendor's own flag left at 0,
+ * indistinguishable from an AP-initiated deauth without our own tracking.
+ *
+ * SCOPE: covers the CONNECT ATTEMPT only -- the reason or status that ENDED
+ * or REJECTED that attempt.  Once an attempt reaches CONNECTED this value is
+ * frozen; a deauth that arrives AFTER a successful CONNECTED does not update
+ * it (there is no post-connect tracking here by design -- see the fuller note
+ * on g_wifi_conn's `reason` field in hal/ti/cc3501e_hw_ti_wifi.c). */
 int16_t cc3501e_hw_wifi_last_reason(void);
 
 /* --------------------------------------------------------------- */

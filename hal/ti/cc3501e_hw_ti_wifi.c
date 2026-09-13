@@ -75,10 +75,13 @@ appControlBlock app_CB;
  * cc3501e_hw_wifi_last_reason() (both build variants, further down).  0 = none
  * recorded.  Declared UNCONDITIONALLY (unlike wifi_sta_role_up and friends,
  * which stay inside the #ifdef CC3501E_WIFI branch below): the connect-status
- * latch's mark_connecting() / wifi_conn_set() (also unconditional, so both ti
- * sub-builds link) read and clear it directly, so it must be visible in the
- * non-Wi-Fi ti build too, not just the real one that writes it from
- * wifi_event_cb(). */
+ * latch's cc3501e_hw_wifi_mark_connecting() (itself unconditional, further
+ * down, so both ti sub-builds link) reads and clears it directly, so it must
+ * be visible in the non-Wi-Fi ti build too, not just the real one that writes
+ * it from wifi_event_cb().  wifi_conn_set(), the other reader, stays
+ * CC3501E_WIFI-only -- unlike mark_connecting(), it has no reason to run (or
+ * even exist) without a real connect body to call it, and every one of its
+ * call sites is itself inside that same #ifdef. */
 static volatile int16_t wifi_last_reason;
 
 #ifdef CC3501E_WIFI
@@ -150,6 +153,17 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
+/* FIRMWARE-OWNED "we asked for this disconnect" flag -- set immediately before
+ * EVERY Wlan_Disconnect() this firmware issues (wifi_clear_stale_assoc() and
+ * cc3501e_hw_wifi_disconnect(), both below), consumed and cleared by the very
+ * next WLAN_EVENT_DISCONNECT in wifi_event_cb(), which must then leave
+ * wifi_last_reason alone.
+ *
+ * NOT the same thing as the vendor's WlanEventDisconnect_t::IsStaIsDiscnctInitiator
+ * -- see wifi_event_cb()'s DISCONNECT case for why that flag is unreliable for
+ * exactly the disconnects THIS flag exists to cover. */
+static volatile bool wifi_own_disconnect_pending;
+
 static void wifi_event_cb(WlanEvent_t *event)
 {
 	if (event == NULL) {
@@ -217,18 +231,32 @@ static void wifi_event_cb(WlanEvent_t *event)
 		/* A connect attempt that the FW rejects arrives as one of these three
 		 * rather than a negative CONNECT.Status; surface it as a failure. */
 		wifi_last_status = -1;
-		/* IsStaIsDiscnctInitiator == 1 means WE asked for this disconnect (the
-		 * host's explicit WIFI_DISCONNECT, or wifi_clear_stale_assoc()'s
-		 * cleanup Wlan_Disconnect() after a FAILED connect -- #1437) -- the
-		 * vendor hardcodes ReasonCode = WLAN_DISCONNECT_USER_INITIATED (200,
-		 * 0xC8) for that case (cme.c ~3298/~3335), which is not a real 802.11
-		 * reason and, worse, arrives ASYNCHRONOUSLY from the cleanup call, so
-		 * it could otherwise land here strictly after (and overwrite) a REAL
-		 * reason a REJECTED/DISCONNECT event already stashed for the SAME
-		 * attempt.  Skip it -- wifi_conn_set() below freezes whatever is here
-		 * at the terminal transition anyway, so a stale, skipped 200 also
-		 * cannot leak into a LATER attempt through this static. */
-		if (event->Data.Disconnect.IsStaIsDiscnctInitiator == 0u) {
+		/* Use OUR OWN wifi_own_disconnect_pending flag here, NOT the vendor's
+		 * WlanEventDisconnect_t::IsStaIsDiscnctInitiator -- that flag is only
+		 * set for a disconnect issued while the vendor's station state
+		 * machine is IDLE (cme.c ~3298/~3335: ReasonCode hardcoded to
+		 * WLAN_DISCONNECT_USER_INITIATED == 200, IsStaIsDiscnctInitiator = 1).
+		 * A disconnect WE issue while actually connected or mid-association --
+		 * a host WIFI_DISCONNECT while connected, or wifi_clear_stale_assoc()'s
+		 * #1437 cleanup after a FAILED connect that got as far as associating --
+		 * routes through CmeStationDisconnectKick() instead
+		 * (cme_station_flow.c ~548 -> cmeStaSendDisConnectedEventToApp() at
+		 * ~875), which sends ReasonCode = WLAN_REASON_DEAUTH_LEAVING (a real
+		 * 802.11 reason, 3) WITH IsStaIsDiscnctInitiator = 0 -- indistinguishable
+		 * from an AP-initiated deauth by the vendor's own flag.  Narrow but
+		 * real: a host WIFI_DISCONNECT immediately followed by a new connect
+		 * could otherwise have this delayed, vendor-flagged-as-unsolicited
+		 * event land after the new mark_connecting() and publish a stale 0x03
+		 * for the NEW attempt.
+		 *
+		 * wifi_own_disconnect_pending is set by every Wlan_Disconnect() caller
+		 * in this file regardless of which vendor path handles it, so it
+		 * covers both cases uniformly; the vendor flag is not consulted at all
+		 * any more.  Consumed (cleared) here -- exactly once per firmware-
+		 * issued disconnect -- so it cannot suppress a LATER, real event. */
+		if (wifi_own_disconnect_pending) {
+			wifi_own_disconnect_pending = false;
+		} else {
 			wifi_last_reason = event->Data.Disconnect.ReasonCode;
 		}
 		osi_SyncObjSignal(&wifi_event_sync);
@@ -592,10 +620,25 @@ int cc3501e_hw_get_mac(uint8_t mac[6])
  * at the moment it publishes a terminal state -- NOT a live mirror.  Freezing
  * matters because wifi_last_reason keeps moving after that: a FAILED connect's
  * cleanup (wifi_clear_stale_assoc(), called right after every wifi_conn_set()
- * on the failure paths) issues its own Wlan_Disconnect(), and the vendor's own
- * DISCONNECT event for that (ReasonCode == WLAN_DISCONNECT_USER_INITIATED,
- * cme.c:3298/3335) would otherwise land in wifi_last_reason AFTER the real
- * failure reason and overwrite it before CMD_WIFI_STATUS ever reads it. */
+ * on the failure paths) issues its own Wlan_Disconnect(), and its DISCONNECT
+ * event -- wifi_own_disconnect_pending suppresses the reason THAT event would
+ * otherwise stash (see wifi_event_cb()), but arrives asynchronously and could
+ * still land in wifi_last_reason strictly AFTER the real failure reason if
+ * this were a live mirror instead of a freeze.
+ *
+ * SCOPE: this byte covers the CONNECT ATTEMPT only -- the reason or status
+ * that ENDED or REJECTED that attempt (a DISCONNECT/REJECTED event that
+ * TERMINATES it, i.e. arrives while state is still CONNECTING).  Once a
+ * connect reaches CONNECTED, wifi_conn_set() has already frozen this field for
+ * that attempt and nothing calls it again for THAT association: a spontaneous,
+ * AP-initiated deauth arriving AFTER a successful CONNECTED updates the LIVE
+ * wifi_last_reason (wifi_event_cb() does not know or care whether anything is
+ * still waiting on it), but there is no listener left to freeze that update
+ * into g_wifi_conn.reason or to transition g_wifi_conn.state out of CONNECTED
+ * -- this firmware has no background watcher for a post-connect deauth today,
+ * on this byte or on state/fail_reason either.  That is a pre-existing gap in
+ * THIS firmware's async-latch design generally, not specific to this byte, and
+ * post-connect tracking is deliberately out of scope here. */
 static volatile struct {
 	uint8_t state;       /* alp_cc3501e_wifi_conn_state_t   */
 	uint8_t fail_reason; /* alp_cc3501e_wifi_fail_t          */
@@ -632,11 +675,12 @@ int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rs
 /* See the contract on the declaration in hal/cc3501e_hw.h.  ONE unconditional
  * definition (unlike cc3501e_hw_wifi_last_event_id()'s two, which mirror
  * wifi_started/wifi_sta_role_up's own #ifdef split): g_wifi_conn.reason is
- * itself unconditional storage (this struct, above) that only wifi_conn_set()
- * (also unconditional) ever writes, from the FROZEN copy of wifi_last_reason
- * described on g_wifi_conn's comment -- the non-Wi-Fi ti build never calls
- * wifi_conn_set() with a nonzero reason, so this naturally reads 0 there
- * without a separate hardcoded stub. */
+ * itself unconditional storage (this struct, above), and the only function
+ * that ever writes it -- wifi_conn_set(), from the FROZEN copy of
+ * wifi_last_reason described on g_wifi_conn's comment -- is CC3501E_WIFI-only.
+ * The non-Wi-Fi ti build has no wifi_conn_set() at all to write a nonzero
+ * value, so this naturally reads its zero-init 0 there without a separate
+ * hardcoded stub. */
 int16_t cc3501e_hw_wifi_last_reason(void)
 {
 	return g_wifi_conn.reason;
@@ -1000,6 +1044,9 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
 static void wifi_clear_stale_assoc(void)
 {
 	if (wifi_started) {
+		/* Arm BEFORE the call -- see wifi_own_disconnect_pending's declaration
+		 * and wifi_event_cb()'s DISCONNECT case. */
+		wifi_own_disconnect_pending = true;
 		(void)Wlan_Disconnect(WLAN_ROLE_STA, NULL);
 	}
 }
@@ -1334,6 +1381,12 @@ int cc3501e_hw_wifi_disconnect(void)
 	if (!wifi_started) {
 		return CC3501E_HW_OK; /* nothing to disconnect */
 	}
+	/* Arm BEFORE the call -- see wifi_own_disconnect_pending's declaration and
+	 * wifi_event_cb()'s DISCONNECT case: a disconnect issued while actually
+	 * connected routes through the vendor's non-idle path, which does NOT set
+	 * IsStaIsDiscnctInitiator, so this flag is the only reliable signal that
+	 * the DISCONNECT event about to fire was ours. */
+	wifi_own_disconnect_pending = true;
 	if (Wlan_Disconnect(WLAN_ROLE_STA, NULL) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
@@ -1396,21 +1449,31 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	 * Wlan_RoleUp(AP) below, so there is no window where beaconing could start
 	 * under a stale ELP/AUTO_PS setting.
 	 *
-	 * A related bug WAS found here, one level up: cc3501e_hw_ti_power.c's
-	 * effective-policy rule used to exclude AP from the unconfigured-default
-	 * override by testing cc3501e_hw_radio_role() != WIFI_AP -- and that role
-	 * getter reports AP over STA whenever BOTH are up.  So a scan/connect that
-	 * brought STA up WHILE this AP was already running read as "AP" there, took
-	 * the pp_policy_latched (BALANCED) branch instead of the unconfigured
-	 * default, and pulled THIS role's forced ALWAYS_ACTIVE back to BALANCED's
-	 * ELP/AUTO_PS the next time cc3501e_hw_tick() drained it -- fixed by gating
-	 * that function on the STA role being up directly (cc3501e_hw_wifi_sta_role_up())
-	 * instead of reading cc3501e_hw_radio_role().  With AP up and STA never
-	 * coming up, that drain never runs at all (pp_apply_radio_effective() now
-	 * requires an STA role up before calling pp_apply_radio()), so a host
-	 * CMD_POWER_POLICY sent while only this AP is running does not reach the
-	 * radio until a STA role also exists -- this Wlan_Set() call is what keeps
-	 * an AP-only bridge on ALWAYS_ACTIVE in that window regardless. */
+	 * Two related bugs WERE found here, one level up, in cc3501e_hw_ti_power.c:
+	 *   1. Its effective-policy rule used to exclude AP from the
+	 *      unconfigured-default override by testing cc3501e_hw_radio_role() !=
+	 *      WIFI_AP -- and that role getter reports AP over STA whenever BOTH
+	 *      are up.  So a scan/connect that brought STA up WHILE this AP was
+	 *      already running read as "AP" there, took the pp_policy_latched
+	 *      (BALANCED) branch instead of the unconfigured default.  Fixed by
+	 *      gating on the STA role being up directly
+	 *      (cc3501e_hw_wifi_sta_role_up()) instead of reading
+	 *      cc3501e_hw_radio_role().
+	 *   2. Even with (1) fixed, an EXPLICIT host CMD_POWER_POLICY of BALANCED /
+	 *      LOW_POWER / DEEP_SLEEP still applied verbatim -- pm is device-wide
+	 *      (ctrlCmdFw_SetSleepAuth has no per-role scoping), so that pulled
+	 *      THIS role's forced ALWAYS_ACTIVE back to ELP the next time
+	 *      cc3501e_hw_tick() drained it.  pp_apply_radio() now forces pm back
+	 *      to ALWAYS_ACTIVE unconditionally whenever AP is up, regardless of
+	 *      which policy (or who chose it) is otherwise being applied -- see
+	 *      its header comment.  ps (the STA-specific half) is unaffected and
+	 *      still follows the host's policy.
+	 * With AP up and STA never coming up, cc3501e_hw_tick()'s drain never runs
+	 * at all either way (pp_apply_radio_effective() requires an STA role up
+	 * before calling pp_apply_radio()), so a host CMD_POWER_POLICY sent while
+	 * only this AP is running does not reach the radio until a STA role also
+	 * exists -- this Wlan_Set() call is what keeps an AP-only bridge on
+	 * ALWAYS_ACTIVE in that window regardless. */
 	WlanPowerManagement_e pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE; /* = 0 */
 	(void)Wlan_Set(WLAN_SET_POWER_MANAGEMENT, (void *)&pm);
 
