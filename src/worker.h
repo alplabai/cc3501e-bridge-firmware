@@ -70,14 +70,6 @@ extern volatile uint32_t g_worker_execs;
  * (GET_MAC / scan / ble); jobs that carry a request payload use
  * worker_submit_payload() instead.
  *
- * @p seq is the request frame's identity (protocol.c's s_current_req_seq,
- * the 5-bit flags-byte retry seq, proto v8) -- tagged onto the job so a
- * LATER poll carrying the same opcode but a DIFFERENT seq cannot collect
- * THIS job's result (see worker_poll).  Callers with no request identity of
- * their own pass whatever their caller extracted (including
- * ALP_CC3501E_REQ_SEQ_NONE); this file attaches no meaning to the value
- * beyond equality.
- *
  * Returns 1 if the job was accepted (state IDLE -> QUEUED), 0 if the
  * worker was busy (a different/earlier job is still in flight).
  *
@@ -85,7 +77,7 @@ extern volatile uint32_t g_worker_execs;
  * SYNCHRONOUSLY here so the result is immediately available on the next
  * poll -- this keeps native_sim ztests deterministic with no main loop.
  */
-int worker_submit(uint8_t cmd, uint8_t seq);
+int worker_submit(uint8_t cmd);
 
 /*
  * worker_submit_payload -- like worker_submit, but for a job that carries a
@@ -93,31 +85,17 @@ int worker_submit(uint8_t cmd, uint8_t seq);
  * alp_cc3501e_wifi_connect_t header + inline ssid + psk).  @p payload / @p len
  * are copied into a worker-owned buffer so the drain can run the blocking
  * association off the SPI ISR.  @p len must be <= ALP_CC3501E_MAX_PAYLOAD and
- * is expected to be validated by the caller.  @p seq -- see worker_submit.
- * Same IDLE->QUEUED accept / busy semantics and synchronous-stub behaviour as
- * worker_submit.
+ * is expected to be validated by the caller.  Same IDLE->QUEUED accept / busy
+ * semantics and synchronous-stub behaviour as worker_submit.
  */
-int worker_submit_payload(uint8_t cmd, uint8_t seq, const uint8_t *payload, uint16_t len);
+int worker_submit_payload(uint8_t cmd, const uint8_t *payload, uint16_t len);
 
 /*
  * worker_poll -- read back a completed job's result WITHOUT blocking.
  * Safe to call from the SPI ISR.  Only succeeds when a DONE/ERR job
- * matching @p cmd AND @p seq is present.
+ * matching @p cmd is present.
  *
  *   cmd      -- the opcode the caller expects the in-flight job to be.
- *   seq      -- the polling request's own identity (see worker_submit).  A
- *               same-opcode DONE/ERR job tagged with a DIFFERENT seq is a
- *               finished result nobody still waiting can claim -- the host
- *               that owned it gave up (its poll_by_repeat deadline expired)
- *               before collecting, and this poll is a NEW logical command
- *               that only happens to share the opcode.  Handing it that
- *               stale answer would skip ever submitting the new request (see
- *               the worker.c comment on this arm for the concrete SOCK_SEND
- *               failure this closes).  Treated exactly like the different-
- *               opcode orphan below: discarded, IDLE reported, so the new
- *               request submits fresh.  A QUEUED/RUNNING job is still
- *               genuinely in flight regardless of seq -- only a TERMINAL
- *               result needs an owner to claim it.
  *   out      -- buffer for the result bytes (DONE only).
  *   out_cap  -- capacity of @p out.
  *   out_len  -- [out] bytes written to @p out.
@@ -128,15 +106,12 @@ int worker_submit_payload(uint8_t cmd, uint8_t seq, const uint8_t *payload, uint
  *                   MUST then reset the worker (worker_reset) so the next
  *                   command can submit.
  *   WORKER_ERR   -- job failed; err set.  Caller resets too.
- *   WORKER_QUEUED/WORKER_RUNNING -- still in flight (caller replies BUSY),
- *                   whatever @p seq is.
- *   WORKER_IDLE  -- no job, a job for a DIFFERENT cmd is in flight, or a
- *                   terminal same-cmd job tagged with a DIFFERENT seq was
- *                   just discarded (all three: caller treats it as
- *                   "submit/BUSY", see protocol.c).
+ *   WORKER_QUEUED/WORKER_RUNNING -- still in flight (caller replies BUSY).
+ *   WORKER_IDLE  -- no job, or a job for a DIFFERENT cmd is in flight
+ *                   (caller treats both as "submit/BUSY", see protocol.c).
  */
 enum worker_state
-worker_poll(uint8_t cmd, uint8_t seq, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *err);
+worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *err);
 
 /* Return the worker to IDLE after the host has consumed a DONE/ERR result
  * (or to abandon a job).  Called from protocol.c once a GET_MAC poll has
