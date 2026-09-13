@@ -171,7 +171,7 @@ alp_cc3501e_resp_t handle_wifi_get_ip(const uint8_t *req,
 }
 
 /* WIFI_STATUS (0x1B): reply data = alp_cc3501e_wifi_status_t
- * { state(1) | fail_reason(1) | rssi_dbm(int8) | reserved(1) }.  A NON-BLOCKING
+ * { state(1) | fail_reason(1) | rssi_dbm(int8) | last_reason(1) }.  A NON-BLOCKING
  * read of the firmware connection-status latch (no radio op -- safe in the SPI
  * ISR), so the host can collect an async connect outcome without poll-by-repeat
  * on WIFI_CONNECT_STA (which clocked the bridge while the radio op held it down).
@@ -181,13 +181,16 @@ alp_cc3501e_resp_t handle_wifi_get_ip(const uint8_t *req,
  * measurement and the host must not present it as one -- WIFI_GET_RSSI (0x16) is
  * the only real read.  Issue #1387.
  *
- * reserved is the low byte of cc3501e_hw_wifi_last_reason(): the IEEE 802.11
- * reason code from THIS attempt's last non-user-initiated DISCONNECT, or the
- * status code from an ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED, 0
- * meaning none recorded -- see the full contract on the declaration in
- * hal/cc3501e_hw.h.  Additive: the host already decodes this byte into
- * alp_cc3501e_wifi_status_t::reserved verbatim (alp-sdk's
- * chips/cc3501e/cc3501e_wifi.c) with no assumed meaning yet -- <alp/protocol/
+ * last_reason (formerly `reserved`) is the low byte of
+ * cc3501e_hw_wifi_last_reason(): the IEEE 802.11 reason code from THIS
+ * attempt's last non-user-initiated DISCONNECT, or the status code from an
+ * ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED, 0 meaning none recorded --
+ * see the full contract on the declaration in hal/cc3501e_hw.h.  Additive:
+ * the host already decodes this byte into
+ * alp_cc3501e_wifi_status_t::last_reason (formerly `reserved`) verbatim
+ * (alp-sdk's chips/cc3501e/cc3501e_wifi.c; the field rename itself is
+ * feat/cc3501e-wifi-status-reason, not yet merged) with no assumed meaning
+ * yet -- <alp/protocol/
  * cc3501e.h> itself calls the byte's meaning "open; neither is decided here"
  * -- so giving it one needs no wire-version bump and does not change this
  * firmware's wire vectors (they carry no WIFI_STATUS case).  The alp-sdk

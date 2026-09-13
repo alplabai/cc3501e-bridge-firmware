@@ -257,9 +257,9 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 /* No radio on the host stub, so no real WLAN event ever fires -- default 0
  * ("none recorded", see the contract in hal/cc3501e_hw.h).  Settable ONLY by
  * cc3501e_hw_wifi_test_set_last_reason() below, which exists purely so the host
- * suite (tests/unit) can exercise CMD_WIFI_STATUS's reserved-byte plumbing
- * (protocol_wifi.c) without a silicon-only vendor event -- not part of the
- * cc3501e_hw.h contract and not declared there.  Cleared by
+ * suite (tests/unit) can exercise CMD_WIFI_STATUS's last_reason-byte plumbing
+ * (formerly named `reserved`; protocol_wifi.c) without a silicon-only vendor
+ * event -- not part of the cc3501e_hw.h contract and not declared there.  Cleared by
  * cc3501e_hw_wifi_mark_connecting() below, mirroring the real TI backend's
  * contract (hal/cc3501e_hw.h): the published byte must read 0 for a fresh
  * attempt unless THAT attempt records a reason of its own. */

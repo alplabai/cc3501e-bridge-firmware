@@ -276,9 +276,11 @@ void cc3501e_hw_wifi_mark_connecting(void);
 int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rssi_dbm);
 
 /* The reason/status code for THIS connect attempt, for CMD_WIFI_STATUS's
- * reserved byte -- see @ref alp_cc3501e_wifi_status_t::reserved in
- * <alp/protocol/cc3501e.h> (that header's own byte-meaning update is a
- * separate host-side alp-sdk PR; this is the firmware half only).
+ * last_reason byte -- see @ref alp_cc3501e_wifi_status_t::last_reason
+ * (formerly `reserved`) in <alp/protocol/cc3501e.h> (that header's own
+ * rename + byte-meaning update is a separate host-side alp-sdk PR --
+ * feat/cc3501e-wifi-status-reason, not yet merged; this is the firmware
+ * half only).
  *
  * Exactly: the low byte of the IEEE 802.11 reason code from a DISCONNECT, or
  * the status code from an ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED,

@@ -1544,7 +1544,8 @@ ZTEST(cc3501e_bridge_transport, test_wifi_status_publishes_stashed_reason_byte)
 	 * handle_wifi_status()'s top comment, protocol_wifi.c) -- one transaction
 	 * resolves it, no worker submit/poll dance.
 	 *
-	 * Asserting the reserved byte against a hardcoded 0 would pass even if
+	 * Asserting the last_reason byte (formerly `reserved`) against a hardcoded
+	 * 0 would pass even if
 	 * handle_wifi_status() dropped cc3501e_hw_wifi_last_reason() entirely (the
 	 * stub defaults to 0, "none recorded"), so this drives a REAL nonzero value
 	 * through the test-only stub hook first, to actually exercise the plumbing
@@ -1554,13 +1555,13 @@ ZTEST(cc3501e_bridge_transport, test_wifi_status_publishes_stashed_reason_byte)
 
 	transport_spi_init();
 
-	/* Baseline: nothing recorded yet -> reserved byte 0. */
+	/* Baseline: nothing recorded yet -> last_reason byte 0. */
 	transaction(status_req, sizeof status_req);
 	size_t n = drain(reply, sizeof reply);
 	zassert_equal(n, reply_wire(4u), "WIFI_STATUS reply is header + status + 4 data bytes");
 	assert_reply_header(reply, ALP_CC3501E_CMD_WIFI_STATUS, 5u);
 	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "WIFI_STATUS -> RESP_OK");
-	zassert_equal(reply[8], 0x00u, "no reason recorded yet -> reserved byte 0");
+	zassert_equal(reply[8], 0x00u, "no reason recorded yet -> last_reason byte 0");
 
 	/* 0x0208: a value that is NOT already a clean single byte by accident, so a
 	 * truncate-to-low-byte bug (e.g. an accidental sign-extend to 0xFFFF or a
@@ -1571,7 +1572,7 @@ ZTEST(cc3501e_bridge_transport, test_wifi_status_publishes_stashed_reason_byte)
 	n = drain(reply, sizeof reply);
 	zassert_equal(n, reply_wire(4u), "WIFI_STATUS reply is header + status + 4 data bytes");
 	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "WIFI_STATUS -> RESP_OK");
-	zassert_equal(reply[8], 0x08u, "reserved byte carries the stashed reason's LOW byte");
+	zassert_equal(reply[8], 0x08u, "last_reason byte carries the stashed reason's LOW byte");
 
 	/* Reset the TU-static latch so a later test never inherits this value --
 	 * same discipline as reset_worker() below. */
