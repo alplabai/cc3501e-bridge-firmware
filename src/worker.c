@@ -786,11 +786,30 @@ void worker_run_pending(void)
 		 *      made false -- and a well-meaning cleanup of that stale line would have
 		 *      restored the drain's re-init and silently reverted the fix.
 		 *
-		 * WIFI_DISCONNECT WAS in this list and has been REMOVED: its HAL body
-		 * cc3501e_hw_wifi_disconnect() contains NO re-init at all -- it calls
-		 * Wlan_Disconnect() and returns -- so skipping the drain's left a Wlan_* radio
-		 * op with no SPI re-sync from either side, which is the exact gap the skip was
-		 * introduced to avoid double-paying.  It now takes the drain's re-init. */
+		 * WIFI_DISCONNECT WAS in this list, was REMOVED for the reason below, and
+		 * (#106 run9) is BACK ON IT below under wifi_disconnect -- for a THIRD,
+		 * different reason than either the old entry or the removal.  History,
+		 * kept rather than deleted:
+		 *
+		 * It was in this list once already, asserting (like BLE_SCAN_STOP /
+		 * BLE_DISCONNECT) that its body ALREADY reinit.  It did not: its HAL
+		 * body cc3501e_hw_wifi_disconnect() contains NO re-init at all -- it
+		 * calls Wlan_Disconnect() and returns -- so skipping the drain's left a
+		 * Wlan_* radio op with no SPI re-sync from either side, which is the gap
+		 * the removal fixed.  It then took the drain's re-init unconditionally.
+		 *
+		 * CORRECTED (2026-09-14, #106 run9): that removal's premise -- that
+		 * EVERY Wlan_* call needs a re-sync from somewhere, body or drain, or
+		 * else there is "a gap" -- is the same "every Wlan_* kills the DMA"
+		 * assumption the RSSI source audit already refuted for Wlan_Get.  Traced
+		 * the same way for Wlan_Disconnect (see wifi_disconnect below): its
+		 * synchronous execution posts an RTOS message and returns, touching no
+		 * DMA/SPI/interrupt-mask at all, so there was never a "gap" to close on
+		 * that call in the first place -- paying the drain's reinit after it is
+		 * the SAME destructive no-op the socket/SPI1 groups warn about, not a
+		 * fix for a real one.  The 2026-09-14 exemption below does not repeat
+		 * the earlier bug (a static "body already reinit" claim that was false):
+		 * it rests on "body makes no DMA-affecting call", sourced this time. */
 		/* KEEPING THIS LIST IN SYNC IS MANUAL, AND IT HAS ALREADY DRIFTED ONCE (#61).
 		 * The predicate below restates, here, a fact that actually lives in each HAL
 		 * body -- whether that body calls bridge_transport_spi_hw_reinit().  Nothing
@@ -814,6 +833,16 @@ void worker_run_pending(void)
 		 * cc3501e_hw_sock_* or cc3501e_hw_spi1_* body picking up a Wlan_Get gets
 		 * the same pass for free -- that would need its own measurement, same as
 		 * this one.
+		 *
+		 * WIFI_DISCONNECT (#106 run9) straddles BOTH facts rather than fitting
+		 * either alone: cc3501e_hw_wifi_disconnect() makes NO Wlan_* call at all
+		 * when Wi-Fi was never started (the socket/SPI1 fact, unconditionally
+		 * true for that branch), and when it WAS started its one Wlan_Disconnect()
+		 * call is sourced safe the same way WIFI_GET_RSSI's Wlan_Get is (see
+		 * wifi_disconnect below) -- unlike RSSI, that source trace found NO DMA
+		 * traffic on the call at all, not merely DMA traffic proven not to
+		 * collide.  Re-check wifi_disconnect's own comment, not this paragraph,
+		 * if Wlan_Disconnect's implementation ever changes.
 		 *
 		 * WIFI_CONNECT_STA has TWO body reinits, and only the SECOND one changed
 		 * this list.  The FIRST (between the STA role-up and Wlan_Connect, gated on
@@ -944,8 +973,70 @@ void worker_run_pending(void)
 		    (cmd == ALP_CC3501E_CMD_WIFI_GET_RSSI) &&
 		    cc3501e_hw_wifi_get_rssi_take_reinit_skip(&rssi_already_started);
 		const bool rssi_read = rssi_reported_skip && rssi_already_started;
+		/* WIFI_DISCONNECT (#106 run9) is its OWN group too, exempt for a
+		 * DIFFERENT reason than RSSI even though both call one Wlan_* function.
+		 * Its HAL body (cc3501e_hw_wifi_disconnect, hal/ti/cc3501e_hw_ti_wifi.c)
+		 * calls Wlan_Disconnect(WLAN_ROLE_STA, NULL) directly -- no lazy_start(),
+		 * no Wlan_Start(), no role-up, so there is no RSSI-style "first radio op
+		 * of the boot already tried and threw away its own reinit result" hazard
+		 * to gate against; if Wi-Fi was never started this body returns OK with
+		 * NO Wlan_* call at all (checked: `if (!wifi_started) return
+		 * CC3501E_HW_OK;`), which is exactly the "body makes no Wlan_* call"
+		 * shape the socket/SPI1 groups already rest on.  So unlike RSSI this
+		 * exemption is UNCONDITIONAL -- there is no runtime handoff, because
+		 * there is no branch where skipping would be wrong.
+		 *
+		 * When Wi-Fi WAS started, Wlan_Disconnect() -> CME_WlanDisconnect() is
+		 * traced against the SDK source the same way the RSSI audit traced
+		 * Wlan_Get (TI SimpleLink Wi-Fi SDK 10.10.01.08,
+		 * source/ti/net/wifi_stack/): app_entry/wlan_if.c's Wlan_Disconnect()
+		 * (STA path) calls cme/cme.c's CME_WlanDisconnect(), which builds a
+		 * cmeMsg_t and calls pushMsg2Queue() -> osi_MsgQWrite() ->
+		 * MessageQueueP_post() -- an RTOS message-queue post, synchronously
+		 * returning once queued.  The actual disconnect radio work runs LATER,
+		 * asynchronously, on the CME task that drains that queue -- outside
+		 * this function's (and this worker job's) synchronous window entirely.
+		 * The only other calls on this path, set_cond_in_process_wlan_
+		 * discconnect()/set_finish_wlan_disconnect() (wlan_if.c), take
+		 * wlan_if_lock()/unlock(), which is osi_LockObjLock -- the same mutex
+		 * primitive (SemaphoreP_pend in this build's linked adaptation layer,
+		 * see hal/ti/transport_hw_ti_spi.c's dated correction) already audited
+		 * for RSSI, not an interrupt mask.  So Wlan_Disconnect()'s SYNCHRONOUS
+		 * execution touches no DMA, no SPI, and no interrupt masking at all --
+		 * a stronger case than RSSI's, whose Wlan_Get is fully synchronous DMA
+		 * traffic on channel 11 (merely proven not to collide with the bridge's
+		 * channels 12/13).  Here there is no DMA traffic on this path to begin
+		 * with.
+		 *
+		 * #106 run9 (GPE 0.254.9.0, e1m-aen-evk-01): WIFI_DISCONNECT hung ~10 s
+		 * then the link returned -4/-5 on 3 of 11 calls -- C-01 (a NON-associated
+		 * boot), C-03 (after a successful association), P2-03 (the socket-
+		 * throughput app's final disconnect); the other 8 succeeded.  Consistent
+		 * with the SAME mechanism as every other exemption in this file: the
+		 * drain's SPI_close/SPI_open lands 1-15 ms after submit, inside the
+		 * host's dense poll window, and desyncs the transport -- not a DMA
+		 * collision from the disconnect call itself, which the trace above shows
+		 * never reaches the DMA at all.
+		 *
+		 * FALSIFIER: if Wlan_Disconnect has some OTHER path to the slave's DMA
+		 * this trace missed (e.g. via the async CME-task processing later, or a
+		 * side effect this trace did not follow), wedges will move to the op
+		 * AFTER a successful disconnect, or a disconnect itself will still wedge
+		 * with this skip in place.  Not yet observed; open to a future bench
+		 * run, same as the RSSI skip's own falsifier above.
+		 *
+		 * WIFI_AP_STOP (Wlan_RoleDown) and GET_MAC (lazy_start + a Wlan_Get, the
+		 * same shape as RSSI) are UNMEASURED candidates for this same class of
+		 * exemption and are deliberately left OFF this list and untouched here --
+		 * neither has a source trace or a bench run behind it yet.
+		 *
+		 * See "WIFI_DISCONNECT WAS in this list and has been REMOVED" above for
+		 * why it was taken OFF this list once already, and the 2026-09-14 note
+		 * appended there on why that removal's premise does not hold either. */
+		const bool wifi_disconnect = (cmd == ALP_CC3501E_CMD_WIFI_DISCONNECT);
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
-		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read) {
+		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read &&
+		    !wifi_disconnect) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}
