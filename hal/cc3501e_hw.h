@@ -324,7 +324,13 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * cleared twice for a new attempt -- once by cc3501e_hw_wifi_mark_connecting()
  * at submit, and again by cc3501e_hw_wifi_connect_sta() immediately before its
  * own Wlan_Connect (hal/ti/cc3501e_hw_ti_wifi.c) -- but neither reset is the
- * exact instant the vendor begins processing that new connect.  A late event
+ * exact instant the vendor begins processing that new connect.  A THIRD such
+ * reset happens for the SAME attempt if cc3501e_hw_wifi_connect_sta()'s RUN9
+ * bounded retry fires (reason 30, see that function's own comment): the retry
+ * re-issues Wlan_Connect once, and clears this value again immediately
+ * before doing so, so a caller observing this byte mid-attempt cannot tell
+ * a first try from a retried one -- only the FINAL value, once the attempt
+ * reaches a terminal state or CONNECTED, is meaningful.  A late event
  * from the PREVIOUS attempt (still in flight on the host-driver thread) that
  * lands in the tiny window between that second reset and the vendor actually
  * processing the new connect can still be recorded against the new one.  Not
