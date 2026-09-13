@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include <ti/drivers/Power.h> /* Power_setConstraint/Policy (pulls PowerWFF3.h via DeviceFamily_CC35XX) */
+#include <ti/drivers/dpl/HwiP.h> /* HwiP_disable/HwiP_restore -- the dirty-flag critical section (#7) */
 
 #ifdef CC3501E_WIFI
 #include <wlan_if.h> /* Wlan_Set -- the RADIO half of the power policy */
@@ -26,6 +27,7 @@
 #include "alp/protocol/cc3501e.h"
 
 #include "../cc3501e_hw.h"
+#include "cc3501e_hw_ti_internal.h" /* cc3501e_hw_wifi_sta_role_up (cross-TU seam, see #6/#5's guard) */
 
 /* --------------------------------------------------------------- */
 /* Power policy (CMD_POWER_POLICY, 0x62) -- real CC35xx Power driver. */
@@ -104,7 +106,7 @@ static void pp_release_constraint(uint8_t id)
 static uint8_t  pp_policy_latched = ALP_CC3501E_PP_BALANCED;
 static uint32_t pp_idle_ms_latched;
 /* Has the HOST ever set a policy?  Until it does, a STA role runs ACTIVE rather
- * than the BALANCED default -- see cc3501e_hw_power_sta_default_active() for the
+ * than the BALANCED default -- see pp_apply_radio_effective()'s comment for the
  * measurement behind that, and note the host's own policy still wins the moment
  * it sends one. */
 static bool pp_host_set_policy;
@@ -112,11 +114,15 @@ static bool pp_host_set_policy;
 static volatile bool pp_radio_dirty;
 /* Separate from pp_radio_dirty: the CORE half runs ONLY on an explicit host
  * CMD_POWER_POLICY.  A Wi-Fi role-up used to reach it too -- cc3501e_hw_ti_wifi.c
- * calls cc3501e_hw_power_reapply_radio() unconditionally after a successful
- * Wlan_RoleUp(STA), which set pp_radio_dirty, and the service ran pp_apply_core()
+ * used to call a reapply helper unconditionally after a successful
+ * Wlan_RoleUp(STA) that set pp_radio_dirty, and the service ran pp_apply_core()
  * on the BALANCED default that pp_policy_latched initialises to.  A plain
  * `wifi connect`, with no POWER_POLICY ever sent, therefore flipped the part from
- * "the core never idled" to "the sleep policy runs on every idle".  Issue #14. */
+ * "the core never idled" to "the sleep policy runs on every idle".  Issue #14.
+ * (The STA role-up path no longer touches pp_radio_dirty at all -- see
+ * cc3501e_hw_power_apply_radio_now() -- so this specific trigger is gone, but
+ * pp_core_dirty stays separate from pp_radio_dirty regardless, since the core
+ * half must still run ONLY for an explicit host policy.) */
 static volatile bool pp_core_dirty;
 /* Result of the last TASK-side apply, surfaced via cc3501e_hw_power_radio_ok()
  * because POWER_POLICY has no async-result opcode of its own. */
@@ -298,63 +304,71 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 }
 #endif /* CC3501E_WIFI */
 
-/* Re-apply the latched radio policy after a role comes up.  Called from the
- * Wi-Fi path once Wlan_RoleUp(STA) succeeds -- without this a power policy set
- * while the radio was down would be silently lost.
- *
- * This only ARMS the flag for the next cc3501e_hw_tick() drain -- it is NOT
- * where the STA role-up path's policy actually lands any more.  See
- * cc3501e_hw_power_apply_radio_now() below and its caller in
- * cc3501e_hw_wifi_ensure_sta_role() (issue: an unconfigured STA whose first
- * radio op is CONNECT ran the whole association + DHCP body before this
- * flag was ever drained). */
-void cc3501e_hw_power_reapply_radio(void)
-{
-	pp_radio_dirty = true;
-}
-
 /* Compute the effective radio policy and apply it via pp_apply_radio(), then
  * publish pp_radio_ok.  ONE copy of the effective-policy rule, shared by:
  *   - cc3501e_hw_power_apply_radio_now(), the SYNCHRONOUS caller (STA
  *     role-up, before Wlan_Connect starts the DHCP-critical window), and
  *   - cc3501e_hw_power_service()'s TASK-context drain (an explicit host
- *     CMD_POWER_POLICY, or a redundant re-drain after the synchronous path
- *     already applied it -- see the tick()-ordering note there).
+ *     CMD_POWER_POLICY set before or after a role is up).
  *
  * TASK CONTEXT ONLY, same rule as pp_apply_core (#1683): Wlan_Set() is a
  * blocking vendor radio call and must never run off the SPI-dispatch ISR.
  *
- * An un-configured STA runs ACTIVE, not the BALANCED default.  BALANCED maps
- * to WLAN_STATION_AUTO_PS_MODE, and applying that before Wlan_Connect puts the
- * station to sleep exactly when it has to hear a DHCP OFFER.  The AP buffers
- * broadcast and multicast until a DTIM beacon, and a sleeping station on a
- * marginal link misses beacons and therefore misses DTIMs: measured on
- * e1m-aen-evk-01 at -78 dBm, the station associated every time, its
- * DISCOVERs left every time (DHCP_STATE_SELECTING, tries = 5), and it leased
- * on roughly one attempt in four.
- *
- * The host's power API stays authoritative: once it sends a POWER_POLICY,
- * pp_host_set_policy latches and that policy is applied verbatim, including
- * BALANCED.  This only changes what an un-configured station defaults to,
- * where the alternative is a bridge that cannot reliably get an address.
- *
- * AP is excluded from the override deliberately (per the existing rule,
- * unchanged by this function's introduction): cc3501e_hw_wifi_ap_start()
- * already forces ALWAYS-ACTIVE with its own direct Wlan_Set(), synchronously,
- * before its own Wlan_RoleUp(AP) -- a soft-AP cannot tolerate the NWP dozing
- * at all, so it never depended on this latch/drain to get a safe default in
- * the first place, and a host-set policy for AP is meant to apply verbatim
- * once it lands. */
+ * NO STA ROLE UP -> DO NOT CALL pp_apply_radio() AT ALL (vendor-confirmed,
+ * SDK 10.10.01.08).  WLAN_SET_POWER_SAVE routes to CME_WlanSetPSMode()
+ * (wlan_if.c ~1716), which returns SUCCESS in BOTH of two ways that never
+ * touch firmware: its cached mode already matches the request (cme.c ~1131,
+ * queues nothing), or it queues CME_MESSAGE_ID_PS_SET, whose handler silently
+ * drops the whole message when no STA interface is up (cme.c ~3020-3037,
+ * "STA Role is not up").  pp_apply_radio()'s Wlan_Set() return-value check
+ * cannot see either case, so calling it with no STA role up would mark
+ * pp_radio_ok true for a policy that silently never reached the radio.
+ * Skipping the whole call and leaving pp_radio_dirty set (the caller's job,
+ * not this function's) means the STA role-up path's own synchronous apply --
+ * or the next tick, once a role exists -- retries it for real. */
 static void pp_apply_radio_effective(void)
 {
-	const bool    radio_up = (cc3501e_hw_radio_role() != ALP_CC3501E_ROLE_OFF);
+	if (!cc3501e_hw_wifi_sta_role_up()) {
+		pp_radio_ok = true; /* nothing attempted -- not a failure */
+		return;
+	}
+
+	/* An un-configured role defaults to PERFORMANCE/ACTIVE, not the BALANCED
+	 * default.  BALANCED maps to WLAN_STATION_AUTO_PS_MODE, and applying that
+	 * before Wlan_Connect puts the station to sleep exactly when it has to hear
+	 * a DHCP OFFER.  The AP buffers broadcast and multicast until a DTIM
+	 * beacon, and a sleeping station on a marginal link misses beacons and
+	 * therefore misses DTIMs: measured on e1m-aen-evk-01 at -78 dBm, the
+	 * station associated every time, its DISCOVERs left every time
+	 * (DHCP_STATE_SELECTING, tries = 5), and it leased on roughly one attempt
+	 * in four.
+	 *
+	 * The host's power API stays authoritative: once it sends a POWER_POLICY,
+	 * pp_host_set_policy latches and that policy is applied verbatim, including
+	 * BALANCED.  This only changes what an un-configured station defaults to,
+	 * where the alternative is a bridge that cannot reliably get an address.
+	 *
+	 * This used to also test cc3501e_hw_radio_role() != WIFI_AP, to exclude a
+	 * running AP from the override.  That test broke the moment BOTH roles were
+	 * up: cc3501e_hw_radio_role() reports AP over STA by design ("AP outranks
+	 * STA" -- see its own comment), so a scan/connect bringing STA up alongside
+	 * an already-running AP read as "AP", took the pp_policy_latched (BALANCED)
+	 * branch, and pulled the AP OUT of the ALWAYS_ACTIVE
+	 * cc3501e_hw_wifi_ap_start() had forced on it, while also connecting the
+	 * new STA under BALANCED/AUTO_PS instead of the intended ACTIVE default.
+	 * Reaching this line already proves a STA role is up (the guard above), so
+	 * testing STA-up directly -- rather than radio_role()'s AP-outranks-STA
+	 * summary -- is what "an STA role is being brought up or is up" (not
+	 * "cc3501e_hw_radio_role() alone") means here, and PERFORMANCE is simply
+	 * the correct unconfigured default whenever it applies: its ALWAYS_ACTIVE
+	 * pm is the identical setting cc3501e_hw_wifi_ap_start() forces inline, so
+	 * an AP running alongside stays on it instead of being pulled to BALANCED's
+	 * ELP/AUTO_PS. */
 	const uint8_t eff =
-	    (!pp_host_set_policy && cc3501e_hw_radio_role() != (uint8_t)ALP_CC3501E_ROLE_WIFI_AP)
-	        ? (uint8_t)ALP_CC3501E_PP_PERFORMANCE
-	        : pp_policy_latched;
+	    pp_host_set_policy ? pp_policy_latched : (uint8_t)ALP_CC3501E_PP_PERFORMANCE;
 	const bool ok = pp_apply_radio(eff, pp_idle_ms_latched);
 
-	pp_radio_ok = radio_up ? ok : true;
+	pp_radio_ok = ok;
 }
 
 /* SYNCHRONOUS radio-policy apply -- called from cc3501e_hw_wifi_ensure_sta_role()
@@ -375,24 +389,33 @@ void cc3501e_hw_power_apply_radio_now(void)
 }
 
 /* TASK-context drain for the latched radio policy.  Called from cc3501e_hw_tick().
- * Applying with no role up is not an error -- Wlan_Set legitimately refuses then,
- * and the STA role-up path re-arms the dirty flag once the radio exists.
- *
- * For a STA role-up, this now runs AFTER cc3501e_hw_power_apply_radio_now()
- * already applied the same effective policy synchronously (see there) --
- * re-running pp_apply_radio_effective() here is a harmless redundant re-apply
- * (the SAME Wlan_Set calls with the SAME arguments), not a second real change,
- * and it stays necessary for the case a CMD_POWER_POLICY lands (SPI-ISR
- * context, cc3501e_hw_set_power_policy()) in the gap between the two. */
+ * Applying with no STA role up is not an error -- pp_apply_radio_effective()'s
+ * own guard (#5) makes that a clean early-return, and pp_radio_dirty stays set
+ * (see below) so a LATER drain -- once a role exists -- retries for real. */
 void cc3501e_hw_power_service(void)
 {
+	/* Read-and-clear pp_core_dirty/pp_radio_dirty as ONE atomic step (#7).  Two
+	 * separate unprotected reads/clears raced cc3501e_hw_set_power_policy(),
+	 * which runs in SPI-DISPATCH (ISR) context and can set either flag between
+	 * this function's two statements -- a POWER_POLICY landing in that exact
+	 * window had its pp_core_dirty=true observed here (do_core reads true) but
+	 * then WIPED by this function's own `pp_core_dirty = false;` before
+	 * pp_apply_core() ever ran for it, losing the core half of that policy
+	 * silently.  HwiP_disable()/HwiP_restore() is the file's existing masking
+	 * primitive (see <ti/drivers/dpl/HwiP.h>, included above) -- short enough
+	 * to hold with interrupts masked (two volatile reads + two writes), unlike
+	 * pp_apply_core()/pp_apply_radio() below, which must NOT run masked (#1683,
+	 * this function's own header comment). */
+	uintptr_t key = HwiP_disable();
 	if (!pp_radio_dirty && !pp_core_dirty) {
+		HwiP_restore(key);
 		return;
 	}
 	const bool do_core  = pp_core_dirty;
 	const bool do_radio = pp_radio_dirty;
 	pp_radio_dirty      = false;
 	pp_core_dirty       = false;
+	HwiP_restore(key);
 
 	/* Core FIRST, then radio -- both on this task, never in the ISR (#1683).
 	 * The core half runs ONLY for an explicit host policy, never because a radio
@@ -444,8 +467,11 @@ int cc3501e_hw_set_power_policy(uint8_t policy, uint8_t wake_events, uint32_t id
 	 * minimum-idle threshold cannot be programmed: PowerWFF3.h exposes no
 	 * idle-hysteresis setter, only the fixed latency constants. */
 	/* Core policy is set; now the radio -- the dominant term.  Latch first so a
-	 * policy set before Wlan_RoleUp() is re-applied by
-	 * cc3501e_hw_power_reapply_radio() once the STA role is up. */
+	 * policy set before Wlan_RoleUp() is re-applied once the STA role comes up
+	 * -- either by cc3501e_hw_wifi_ensure_sta_role()'s own synchronous
+	 * cc3501e_hw_power_apply_radio_now() call, or by the next
+	 * cc3501e_hw_power_service() drain if pp_radio_dirty (set just below) is
+	 * still true when the role finally does exist. */
 	pp_policy_latched  = policy;
 	pp_host_set_policy = true;
 	pp_idle_ms_latched = idle_ms_before_sleep;

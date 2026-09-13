@@ -59,12 +59,14 @@ int cc3501e_hw_wifi_lazy_start(void);
  * PH_REQ_PAYLOAD joined, because the old name said less than it did (#5). */
 bool bridge_transport_spi_phase_stalled(void);
 
-/* Re-apply the latched radio power-save policy after Wlan_RoleUp(STA) succeeds.
- * Wlan_Set() is rejected while the radio is down, so a POWER_POLICY the host set
- * before the role came up would otherwise be silently lost.  Only ARMS the flag
- * for the next cc3501e_hw_tick() drain -- see cc3501e_hw_power_apply_radio_now()
- * for the synchronous apply that actually beats Wlan_Connect now. */
-void cc3501e_hw_power_reapply_radio(void);
+/* Is the STA role up right now?  cc3501e_hw_radio_role() cannot answer this on
+ * its own -- it reports AP over STA whenever both are up (see its own "AP
+ * outranks STA" comment) -- so cc3501e_hw_ti_power.c's pp_apply_radio_effective()
+ * needs this direct accessor instead, both to gate calling pp_apply_radio() at
+ * all (WLAN_SET_POWER_SAVE silently no-ops with no STA role -- vendor
+ * cme.c ~3020-3037) and to pick the right unconfigured default even while an
+ * AP is also up. */
+bool cc3501e_hw_wifi_sta_role_up(void);
 
 /* Apply the effective radio power-save policy SYNCHRONOUSLY, on the calling
  * TASK, right now.  Wlan_Set() is a blocking vendor call and MUST NOT run in
