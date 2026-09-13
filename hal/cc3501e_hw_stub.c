@@ -222,6 +222,24 @@ int cc3501e_hw_wifi_disconnect(void)
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
+bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out)
+{
+	/* No connect body ever runs on the stub, so no run ever takes the
+	 * reinit -- src/worker.c's drain keeps paying its own reinit for
+	 * WIFI_CONNECT_STA here, same as before #106. */
+	(void)armed_out;
+	return false;
+}
+
+bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out)
+{
+	/* No RSSI body ever runs on the stub, so this is never this run's call to
+	 * make -- src/worker.c's drain keeps paying its own reinit for
+	 * WIFI_GET_RSSI here, same as before #106. */
+	(void)skip_ok_out;
+	return false;
+}
+
 int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
                              uint8_t        ssid_len,
                              const uint8_t *psk,
