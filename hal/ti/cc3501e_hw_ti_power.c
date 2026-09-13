@@ -124,7 +124,13 @@ static volatile bool pp_radio_dirty;
  * half must still run ONLY for an explicit host policy.) */
 static volatile bool pp_core_dirty;
 /* Result of the last TASK-side apply, surfaced via cc3501e_hw_power_radio_ok()
- * because POWER_POLICY has no async-result opcode of its own. */
+ * because POWER_POLICY has no async-result opcode of its own.  False means
+ * EITHER a Wlan_Set() call failed OR the policy could not be honoured
+ * verbatim -- see pp_apply_radio()'s `overridden` (the AP-up pm force, #1562)
+ * for the second case: every Wlan_Set() call can succeed while this still
+ * reads false, because "accepted by the radio" and "realised exactly as
+ * requested" are different claims and this bit only ever made the first
+ * one. */
 static volatile bool pp_radio_ok = true;
 
 /* Map idle_ms_before_sleep onto a DTIM count.  A DTIM period is typically ~100 ms
@@ -300,9 +306,19 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 	 * explicit host policy, or the STA role-up path's synchronous apply while
 	 * AP is also up -- could still pull pm back to ELP.  ps is untouched: it
 	 * is STA-scoped (see this function's header comment) and stays whatever
-	 * @p policy chose. */
-	if (cc3501e_hw_radio_role() == (uint8_t)ALP_CC3501E_ROLE_WIFI_AP) {
-		pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE;
+	 * @p policy chose.
+	 *
+	 * `overridden` tracks whether this ACTUALLY changed the value @p policy
+	 * asked for (PERFORMANCE already wants ALWAYS_ACTIVE, so overriding it is a
+	 * no-op there) -- see the return value and pp_radio_ok's contract, which
+	 * this now feeds honestly: a host that asked for a sleeping pm while an AP
+	 * is up did NOT get what it asked for, even though every Wlan_Set() call
+	 * below still succeeds. */
+	bool overridden = false;
+	if (cc3501e_hw_radio_role() == (uint8_t)ALP_CC3501E_ROLE_WIFI_AP &&
+	    pm != POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE) {
+		pm         = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE;
+		overridden = true;
 	}
 
 	bool ok = (Wlan_Set(WLAN_SET_POWER_SAVE, &ps) >= 0);
@@ -316,7 +332,7 @@ static bool pp_apply_radio(uint8_t policy, uint32_t idle_ms)
 		lsi.ListenInterval = want_lsi ? pp_idle_ms_to_dtims(idle_ms) : 1u;
 		ok                 = (Wlan_Set(WLAN_SET_LSI, &lsi) >= 0) && ok;
 	}
-	return ok;
+	return ok && !overridden;
 }
 #else  /* !CC3501E_WIFI -- no Wi-Fi host driver, so no Wlan_Set to call */
 /* Without this the whole ti build fails to link when built without
