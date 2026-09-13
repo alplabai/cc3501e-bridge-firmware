@@ -1027,6 +1027,211 @@ ZTEST(cc3501e_bridge_transport, test_sock_send_is_exempt_from_the_generic_latch)
 	              "send_a's cached reply");
 }
 
+/* worker_discard_stale_terminal()'s guard (protocol_sockets.c), the abandoned-
+ * send case test_sock_send_is_exempt_from_the_generic_latch above does NOT
+ * reach: that test always polls send_a again under its OWN seq (a second
+ * transaction(send_a)) before ever sending send_b, and that poll is ITSELF a
+ * cache hit that reclaims the slot -- so send_a's job is IDLE again by the
+ * time send_b arrives and there is nothing left for the guard to discard.
+ * This test walks away after send_a's SUBMIT ack instead -- exactly
+ * cc3501e-bridge-firmware#107/alp-sdk#1746's abandoned-seq-A scenario -- so
+ * send_a's ERR is CACHED (protocol_sock_send_on_worker_complete() caches
+ * ERR too, not just OK) but still sitting UNCOLLECTED in the worker slot
+ * when send_b, a DIFFERENT seq, arrives: the cache above is a miss (seq 1 !=
+ * seq 2) and gets invalidated, so it is this guard -- not the cache -- that
+ * has to evict the stale job.
+ *
+ * The ERR variant: the stub HAL's cc3501e_hw_sock_send() always returns
+ * CC3501E_HW_ERR_NOTIMPL (no real socket stack here), so WORKER_DONE is
+ * structurally unreachable for SOCK_SEND in this harness -- WORKER_ERR is
+ * the only terminal state a stub run can produce, and it is what the guard
+ * has to see and discard here. */
+ZTEST(cc3501e_bridge_transport, test_sock_send_stale_seq_is_discarded_and_new_send_submits)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	/* alp_cc3501e_sock_send_t = handle(2) flags(1) seq(1) data_len(2)
+	 * reserved2(2) = 8 B, then data inline -> payload_len 9.  Outer header
+	 * flags (byte[1]) left 0: SOCK_SEND is exempt from the generic 5-bit
+	 * latch (retry_latch_applies()), so it carries no meaning here. */
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       1u /* seq 1 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xAAu };
+	const uint8_t send_b[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       2u /* seq 2 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xBBu };
+
+	/* Submit send_a and WALK AWAY -- no second transaction(send_a) to poll it
+	 * under its OWN seq.  The stub runs the body synchronously at submit
+	 * (WORKER_ERR, NOTIMPL), and protocol_sock_send_on_worker_complete()
+	 * caches it under seq 1 immediately -- but this handler's own ack is
+	 * always BUSY on the IDLE->QUEUED edge regardless, so that terminal ERR
+	 * is left sitting UNCOLLECTED in the worker slot. */
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_a submits -> BUSY");
+
+	/* send_b: a genuinely different logical send (different seq, different
+	 * payload byte).  handle_sock_send() invalidates seq 1's cache entry
+	 * (seq mismatch), so the cache lookup misses.  Without the STALE-JOB
+	 * GUARD below that, handle_worker_routed_payload_reply's worker_poll()
+	 * would then match the slot by opcode ALONE, collect send_a's abandoned
+	 * ERR as if it were send_b's answer (NOT_READY, with send_b's own
+	 * payload never submitted), and worker_reset() the slot on its way out.
+	 * With the guard, the seq mismatch (1 vs 2) discards send_a's ERR
+	 * itself, so the fall-through meets WORKER_IDLE and submits send_b fresh
+	 * -> BUSY, not NOT_READY. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "send_a's stale ERR is discarded; send_b submits fresh instead of "
+	              "being answered with send_a's stale outcome");
+
+	/* send_b's OWN result -- not send_a's -- is what the next poll's cache
+	 * hit (+ reclaim) answers, proving send_b's payload genuinely reached
+	 * the worker and was cached under ITS OWN seq. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "send_b's own cached result, not send_a's");
+}
+
+/* A poll carrying SOCK_SEND's OWN seq (req[3]) unchanged from the sitting
+ * job's is the ordinary poll_by_repeat() retry the guard must leave alone:
+ * same seq still collects, exactly as before this fix. */
+ZTEST(cc3501e_bridge_transport, test_sock_send_same_seq_collects)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       1u /* seq 1 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xAAu };
+
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_a submits -> BUSY");
+
+	transaction(send_a, sizeof send_a); /* identical frame: an ordinary retry */
+	(void)drain(reply, sizeof reply);
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "same-seq poll collects the in-flight send");
+}
+
+/* The ERR-caching half of "cache the FINAL outcome per seq, ERR included"
+ * (host review): a decoded ERR must survive being orphan-discarded from the
+ * worker slot by an UNRELATED opcode's poll, exactly like a DONE does (see
+ * sock_send_done's test_orphan_discarded_send_still_answers_from_cache for
+ * the OK-path twin of this test).  Proving this needs a case where caching
+ * ERR is OBSERVABLY different from not caching it -- a same-seq re-issue
+ * after the job is STILL sitting there (test_sock_send_stale_seq_is_-
+ * discarded_and_new_send_submits' shape) collects identically either way,
+ * via worker_discard_stale_terminal() or the cache, so it cannot tell them
+ * apart.  Once the job is GONE (orphan-discarded), only a cached ERR can
+ * still answer a same-seq re-issue without re-running
+ * cc3501e_hw_sock_send() -- proven here via g_worker_execs (DIAG_GET_STATS,
+ * issue #102), same pattern as
+ * test_worker_routed_retry_seq_served_from_latch_and_counted above. */
+ZTEST(cc3501e_bridge_transport, test_sock_send_orphan_discarded_err_still_answers_from_cache)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	const uint8_t send_h[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       8u /* seq 8 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0x88u };
+
+	const uint8_t stats[] = { ALP_CC3501E_CMD_DIAG_GET_STATS, 0x00u, 0x00u, 0x00u };
+	transaction(stats, sizeof stats);
+	(void)drain(reply, sizeof reply);
+	const uint32_t execs_before = diag_stat_u32(reply, 13u);
+
+	/* Submit send_h and walk away: NOTIMPL -> WORKER_ERR, cached under seq 8
+	 * immediately, but never collected under its own seq. */
+	transaction(send_h, sizeof send_h);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_h submits -> BUSY");
+
+	/* A DIFFERENT worker-routed opcode discards send_h's uncollected ERR via
+	 * worker_poll()'s orphan-discard arm and submits its own job. */
+	const uint8_t rssi[] = { ALP_CC3501E_CMD_WIFI_GET_RSSI, 0x00u, 0x00u, 0x00u };
+	transaction(rssi, sizeof rssi);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "an unrelated worker-routed opcode discards send_h's orphaned ERR");
+
+	/* send_h's OWN same seq, re-issued: the job slot is gone, but the
+	 * completion-time cache entry for seq 8 is not -- this must be answered
+	 * NOT_READY from the cache, WITHOUT re-running cc3501e_hw_sock_send(). */
+	transaction(send_h, sizeof send_h);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_NOT_READY,
+	              "send_h's same-seq re-issue is answered NOT_READY from the cache after being "
+	              "orphan-discarded, not resubmitted");
+
+	transaction(stats, sizeof stats);
+	(void)drain(reply, sizeof reply);
+	const uint32_t execs_after = diag_stat_u32(reply, 13u);
+	zassert_equal(execs_after,
+	              execs_before + 2u,
+	              "exactly two worker bodies ran total (send_h once, RSSI once); the cached "
+	              "ERR re-issue did not run cc3501e_hw_sock_send() again");
+}
+
+/* "A re-issue after collect is served from the cache" needs handle_sock_send()
+ * to reach a genuine RESP_OK at least once, and RESP_OK is structurally
+ * unreachable for SOCK_SEND on THIS stub -- cc3501e_hw_sock_send()
+ * (hal/cc3501e_hw_stub.c) always returns CC3501E_HW_ERR_NOTIMPL, there being
+ * no real socket stack on the host.  Covered instead by
+ * tests/unit/sock_send_done/, a separate executable that links the same
+ * sources with `-Wl,--wrap=cc3501e_hw_sock_send` so a real WORKER_DONE (and
+ * therefore a real, cacheable RESP_OK) is reachable over the wire; see
+ * test_same_seq_after_collect_served_from_cache there. */
+
 ZTEST(cc3501e_bridge_transport, test_diag_log_level_ok)
 {
 	uint8_t reply[16];
