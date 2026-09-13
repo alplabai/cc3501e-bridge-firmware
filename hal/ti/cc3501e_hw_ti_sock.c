@@ -301,17 +301,11 @@ void cc3501e_hw_sock_accept_pump(void)
 		 * it a worker-routed CMD_SOCK_RECV on an idle connection blocks in lwIP
 		 * with no timeout at all, holding READY LOW and wedging the bridge.
 		 *
-		 * KNOWN EXPOSURE, the SEND direction is NOT bounded the same way.
-		 * cc3501e_hw_sock_send()'s lwip_send() is blocking, and this SDK's lwIP
-		 * build does not enable LWIP_SO_SNDTIMEO -- there is no SO_SNDTIMEO to
-		 * set here.  CMD_SOCK_SEND is worker-routed, so a peer that opens a
-		 * connection and then stops reading fills the TCP window and parks the
-		 * worker inside lwip_send (READY LOW, no opcode served) until lwIP gives
-		 * up on the connection.  That shape pre-dates this change for CLIENT
-		 * sockets, where the host chooses the peer; a listening socket hands the
-		 * trigger to whoever can reach the AP.  Bounding it needs either
-		 * LWIP_SO_SNDTIMEO in the vendor lwipopts or a chunked non-blocking
-		 * send, neither of which belongs in this change -- tracked in #107. */
+		 * The SEND direction needs no option here: this SDK's lwIP build does not
+		 * enable LWIP_SO_SNDTIMEO, so there is no SO_SNDTIMEO to set, and
+		 * cc3501e_hw_sock_send() passes MSG_DONTWAIT instead (#107).  A peer that
+		 * connects and stops reading now gets "0 bytes queued" replies rather
+		 * than parking the worker inside lwip_send with READY LOW. */
 		struct timeval tv = { .tv_sec  = CC3501E_SOCK_RCVTIMEO_MS / 1000,
 			                  .tv_usec = (CC3501E_SOCK_RCVTIMEO_MS % 1000) * 1000 };
 		(void)lwip_setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
