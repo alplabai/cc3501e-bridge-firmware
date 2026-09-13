@@ -178,28 +178,33 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
-/* RUN10 OBSERVABILITY: cc3501e_hw_wifi_connect_sta()'s bounded retry needs to
- * know which event woke each pass, but wifi_cb_last_id above cannot answer
- * "what woke the FIRST pass" after the fact for a bench operator either --
- * by the time a connect call returns, the retry's own #1437 cleanup (if it
- * ran) has already overwritten it with that cleanup's own DISCONNECT, the
- * SAME contamination that made Run9's "last event id 2" reading
- * inconclusive (see the ASSOCIATION_REJECTED case's own comment).  These two
- * mirror it BEFORE that overwrite, and record whether the retry fired at
- * all, for the next bench run's post-mortem.
+/* RUN10 OBSERVABILITY (why there is no first-pass-wake-event static here):
+ * cc3501e_hw_wifi_connect_sta()'s bounded retry knows which event woke each
+ * pass (event_id_this_pass, local to that function), but nothing here
+ * exposes it for a bench operator to read back after the fact.  wifi_cb_last_id
+ * above cannot serve that purpose either -- by the time a connect call
+ * returns, the retry's own #1437 cleanup (if it ran) has already overwritten
+ * it with that cleanup's own DISCONNECT, the SAME contamination that made
+ * Run9's "last event id 2" reading inconclusive (see the ASSOCIATION_REJECTED
+ * case's own comment).  A prior version of this fix added two module-static
+ * "SWD-readable" mirrors for this, but on an ACTIVATED CC3501E there is no
+ * SWD path to read them from: issue #21 records OpenOCD reporting "Could not
+ * find MEM-AP to control the core" and AP 1 returning a constant 0x00080025
+ * at every address -- unlike wifi_cb_last_id, which IS observable, but only
+ * because it goes out over the wire in GET_DIAG_INFO, not via SWD.  Removed
+ * as write-only dead state rather than kept as statics nothing can read.
  *
- * NOT put on the wire: GET_DIAG_INFO's 18-byte reply (protocol_diag.c) has
- * no spare byte -- fw_version/reset_cause/role/uptime_ms/free_heap_bytes/
- * last_error/reserved[0..2]/dhcp_state/dhcp_flags account for all 18, and
- * reserved[0] specifically is ALREADY wifi_cb_last_id verbatim (the value
- * that needed disambiguating in the first place).  CMD_WIFI_STATUS's
- * alp_cc3501e_wifi_status_t is likewise fully packed (state/fail_reason/
- * rssi_dbm/last_reason -- protocol_wifi.c).  Exposing this over the wire
- * would need a wire-format change (a new opcode field or a version bump),
- * out of scope for this commit -- these two are SWD-readable statics only,
- * the same bench-debug pattern wifi_cb_last_id itself already uses. */
-static volatile uint32_t wifi_connect_first_wake_event_id;
-static volatile bool     wifi_connect_last_retried;
+ * The retry IS observable today, just indirectly, through connect timing: a
+ * deny-list retry (see WLAN_EVENT_AUTHENTICATION_REJECTED below) makes a
+ * rejected connect attempt take roughly 17-20 s end to end instead of the
+ * ~4 s an unretried rejection takes, and a comeback-IE retry adds roughly
+ * 1.5-2 s the same way -- both bounded well under the 30 s association
+ * window either way (see the retry's own deadline-arithmetic comment). A
+ * wire field carrying the first-pass wake event id directly (GET_DIAG_INFO's
+ * 18-byte reply and CMD_WIFI_STATUS's alp_cc3501e_wifi_status_t are BOTH
+ * already fully packed, protocol_diag.c / protocol_wifi.c) stays a
+ * documented follow-up, not done here since it needs an actual wire-format
+ * change (a new opcode field or a version bump), out of scope for this fix. */
 
 /* IEEE 802.11 status code wifi_event_cb() acts on below (ASSOCIATION_REJECTED
  * temporary-reject handling -- see that case; status 17,
@@ -1723,14 +1728,6 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * that would erase the only real diagnostic the attempt produced. */
 	uint8_t first_pass_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
 	int16_t first_pass_reason_code = 0;
-	/* RUN10 OBSERVABILITY reset for THIS call -- see the statics' own comment
-	 * above.  wifi_connect_first_wake_event_id is deliberately NOT reset here:
-	 * a bench operator reading it after a call that never got far enough to
-	 * wake at all (e.g. the role-up KICK above, which returns before this
-	 * point) should still see the previous call's value rather than a
-	 * misleading 0, exactly like wifi_cb_last_id's own "0 = no WLAN event has
-	 * ever fired" contract. */
-	wifi_connect_last_retried = false;
 
 	for (;;) {
 		osi_SyncObjClear(&wifi_event_sync);
@@ -1831,13 +1828,6 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 			 * further event that would overwrite wifi_cb_last_id and make this
 			 * read the cleanup's event instead of the real one. */
 			event_id_this_pass = cc3501e_hw_wifi_last_event_id();
-			if (!retried) {
-				/* Still the FIRST pass (retried only ever flips true right
-				 * before the `continue` that starts the second one) -- this is
-				 * the wake event a bench operator actually wants; see the
-				 * static's own comment above. */
-				wifi_connect_first_wake_event_id = event_id_this_pass;
-			}
 		}
 		if (wifi_last_status >= 0) {
 			break; /* L2 ASSOCIATED -- fall through to L3/DHCP below. */
@@ -1867,10 +1857,9 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 			const uint32_t elapsed_ms  = cc3501e_hw_uptime_ms() - assoc_wait_start_ms;
 			const uint32_t budget_needed_ms = overhead_ms + CC3501E_WIFI_RETRY_MIN_WAIT_MS;
 			if (elapsed_ms + budget_needed_ms <= CC3501E_WIFI_ASSOC_WAIT_MS) {
-				retried                   = true;
-				wifi_connect_last_retried = true;
-				first_pass_fail_reason    = (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED;
-				first_pass_reason_code    = wifi_last_reason;
+				retried                = true;
+				first_pass_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED;
+				first_pass_reason_code = wifi_last_reason;
 				/* Step 3, "account for the oper-bitmap and disconnect-in-progress
 				 * rules": run the SAME #1437 cleanup every OTHER failure exit
 				 * uses, then wait (bounded, best-effort) for ITS OWN
