@@ -1247,33 +1247,55 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * already have been cancelled by something else's ready(), though nothing
 	 * else in THIS function raises ready() before this point).
 	 *
-	 * Do NOT raise ready() here -- record the armed outcome and let the DRAIN
-	 * raise it, same as it does for the FAILURE exits.  src/worker.c's own
-	 * ordering rule (worker_run_pending, the CONNECT/AP_START comment) is that
-	 * worker_reset() must run BEFORE cc3501e_bridge_ready(): once READY is high
-	 * the host may clock a new CONNECT, and if the job slot still held THIS
-	 * attempt's result that new CONNECT would be collected as a stale submit
-	 * instead of starting fresh.  worker_reset() cannot run until this whole
-	 * function returns, so raising ready() from here (a version of this fix
-	 * briefly did) jumps that ordering -- a CONNECT landing between this line
-	 * and the drain's worker_reset() would race the exact bug that rule exists
-	 * to prevent.  It also re-enabled the attention pulse (event_ring_push's
-	 * cc3501e_bridge_attn_pulse() below, off wifi_conn_set's EVT_WIFI_CONNECTED
-	 * push) a whole function-return early, because the pulse self-suppresses
-	 * only while READY reads LOW (src/event_ring.c).  Leaving READY low here
-	 * keeps the pulse suppressed until the drain raises it in the correct
-	 * place, same as before this whole change.
+	 * CORRECTED (2026-09-13, post-ae381bc review): this used to say removing
+	 * an explicit cc3501e_bridge_ready() call from here (a version of this fix
+	 * briefly had one) was necessary to keep worker_reset() ordered before
+	 * READY.  That is not what is actually happening, on two counts:
 	 *
-	 * cc3501e_hw_wifi_connect_sta_take_reinit() hands the armed outcome to the
-	 * drain so it can skip paying a SECOND SPI_close/SPI_open for the same
-	 * event and still raise READY correctly, in the right place, off the real
-	 * arm state -- see src/worker.c's body_already_reinit / wifi_connect_body_
-	 * reinit and its worker_reset()-then-ready() sequencing.  Every FAILURE
-	 * exit above (bad SSID, role-up fail, Wlan_Connect reject, association
-	 * timeout, the no-DHCP-lease exit just above this one) never reaches here,
-	 * so take_reinit() reports false for them and the drain's own post-body
-	 * reinit (and its own ready()) still runs for every one of those,
-	 * unchanged. */
+	 *   1. bridge_transport_spi_hw_reinit() already raises READY itself, as a
+	 *      side effect, when the arm succeeds: it calls spi_open_and_arm() ->
+	 *      arm_request_header() -> arm_transfer(), and arm_transfer() calls
+	 *      cc3501e_bridge_ready() directly on a successful SPI_transfer() queue
+	 *      (hal/ti/transport_hw_ti_spi.c ~572), independently of anything this
+	 *      function does afterward.  So READY is already HIGH by the time
+	 *      wifi_conn_set(CONNECTED) below runs -- REGARDLESS of whether this
+	 *      function also calls cc3501e_bridge_ready() explicitly.  The explicit
+	 *      call this fix removed was always redundant with what the reinit call
+	 *      above already does; removing it changed no observable behaviour.
+	 *      Because the pulse in event_ring_push() (off wifi_conn_set's
+	 *      EVT_WIFI_CONNECTED push) self-suppresses only while READY reads LOW,
+	 *      the attention pulse FIRES on this CONNECTED push either way -- it was
+	 *      never suppressed by removing the explicit call.
+	 *   2. READY is not held low across this whole function to begin with, so
+	 *      there is no "before worker_reset()" window this could have closed.
+	 *      The FIRST reinit above (between role-up and Wlan_Connect) already
+	 *      raises READY the same way, well before the association wait even
+	 *      starts -- that is the whole point of the "so the host CAN clock
+	 *      WIFI_STATUS in" comment on that reinit.  From there on READY tracks
+	 *      the SPI ISR's own per-transaction arm/re-arm cycle (on_transfer's
+	 *      re-arm on every SERVICED request) continuously through the
+	 *      association wait and the DHCP loop, not something held low until
+	 *      the drain's worker_reset() runs.  A host CONNECT landing in that
+	 *      window and being collected against a stale result is therefore a
+	 *      possible race that PREDATES this whole #106 change and is not
+	 *      opened or closed by it.  If it ever needs closing, the fix is in
+	 *      worker_execute()'s own publish critical section (src/worker.c) --
+	 *      publish CONNECT/AP_START as IDLE there directly instead of DONE/ERR,
+	 *      not by sequencing this body's or the drain's cc3501e_bridge_ready()
+	 *      relative to worker_reset().
+	 *
+	 * cc3501e_hw_wifi_connect_sta_take_reinit() still earns its keep for a
+	 * narrower, correct reason: it tells the drain NOT to call
+	 * bridge_transport_spi_hw_reinit() a SECOND time for the same event (a real
+	 * second SPI_close/SPI_open cycle, not just a redundant GPIO write) -- see
+	 * src/worker.c's body_already_reinit / wifi_connect_body_reinit.  The
+	 * drain's own subsequent cc3501e_bridge_ready()-or-not (gated on the armed
+	 * outcome this handoff carries) is consistent with, and redundant to, what
+	 * arm_transfer() already did above; it is not what makes READY correct.
+	 * Every FAILURE exit above (bad SSID, role-up fail, Wlan_Connect reject,
+	 * association timeout, the no-DHCP-lease exit just above this one) never
+	 * reaches here, so take_reinit() reports false for them and the drain's
+	 * own post-body reinit still runs for every one of those, unchanged. */
 	cc3501e_bridge_busy();
 	g_connect_reinit_armed   = bridge_transport_spi_hw_reinit();
 	g_connect_reinit_pending = true;

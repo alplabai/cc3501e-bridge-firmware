@@ -266,11 +266,15 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
  * WIFI_STATUS poll had already seen CONNECTED and started clocking
  * WIFI_GET_RSSI at its dense post-connect cadence into a slave the connect's
  * own Wlan_Connect + association wait had left torn down.  The body does NOT
- * raise READY itself -- it hands the armed outcome here instead, and the
- * DRAIN raises READY, in the drain's own place in its sequencing (AFTER
- * worker_reset(), never before -- see worker.c's worker_run_pending).  See
- * the body for the full evidence and why raising READY from here would be
- * wrong.
+ * call cc3501e_bridge_ready() itself; it hands the armed outcome here
+ * instead, so the DRAIN can raise READY without paying a SECOND
+ * SPI_close/SPI_open for the same event.  That is what this handoff buys --
+ * NOT a READY-vs-worker_reset() ordering guarantee: bridge_transport_spi_hw_
+ * reinit() already raises READY itself, as a side effect, when the arm
+ * succeeds (transport_hw_ti_spi.c's arm_transfer()), independently of
+ * whether the body or the drain also calls cc3501e_bridge_ready() -- so
+ * READY's actual state is set before either of them gets a chance to touch
+ * it, not after.  See the body for the full citation trail.
  *
  * take_reinit() is a ONE-SHOT read-and-clear, not a state query: it reports
  * true (and clears the latch) only for the run whose SUCCESS exit just took

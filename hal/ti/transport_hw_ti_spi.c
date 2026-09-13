@@ -38,18 +38,37 @@
  *     DMAStartTransaction, DMAGetChannelStatus) all take that same
  *     channel-11 handle and touch only channel 11's registers
  *     (source/ti/devices/cc35xx/driverlib/dma.c:108-155,
- *     driverlib/dma.h:429-446) -- never channel 12 or 13's.
- *   - The transport lock a Wlan_Get runs under
- *     (trnspt_EnterCriticalSection, wifi_host_driver/trnspt_layer/
- *     trnspt_thread.c:494-499) is a plain RTOS mutex (osi_LockObjLock ->
- *     SemaphoreP_pend), not an interrupt mask -- the bridge SPI's own
+ *     driverlib/dma.h:429-446) -- never channel 12 or 13's.  HIFRead/HIFWrite
+ *     each busy-wait on that channel's status (hif.c:304, :386) for the DMA
+ *     round trip; that does NOT block interrupts (the bridge SPI's ISR still
+ *     fires), it starves whatever LOWER-PRIORITY task is ready to run for
+ *     the round trip's duration -- a different, milder effect than a DMA
+ *     collision, worth naming so it is not conflated with one.
+ *   - The transport lock a Wlan_Get runs under (trnspt_EnterCriticalSection,
+ *     wifi_host_driver/trnspt_layer/trnspt_thread.c:494-499) calls
+ *     osi_LockObjLock, not an interrupt mask, so the bridge SPI's own
  *     DMA-completion interrupt (SPI_MIS_DMARX, drivers/spi/
- *     SPIWFF3DMA.c:421) keeps running underneath it.
+ *     SPIWFF3DMA.c:421) keeps running underneath it.  osi_LockObjLock has NO
+ *     definition under source/ti/ (the core driver tree it is called from)
+ *     -- only a prototype; TI ships the OSI layer as application-adaptation
+ *     code the demo/example tree provides, not core SDK source.  The
+ *     definition ti/build_ti.sh actually links
+ *     (examples/rtos/LP_EM_CC35X1/demos/network_terminal/adaptation/
+ *     osi_dpl.c:414-440) resolves to SemaphoreP_pend, a semaphore wait --
+ *     confirmed for THIS adaptation file, but any other board's or
+ *     product's adaptation/osi_dpl.c is free to implement osi_LockObjLock
+ *     differently, so treat "a mutex, not an interrupt mask" as this
+ *     build's answer, not a property of the OSI API in general.
  *   - The SDK's ONE global DMA reset, DMAWFF3_initHw() (drivers/dma/
  *     DMAWFF3.c:109-120: disables/clears all DMA interrupts, then writes
  *     CHCTL0 = CHCTL1 = 0xFFFFFFFF), runs once behind an isInitialized
- *     latch, and its ONLY caller in the whole SDK is the bridge's OWN SPI
- *     driver (SPIWFF3DMA.c:1647) -- no Wi-Fi source calls it, ever.
+ *     latch.  Its only caller under source/ti/ (the SDK proper) is the
+ *     bridge's OWN SPI driver (DMAWFF3_init(), SPIWFF3DMA.c:1647) -- no
+ *     Wi-Fi source calls it.  The SysConfig-GENERATED Board_init also calls
+ *     DMAWFF3_init() once at boot (build/ti/ti_drivers_config.c:411, this
+ *     tree's own generated output, not SDK source either); either way it is
+ *     the same one-time isInitialized-gated init, called before any radio
+ *     or bridge activity, not a per-command reset.
  *   - The prebuilt libraries agree (arm-none-eabi-nm -u): wifi_host_driver.a
  *     and wifi_stack.a (the upper-MAC/network-stack libs) reference no real
  *     DMA symbol; wifi_platform_cc35xx.a references only
@@ -59,9 +78,16 @@
  *     (DMAInitChannel's read-modify-write of its own channel's 4-bit field,
  *     hif.c:141 inside HIFConfigure, hif.c:139) -- but that runs ONLY from
  *     HIFInit() (hif.c:114, i.e. Wlan_Start) and the PowerWFF3_AWAKE_SLEEP
- *     wake notify (hif.c:167), NEVER from a per-command Wlan_Get.  This
- *     firmware holds PowerWFF3_DISALLOW_SLEEP for every preset
- *     (hal/ti/cc3501e_hw_ti_power.c), so the wake path never fires either.
+ *     wake notify (hif.c:167), NEVER from a per-command Wlan_Get.  That wake
+ *     notify cannot fire for TWO independent reasons, not one: (a) the sleep
+ *     policy is never even ENABLED until a host POWER_POLICY command runs
+ *     pp_apply_core() at least once (Power_enablePolicy(), gated behind a
+ *     one-shot `policy_enabled` static, hal/ti/cc3501e_hw_ti_power.c) -- with
+ *     no policy enabled the idle loop cannot invoke PowerWFF3_sleepPolicy at
+ *     all, so no notify can fire regardless of any constraint; (b) once a
+ *     host DOES issue a POWER_POLICY command, that same pp_apply_core() holds
+ *     PowerWFF3_DISALLOW_SLEEP for every one of its presets.  Before the
+ *     first POWER_POLICY command it is reason (a); after one, it is (b).
  * Wlan_Start's bench-observed kill (measured, not read from source) stands;
  * this audit does not explain ITS mechanism -- HIFConfigure's CHCTL1 write
  * above and the NWP firmware download in
