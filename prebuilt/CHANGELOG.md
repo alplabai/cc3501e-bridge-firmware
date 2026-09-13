@@ -9,6 +9,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
 **Correction to v0.8.0's "An unconfigured station now defaults to ACTIVE" claim
 below.** That fix (`cc3501e_hw_power_service()` applying the effective policy
 after `Wlan_RoleUp(STA)`) only actually landed once `cc3501e_hw_tick()` next
@@ -16,12 +18,12 @@ drained it, which requires a return to `main()`'s bringup loop between the
 role-up and the connect. A `wifi connect` issued as the FIRST radio op of a
 boot runs `Wlan_RoleUp(STA)` and `Wlan_Connect` back-to-back inside the same
 worker job, with no such return in between -- so the ACTIVE default did not
-land before association and DHCP for that specific ordering, and the fix's
-16/16 bench result does not generalise to a connect-first attempt. Source
-fix pending release; see `hal/ti/cc3501e_hw_ti_wifi.c`'s
-`cc3501e_hw_wifi_ensure_sta_role()` and `hal/ti/cc3501e_hw_ti_power.c`'s
-`cc3501e_hw_power_apply_radio_now()`, which now apply the policy synchronously
-instead.
+land before association and DHCP for that specific ordering, and v0.8.0's own
+bench numbers below it (12 of 16 clean inside the connect call, 14 of 16 by any
+route) do not generalise to a connect-first attempt. Source fix pending
+release; see `hal/ti/cc3501e_hw_ti_wifi.c`'s `cc3501e_hw_wifi_ensure_sta_role()`
+and `hal/ti/cc3501e_hw_ti_power.c`'s `cc3501e_hw_power_apply_radio_now()`,
+which now apply the policy synchronously instead.
 
 ## v0.8.0
 

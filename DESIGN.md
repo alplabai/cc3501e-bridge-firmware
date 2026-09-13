@@ -272,8 +272,13 @@ association and the DHCP lease poll, not after the next `cc3501e_hw_tick()`.
 same as above) and, with no STA role up yet, `pp_apply_radio_effective()`
 skips calling `Wlan_Set()` at all rather than risk marking a policy applied
 that the vendor SDK's own `WLAN_SET_POWER_SAVE` path silently drops with no
-STA interface -- the latched flag then waits for the role-up path's own
-synchronous apply, or a later drain once a role exists.
+STA interface.  That skip does NOT leave anything latched for a later drain to
+retry -- `cc3501e_hw_power_service()` clears its dirty flag regardless of
+whether the apply underneath it actually ran.  The policy is not lost anyway:
+`cc3501e_hw_wifi_ensure_sta_role()` calls the same effective-policy apply
+UNCONDITIONALLY on every STA role-up, re-reading the latched policy VALUES
+fresh each time rather than depending on the flag, so the first role-up after
+a policy was set with no role up always applies it for real.
 
 > **[#1691](https://github.com/alplabai/alp-sdk/issues/1691):** repeated BLE
 > advertise/stop cycles can wedge the bridge. It is NOT power-related — it
