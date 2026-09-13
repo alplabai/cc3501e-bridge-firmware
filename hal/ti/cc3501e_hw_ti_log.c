@@ -179,7 +179,14 @@ uint32_t cc3501e_hw_uptime_ms(void)
 	 * The baseline is taken in cc3501e_hw_init(); the lazy capture here only
 	 * covers a caller that somehow runs first, so the field can never report a
 	 * pre-boot span.  Unsigned subtraction is correct across the 32-bit tick
-	 * wrap. */
+	 * wrap.
+	 *
+	 * A caller that subtracts two of THIS function's own return values to get
+	 * an elapsed time (e.g. cc3501e_hw_wifi_connect_sta()'s RUN9 retry
+	 * deadline, hal/ti/cc3501e_hw_ti_wifi.c) inherits wrap-safety from the
+	 * SAME argument only because this platform's ClockP tick period is 1 ms
+	 * -- do not assume it still holds if that period is ever reconfigured
+	 * coarser. */
 	if (!s_boot_ticks_valid) {
 		cc3501e_hw_uptime_mark_boot();
 	}
