@@ -267,6 +267,70 @@ ZTEST(cc3501e_sock_send_done, test_new_seq_after_collect_submits_fresh)
 	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "send_f collects its own DONE");
 }
 
+/* The remaining duplicate-bytes path (host review, on top of 9656d37/ced5637):
+ * a SOCK_SEND completes but is never collected -- instead a DIFFERENT
+ * worker-routed opcode's poll discards it via worker_poll()'s own orphan-
+ * discard arm (src/worker.c) before the host's same-seq re-issue of the
+ * SEND ever arrives.  The #88 cache used to be filled only on COLLECT, so
+ * that re-issue found the slot IDLE (discarded) and nothing cached, and
+ * re-submitted -- queuing the same bytes twice.
+ * protocol_sock_send_on_worker_complete() (worker.h, called from worker.c's
+ * worker_execute()) fills the cache at COMPLETION instead, so the re-issue
+ * is answered from it regardless of what happened to the job slot in
+ * between. */
+ZTEST(cc3501e_sock_send_done, test_orphan_discarded_send_still_answers_from_cache)
+{
+	uint8_t reply[32];
+	uint8_t send_g[13];
+	build_send(send_g, 7u, 0x77u);
+	const uint32_t execs_before = worker_execs();
+
+	/* Submit send_g and walk away: the wrap makes this a REAL WORKER_DONE
+	 * (cc3501e_hw_sock_send() ran once, right here), but nobody collects it. */
+	transaction(send_g, sizeof send_g);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_g submits -> BUSY");
+
+	/* A DIFFERENT worker-routed opcode (argless, like
+	 * test_abandoned_job_does_not_wedge_the_slot in test_transport_spi.c)
+	 * polls the SAME single job slot.  worker_poll()'s orphan-discard arm
+	 * (job_cmd mismatch, terminal state) throws send_g's uncollected DONE
+	 * away and reports IDLE, so this opcode submits fresh -> BUSY. */
+	const uint8_t rssi[] = { ALP_CC3501E_CMD_WIFI_GET_RSSI, 0x00u, 0x00u, 0x00u };
+	transaction(rssi, sizeof rssi);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "an unrelated worker-routed opcode discards send_g's orphaned DONE and "
+	              "submits its own job");
+
+	/* send_g's OWN same seq, re-issued exactly as poll_by_repeat() would:
+	 * the job slot is gone (holding WIFI_GET_RSSI's job now, not send_g's),
+	 * but the completion-time cache entry is not -- this must be answered
+	 * from it, WITHOUT resubmitting send_g's payload. */
+	transaction(send_g, sizeof send_g);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(2u), "cached reply = header + status + 2B queued-count");
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_OK,
+	              "send_g's same-seq re-issue is answered from the cache after being orphan-"
+	              "discarded, not resubmitted");
+	zassert_equal((uint16_t)(reply[5] | ((uint16_t)reply[6] << 8)),
+	              1u,
+	              "the cached reply is send_g's ORIGINAL queued count");
+
+	/* g_worker_execs increments exactly once per worker_execute() call, which
+	 * on this stub happens synchronously at SUBMIT (never at collect) -- so
+	 * the count is already final: +1 for send_g's own completion, +1 for
+	 * WIFI_GET_RSSI's submit above, +0 for the cached re-issue just now.
+	 * cc3501e_hw_sock_send() (the wrapped body) is what send_g's +1 IS; it
+	 * did NOT run again for the re-issue. */
+	zassert_equal(worker_execs(),
+	              execs_before + 2u,
+	              "exactly two worker bodies ran total (send_g once, RSSI once); the cached "
+	              "re-issue did not run cc3501e_hw_sock_send() again");
+}
+
 static void reset_worker(void *fixture)
 {
 	(void)fixture;

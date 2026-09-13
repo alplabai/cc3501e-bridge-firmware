@@ -46,10 +46,45 @@
  * the send reply is a 2-byte queued-count, so this is 4 bytes of static RAM
  * (valid flag + seq + the 2 reply bytes), nothing like SPI1's 4 KB (see
  * protocol_spi.c's own note on that cost, offered as the upgrade path if a
- * host ever needs more than the single most-recent send cached). */
+ * host ever needs more than the single most-recent send cached).
+ *
+ * FILLED FROM TWO PLACES.  handle_sock_send()'s own COLLECT below (a normal
+ * poll that reaches WORKER_DONE) is one.  The other is
+ * protocol_sock_send_on_worker_complete() further down -- worker.c's
+ * worker_execute() calls it the INSTANT a SOCK_SEND job goes terminal, so
+ * the cache is filled even if THIS handler never gets to collect it at all:
+ * a DIFFERENT opcode's poll can discard an uncollected SOCK_SEND job via
+ * worker_poll()'s orphan-discard arm before the host's own same-seq
+ * re-issue ever arrives (host review, alp-sdk#2035-era) -- without the
+ * completion-time fill, that re-issue would find nothing to collect AND
+ * nothing cached, and queue the same bytes twice.  Both writers converge on
+ * this SAME cache, so a lookup here does not need to know or care which one
+ * filled it. */
 static bool    g_sock_send_cached;
 static uint8_t g_sock_send_seq;
 static uint8_t g_sock_send_reply[2];
+
+/* See worker.h for the full contract.  ERR is deliberately NOT cached: as
+ * worker.c's own SOCK_SEND case shows (the `if (rv == CC3501E_HW_OK)` guard
+ * around the ONLY place it ever fills the reply with a queued-byte count),
+ * cc3501e_hw_sock_send() reports bytes queued ONLY on success -- a non-OK
+ * @p hw_rv means NOTHING reached the socket.  Re-submitting the same
+ * payload under the same seq after a discarded ERR is therefore a plain,
+ * safe retry, not a duplicate-bytes hazard -- exactly how a COLLECTED ERR
+ * already behaves today (the `if (st == ALP_CC3501E_RESP_OK)` guard in
+ * handle_sock_send() below has only ever cached a success).  Caching ERR
+ * here would be a behaviour change -- making a failed send's status sticky
+ * across what is otherwise an ordinary resubmit -- that this fix does not
+ * need to make. */
+void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t *data, size_t len)
+{
+	if (hw_rv != CC3501E_HW_OK) return;
+	if (len != sizeof(g_sock_send_reply)) return; /* defensive; worker.c always passes 2 */
+
+	memcpy(g_sock_send_reply, data, sizeof(g_sock_send_reply));
+	g_sock_send_seq    = seq;
+	g_sock_send_cached = true;
+}
 
 /* SOCK_OPEN (0x20): req = alp_cc3501e_sock_open_t { family | type | protocol |
  * reserved } = 4 B.  Reply DATA = alp_cc3501e_sock_handle_t (4 B). */
@@ -220,7 +255,16 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 	 *     SPI1_TRANSFER (protocol_spi.c) carries the identical exposure from
 	 *     its own req[3]-seq check under the same build option -- this is
 	 *     not a new class of risk, just the same one CRC-off already
-	 *     accepts, now shared by a second opcode. */
+	 *     accepts, now shared by a second opcode.
+	 *
+	 * A THIRD path this guard alone does NOT close: a DIFFERENT opcode's poll
+	 * discarding THIS job (worker_poll()'s own orphan-discard arm) before the
+	 * host's own same-seq re-issue of THIS send ever arrives.  That is closed
+	 * separately -- see g_sock_send_cached's comment above and
+	 * protocol_sock_send_on_worker_complete() (worker.h) -- by filling the
+	 * cache at COMPLETION time, not only on collect, so a same-seq re-issue
+	 * still finds its answer even after this job has been discarded out from
+	 * under it. */
 	(void)worker_discard_stale_terminal(
 	    ALP_CC3501E_CMD_SOCK_SEND, offsetof(alp_cc3501e_sock_send_t, seq), seq);
 

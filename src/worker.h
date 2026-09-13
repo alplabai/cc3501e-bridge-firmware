@@ -153,6 +153,42 @@ void worker_reset(void);
 int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte);
 
 /*
+ * protocol_sock_send_on_worker_complete -- SOCK_SEND-ONLY completion hook.
+ * DEFINED in protocol_sockets.c (owner of the #88 seq-keyed reply cache:
+ * g_sock_send_cached / g_sock_send_seq / g_sock_send_reply), CALLED from
+ * HERE -- worker.c's worker_execute() -- the instant a SOCK_SEND job
+ * reaches a terminal state, inside the SAME critical section that
+ * publishes job.state (see worker_execute()).  That placement is load-
+ * bearing, not cosmetic: it guarantees the cache entry for @p seq exists
+ * BEFORE any poll, on any context, for any opcode, can first observe this
+ * job as terminal -- so even worker_poll()'s orphan-discard arm (a
+ * DIFFERENT opcode's poll throwing this uncollected job away) can never
+ * run ahead of the cache being filled.  Closes the remaining duplicate-
+ * bytes gap worker_discard_stale_terminal() alone does not: a SOCK_SEND
+ * result that a different opcode's poll discards before the host's own
+ * same-seq re-issue arrives used to leave that re-issue with nothing to
+ * collect AND nothing cached (the #88 cache was filled only on collect),
+ * so it re-submitted and queued the same bytes twice.
+ *
+ * @p seq is the completed job's OWN request seq, read from job.req at the
+ * wire offset alp_cc3501e_sock_send_t.seq occupies -- safe to read without
+ * the critical section (job.req is stable from submit through this point;
+ * nothing writes it again before the NEXT submit, which cannot happen
+ * before this job is collected or discarded).
+ *
+ * @p hw_rv is the RAW cc3501e_hw_sock_send() return (CC3501E_HW_OK or a
+ * CC3501E_HW_ERR_* code) -- worker.c stays wire-response-agnostic; mapping
+ * a HW code to an ALP_CC3501E_RESP_* belongs to the protocol layer, same as
+ * everywhere else worker.c's callers already do it.  @p data / @p len are
+ * the 2-byte queued-count reply, valid on CC3501E_HW_OK only.
+ *
+ * A non-OK @p hw_rv is NOT cached (see protocol_sockets.c's definition for
+ * why: nothing was queued on failure, so re-submitting under the same seq
+ * after a discarded ERR is a safe, ordinary retry, not a duplicate-bytes
+ * hazard -- exactly how a COLLECTED ERR already behaves today). */
+void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t *data, size_t len);
+
+/*
  * worker_run_pending -- THE DRAIN.  Runs OUTSIDE the ISR, from main()'s
  * loop / bringup_task.  If a job is QUEUED it transitions it to RUNNING,
  * calls the (possibly blocking) HAL body, stores the result, and sets

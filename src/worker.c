@@ -29,6 +29,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h> /* offsetof -- SOCK_SEND's own seq field, not a magic wire offset */
 #include <string.h>
 
 #include "worker.h"
@@ -510,6 +511,18 @@ static void worker_execute(uint8_t cmd)
 	/* Publish the result atomically wrt the SPI ISR: fill result[] first,
 	 * then flip state LAST so a poller never sees DONE with stale bytes. */
 	const unsigned long key = worker_critical_enter();
+	/* SOCK_SEND-ONLY: publish into protocol_sockets.c's #88 seq-keyed reply
+	 * cache in this SAME critical section, strictly BEFORE job.state flips
+	 * below -- see protocol_sock_send_on_worker_complete()'s doc comment
+	 * (worker.h) for why the ordering is load-bearing, not cosmetic: it is
+	 * what stops worker_poll()'s orphan-discard arm (a DIFFERENT opcode's
+	 * poll, possibly on a different host thread) from ever observing this
+	 * job as terminal before the cache entry a same-seq re-issue would need
+	 * already exists. */
+	if (cmd == ALP_CC3501E_CMD_SOCK_SEND) {
+		protocol_sock_send_on_worker_complete(
+		    job.req[offsetof(alp_cc3501e_sock_send_t, seq)], rv, buf, len);
+	}
 	if (rv == CC3501E_HW_OK) {
 		memcpy((void *)job.result, buf, len);
 		job.result_len = (uint16_t)len;
