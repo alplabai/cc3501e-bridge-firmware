@@ -1027,6 +1027,136 @@ ZTEST(cc3501e_bridge_transport, test_sock_send_is_exempt_from_the_generic_latch)
 	              "send_a's cached reply");
 }
 
+/* worker_peek_terminal_req_byte()'s guard (protocol_sockets.c), the abandoned-
+ * send case test_sock_send_is_exempt_from_the_generic_latch above does NOT
+ * reach: that test always COLLECTS send_a (a second transaction(send_a))
+ * before ever sending send_b, so send_a's job is IDLE again by the time
+ * send_b arrives and there is nothing left for the guard to discard.  This
+ * test walks away after send_a's SUBMIT ack instead -- exactly
+ * alp-sdk#107/#1746's abandoned-seq-A scenario -- so send_a's ERR is still
+ * sitting in the slot, uncollected AND uncached (only a RESP_OK caches, see
+ * handle_sock_send), when send_b arrives.
+ *
+ * The ERR variant: the stub HAL's cc3501e_hw_sock_send() always returns
+ * CC3501E_HW_ERR_NOTIMPL (no real socket stack here), so WORKER_DONE is
+ * structurally unreachable for SOCK_SEND in this harness -- WORKER_ERR is
+ * the only terminal state a stub run can produce, and it is what the guard
+ * has to see and discard here. */
+ZTEST(cc3501e_bridge_transport, test_sock_send_stale_seq_is_discarded_and_new_send_submits)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	/* alp_cc3501e_sock_send_t = handle(2) flags(1) seq(1) data_len(2)
+	 * reserved2(2) = 8 B, then data inline -> payload_len 9.  Outer header
+	 * flags (byte[1]) left 0: SOCK_SEND is exempt from the generic 5-bit
+	 * latch (retry_latch_applies()), so it carries no meaning here. */
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       1u /* seq 1 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xAAu };
+	const uint8_t send_b[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       2u /* seq 2 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xBBu };
+
+	/* Submit send_a and WALK AWAY -- no second transaction(send_a) to collect
+	 * it.  The stub runs the body synchronously at submit (WORKER_ERR,
+	 * NOTIMPL), but this handler's own ack is always BUSY on the IDLE->QUEUED
+	 * edge regardless, so that terminal ERR is left sitting in the slot,
+	 * never collected, never cached. */
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_a submits -> BUSY");
+
+	/* send_b: a genuinely different logical send (different seq, different
+	 * payload byte).  Before this guard, handle_worker_routed_payload_reply's
+	 * worker_poll() would match the slot by opcode ALONE, collect send_a's
+	 * abandoned ERR as if it were send_b's answer (NOT_READY, with send_b's
+	 * own payload never submitted), and worker_reset() the slot on its way
+	 * out.  With the guard, the seq mismatch (1 vs 2) discards send_a's ERR
+	 * itself, so the fall-through meets WORKER_IDLE and submits send_b fresh
+	 * -> BUSY, not NOT_READY. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4],
+	              ALP_CC3501E_RESP_ERR_BUSY,
+	              "send_a's stale ERR is discarded; send_b submits fresh instead of "
+	              "being answered with send_a's stale outcome");
+
+	/* And send_b's OWN result -- not send_a's -- is what the next poll
+	 * collects, proving send_b's payload genuinely reached the worker. */
+	transaction(send_b, sizeof send_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "send_b collects its own result, not send_a's");
+}
+
+/* A poll carrying SOCK_SEND's OWN seq (req[3]) unchanged from the sitting
+ * job's is the ordinary poll_by_repeat() retry the guard must leave alone:
+ * same seq still collects, exactly as before this fix. */
+ZTEST(cc3501e_bridge_transport, test_sock_send_same_seq_collects)
+{
+	uint8_t reply[32];
+	transport_spi_init();
+
+	const uint8_t send_a[] = { ALP_CC3501E_CMD_SOCK_SEND,
+		                       0x00u,
+		                       9u,
+		                       0x00u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       1u /* seq 1 */,
+		                       1u,
+		                       0u,
+		                       0u,
+		                       0u,
+		                       0xAAu };
+
+	transaction(send_a, sizeof send_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "send_a submits -> BUSY");
+
+	transaction(send_a, sizeof send_a); /* identical frame: an ordinary retry */
+	(void)drain(reply, sizeof reply);
+	zassert_equal(
+	    reply[4], ALP_CC3501E_RESP_ERR_NOT_READY, "same-seq poll collects the in-flight send");
+}
+
+/* NOT COVERED HERE, and saying so rather than shipping a test that passes
+ * either way (same policy as the generic-latch invalidation gap documented
+ * above test_sock_send_is_exempt_from_the_generic_latch): "a re-issue after
+ * collect is served from the cache" needs handle_sock_send() to actually
+ * reach its `if (st == ALP_CC3501E_RESP_OK)` cache-store arm at least once,
+ * and RESP_OK is structurally unreachable for SOCK_SEND on this stub --
+ * cc3501e_hw_sock_send() (hal/cc3501e_hw_stub.c) always returns
+ * CC3501E_HW_ERR_NOTIMPL, there being no real socket stack on the host.
+ * This predates the guard above (issue #88's cache has been untestable here
+ * since it landed) and the guard does not touch it either way: the cache
+ * check in handle_sock_send() runs BEFORE worker_peek_terminal_req_byte(),
+ * so a genuine cache hit returns straight out of that first `if` and never
+ * reaches the guard at all.  Proving the cache's own retry-serves-hit
+ * behaviour needs a real socket -- the bench, or the TI backend. */
+
 ZTEST(cc3501e_bridge_transport, test_diag_log_level_ok)
 {
 	uint8_t reply[16];

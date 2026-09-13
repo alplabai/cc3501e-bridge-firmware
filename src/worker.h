@@ -119,6 +119,35 @@ worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *
 void worker_reset(void);
 
 /*
+ * worker_peek_terminal_req_byte -- narrow, SOCK_SEND-only escape hatch (see
+ * protocol_sockets.c's handle_sock_send).  Without collecting or resetting
+ * anything, reports whether a TERMINAL (DONE/ERR) job for @p cmd is
+ * currently sitting in the slot and, if so, hands back one byte of the
+ * REQUEST it was originally submitted with (worker_submit_payload's
+ * job.req[@p req_off] -- untouched by the drain once terminal, so it still
+ * reads back exactly what was submitted).
+ *
+ * This is deliberately NOT a general "job identity" mechanism: it does not
+ * change worker_poll()'s opcode-only matching, add a seq field to the job,
+ * or touch worker_submit/worker_submit_payload's signatures.  It exists
+ * ONLY so a caller that already owns a stronger, opcode-specific identity
+ * of its own (SOCK_SEND's per-send seq at req[3], alp_cc3501e_sock_send_t)
+ * can ask "is the terminal result sitting here actually the one I am
+ * waiting for, or a stale one nobody came back for" and worker_reset() it
+ * itself BEFORE falling through to the generic worker-routed helper --
+ * exactly the same pattern protocol_spi.c's handle_spi1_transfer() already
+ * uses for SPI1_TRANSFER, one level up (there the check runs against the
+ * job's OWN already-collected reply data; here it runs against the job's
+ * stored request, since a still-DONE-but-uncollected job has never had its
+ * reply read out through this seam).
+ *
+ * Returns 1 with *req_byte set if a terminal @p cmd job is present and
+ * @p req_off < the stored request's length; 0 otherwise (IDLE, QUEUED/
+ * RUNNING, a different opcode, or @p req_off out of range) -- *req_byte is
+ * left untouched on a 0 return. */
+int worker_peek_terminal_req_byte(uint8_t cmd, size_t req_off, uint8_t *req_byte);
+
+/*
  * worker_run_pending -- THE DRAIN.  Runs OUTSIDE the ISR, from main()'s
  * loop / bringup_task.  If a job is QUEUED it transitions it to RUNNING,
  * calls the (possibly blocking) HAL body, stores the result, and sets

@@ -163,6 +163,52 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
 		return ALP_CC3501E_RESP_OK;
 	}
 
+	/* STALE-SEND GUARD (mirrors protocol_spi.c's SPI1_TRANSFER seq check,
+	 * one level up): the cache above only catches a RETRY of a send this
+	 * handler already collected.  It does NOT catch the send this handler
+	 * never got to collect at all -- the host issued SOCK_SEND under seq A,
+	 * gave up on poll_by_repeat before the worker finished, and has now
+	 * moved on to a genuinely NEW send under seq B.  worker_poll() inside
+	 * handle_worker_routed_payload_reply() below matches the job slot by
+	 * OPCODE ALONE, so without this check that call would hand seq A's
+	 * finished (but never collected, never cached) result back as if it
+	 * were seq B's -- RESP_OK plus seq A's queued-byte count -- and seq B's
+	 * actual payload would never be submitted to the worker at all.
+	 *
+	 * worker_peek_terminal_req_byte() reads back byte 3 of whatever request
+	 * the sitting job was ORIGINALLY submitted with (worker.c) -- the same
+	 * req[3] seq field this handler itself sends -- without collecting or
+	 * resetting it.  A terminal SOCK_SEND job whose own seq differs from
+	 * THIS request's is exactly the abandoned-seq-A case above: reset it
+	 * here so the fall-through below sees WORKER_IDLE and submits seq B
+	 * fresh, instead of handle_worker_routed_payload_reply() collecting
+	 * seq A's stale answer.  A terminal job whose seq MATCHES THIS request's
+	 * own seq is left alone -- it is the ordinary poll_by_repeat retry the
+	 * fall-through below is meant to collect.  QUEUED/RUNNING is also left
+	 * alone regardless of seq: there is no terminal result yet for either
+	 * seq to misclaim, so the fall-through correctly reports BUSY.
+	 *
+	 * RESIDUAL, STATED PLAINLY -- this narrows the failure alp-sdk#107's
+	 * abandoned-seq-A scenario names, it does not close it to zero.  Once
+	 * seq A's bytes are genuinely QUEUED into lwIP (the worker body ran,
+	 * MSG_DONTWAIT accepted some or all of them), that queuing already
+	 * happened -- discarding the sitting job here only stops this firmware
+	 * from MISREPORTING seq A's outcome as seq B's, it cannot un-send bytes
+	 * already handed to the socket.  If the host's own bounded collection
+	 * grace (cc3501e_sock_send()'s CC3501E_SOCK_SEND_COLLECT_GRACE_MS,
+	 * chips/cc3501e/cc3501e_sockets.c) also fails to collect seq A -- the
+	 * whole reason that grace window exists -- and the host then reissues
+	 * the SAME remaining bytes under a NEW seq B, those bytes queue TWICE.
+	 * The host-side grace window is what makes this rare in practice; this
+	 * guard's job is narrower and unconditional: whatever seq A's actual
+	 * outcome was, seq B is never answered with seq A's stale count and
+	 * never skips its own submit. */
+	uint8_t sitting_seq = 0u;
+	if (worker_peek_terminal_req_byte(ALP_CC3501E_CMD_SOCK_SEND, 3u, &sitting_seq) &&
+	    sitting_seq != seq) {
+		worker_reset();
+	}
+
 	const alp_cc3501e_resp_t st = handle_worker_routed_payload_reply(
 	    ALP_CC3501E_CMD_SOCK_SEND, req, req_len, 2u, reply_data, reply_cap, reply_data_len);
 	if (st == ALP_CC3501E_RESP_OK) {

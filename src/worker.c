@@ -656,6 +656,19 @@ void worker_reset(void)
 	worker_critical_exit(key);
 }
 
+int worker_peek_terminal_req_byte(uint8_t cmd, size_t req_off, uint8_t *req_byte)
+{
+	const unsigned long key = worker_critical_enter();
+	int                 ok  = 0;
+	if (job.job_cmd == cmd && (job.state == WORKER_DONE || job.state == WORKER_ERR) &&
+	    req_off < (size_t)job.req_len) {
+		if (req_byte != NULL) *req_byte = job.req[req_off];
+		ok = 1;
+	}
+	worker_critical_exit(key);
+	return ok;
+}
+
 void worker_run_pending(void)
 {
 	/* Promote QUEUED -> RUNNING atomically so the ISR can't double-submit
