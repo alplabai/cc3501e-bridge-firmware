@@ -84,6 +84,16 @@ void cc3501e_hw_tick(void);
  * backend (no real SPI slave to heal). */
 void cc3501e_hw_link_heal(bool in_connect_wait);
 
+/* #142 item 2 (host review of dfd5280): call ONCE per cc3501e_hw_wifi_
+ * connect_sta() attempt, right after that body's own role-up reinit (or at
+ * the same point if no reinit ran) -- resets the quiet-armed detector's
+ * per-call fire cap and its "has a real transfer landed since this attempt
+ * began" arm gate.  See hal/ti/cc3501e_hw_ti.c's quiet_arm_after_xfer_count/
+ * quiet_fired_this_call for what this actually resets.  No-op on the stub
+ * backend and on an SDIO build (the detector itself is compiled out there,
+ * item 3). */
+void cc3501e_hw_link_heal_begin_connect(void);
+
 /* Diagnostic counter: quiet-rearm heals fired by cc3501e_hw_link_heal() since
  * boot (#142).  0 on the stub backend.  See that counter's own comment in
  * hal/ti/cc3501e_hw_ti.c for why it is not (yet) on the wire. */

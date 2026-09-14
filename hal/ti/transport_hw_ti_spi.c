@@ -714,12 +714,31 @@ bool bridge_transport_spi_phase_stalled(void)
  * cc3501e_hw_link_heal(), and ONLY from cc3501e_hw_wifi_connect_sta()'s own
  * wait points -- never from the unconditional idle tick.  See that call
  * path's own comments (hal/ti/cc3501e_hw_ti_wifi.c) for the WHO/WHEN safety
- * argument; this file only stamps and reports the raw quiet duration. */
+ * argument; this file only stamps and reports the raw quiet duration.
+ *
+ * g_xfer_count is the SEPARATE counter #142's host review of dfd5280 added:
+ * bumped ONLY here, in on_transfer(), never in spi_open_and_arm()/
+ * _hw_release()/_hw_suspend() the way g_last_xfer_ms is.  quiet_ms resetting
+ * on the heal's OWN re-arm is correct for deciding WHEN to fire (so a stale
+ * pre-flash stamp is never inherited), but it is the WRONG signal for
+ * deciding when the once-per-episode latch may clear: a reinit that just
+ * re-armed the header satisfies "quiet_ms dropped" against ITSELF, which let
+ * the detector clear its own latch and fire again ~rearm_ms later with zero
+ * real evidence anything changed -- measured against a genuinely deaf slave:
+ * 9 fires in 30 s.  g_xfer_count only ever moves on a REAL host-driven
+ * transfer, so src/link_quiet_rearm.h's latch now clears on THIS counter
+ * moving, never on quiet_ms alone. */
 static volatile uint32_t g_last_xfer_ms;
+static volatile uint32_t g_xfer_count;
 
 uint32_t bridge_transport_spi_quiet_ms(void)
 {
 	return (uint32_t)(cc3501e_hw_uptime_ms() - g_last_xfer_ms);
+}
+
+uint32_t bridge_transport_spi_xfer_count(void)
+{
+	return g_xfer_count;
 }
 
 #ifdef CC3501E_WEDGE_PROBE
@@ -736,8 +755,12 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 	/* #142: this callback firing AT ALL is evidence the slave heard the host,
 	 * regardless of which phase or whether it was a clean advance, a bad-frame
 	 * re-arm, or a CANCELED/failed-arm bounce -- see g_last_xfer_ms's own
-	 * comment above bridge_transport_spi_quiet_ms(). */
+	 * comment above bridge_transport_spi_quiet_ms().  g_xfer_count moves HERE
+	 * ONLY -- see that counter's own comment just above -- so it is real host
+	 * evidence, never something the heal's own reinit can satisfy against
+	 * itself. */
 	g_last_xfer_ms = cc3501e_hw_uptime_ms();
+	g_xfer_count++;
 	/* A phase's transfer just ended -> the slave is momentarily NOT armed for the host's
 	 * next clock.  Drop READY so the host holds off until arm_transfer() re-raises it. */
 	cc3501e_bridge_busy();
@@ -1241,6 +1264,17 @@ void bridge_transport_spi_hw_release(void)
 uint8_t bridge_transport_spi_phase(void)
 {
 	return (uint8_t)phase;
+}
+
+/* #142 item 9: named accessor for the PH_REQ_HEADER == 0 contract -- see
+ * transport.h's own doc comment on this function.  bridge_transport_spi_
+ * phase() itself is UNCHANGED (still the raw wire value); this is a second,
+ * self-documenting way to ask the one question cc3501e_hw_link_heal() (hal/
+ * ti/cc3501e_hw_ti.c) actually needs answered, without a bare `== 0u` at the
+ * call site. */
+bool bridge_transport_spi_at_idle_header(void)
+{
+	return phase == PH_REQ_HEADER;
 }
 
 bool bridge_transport_spi_hw_reinit(void)

@@ -34,6 +34,11 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	(void)in_connect_wait;
 }
 
+void cc3501e_hw_link_heal_begin_connect(void)
+{
+	/* no-op on the stub backend (#142 item 2) */
+}
+
 uint32_t cc3501e_hw_link_quiet_rearm_count(void)
 {
 	return 0u;

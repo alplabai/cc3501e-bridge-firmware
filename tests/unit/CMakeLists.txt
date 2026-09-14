@@ -353,11 +353,11 @@ target_link_libraries(test_wifi_retry PRIVATE ztest_shim)
 add_test(NAME wifi_retry COMMAND test_wifi_retry)
 
 # link_quiet_rearm: the pure once-per-episode DECISION behind #142's
-# quiet-armed detector (hal/ti/cc3501e_hw_ti.c's cc3501e_hw_link_tick()).
+# quiet-armed detector (hal/ti/cc3501e_hw_ti.c's cc3501e_hw_link_heal()).
 # Same reasoning as sock_prefetch_arm above for building it standalone: pure
 # arithmetic, no dependency on the rest of the firmware, and the real caller
-# is TI-SDK-only (needs bridge_transport_spi_quiet_ms()/_phase()/
-# _reply_armed(), hal/ti/transport_hw_ti_spi.c) and never linked on the
+# is TI-SDK-only (needs bridge_transport_spi_quiet_ms()/_at_idle_header()/
+# _xfer_count(), hal/ti/transport_hw_ti_spi.c) and never linked on the
 # host.  Header-only (link_quiet_rearm.h is `static inline`, no .c to add).
 add_executable(test_link_quiet_rearm
     link_quiet_rearm/src/test_link_quiet_rearm.c
