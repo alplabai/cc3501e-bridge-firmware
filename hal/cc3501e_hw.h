@@ -258,6 +258,56 @@ int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
  * same order for both, unchanged from the pre-v9 STA-only body. */
 int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
 
+/* ---- drain reinit handoff (issue #106, connect flavour) -------------------- *
+ * cc3501e_hw_wifi_connect_sta's SUCCESS path re-arms the SPI slave (busy() +
+ * bridge_transport_spi_hw_reinit()) ITSELF, right before it publishes
+ * CONNECTED, instead of waiting for src/worker.c's drain to do it after the
+ * body returns -- the drain's reinit landed too late, after the host's
+ * WIFI_STATUS poll had already seen CONNECTED and started clocking
+ * WIFI_GET_RSSI at its dense post-connect cadence into a slave the connect's
+ * own Wlan_Connect + association wait had left torn down.  The body does NOT
+ * call cc3501e_bridge_ready() itself; it hands the armed outcome here
+ * instead, so the DRAIN can raise READY without paying a SECOND
+ * SPI_close/SPI_open for the same event.  That is what this handoff buys --
+ * NOT a READY-vs-worker_reset() ordering guarantee: bridge_transport_spi_hw_
+ * reinit() already raises READY itself, as a side effect, when the arm
+ * succeeds (transport_hw_ti_spi.c's arm_transfer()), independently of
+ * whether the body or the drain also calls cc3501e_bridge_ready() -- so
+ * READY's actual state is set before either of them gets a chance to touch
+ * it, not after.  See the body for the full citation trail.
+ *
+ * take_reinit() is a ONE-SHOT read-and-clear, not a state query: it reports
+ * true (and clears the latch) only for the run whose SUCCESS exit just took
+ * that reinit, so the drain can skip paying it a second time and instead
+ * trust @p armed_out for whether the slave actually came up armed.  A run
+ * that took a FAILURE exit (bad args, role-up fail, Wlan_Connect reject,
+ * association timeout, no DHCP lease) never reaches that reinit, so this
+ * reports false for it and the drain's own reinit still runs, unchanged from
+ * before #106.  The stub / silicon-free build always reports false (no body
+ * ever takes the reinit there). */
+bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out);
+
+/* ---- drain reinit handoff (issue #106, RSSI flavour) ----------------------- *
+ * cc3501e_hw_wifi_get_rssi() has TWO possible shapes depending on whether
+ * Wi-Fi was already running: if it was, this call's only radio op is the
+ * short Wlan_Get itself, with no reinit anywhere in the body -- if it was
+ * NOT, cc3501e_hw_wifi_lazy_start() inside this call runs Wlan_Start() and
+ * ITS OWN reinit first, and THROWS AWAY that reinit's armed/not-armed result.
+ * The drain may only skip its own post-op reinit in the FIRST shape, where
+ * nothing else has already tried (and had its result discarded) to recover
+ * the slave -- skipping in the second shape would raise READY unconditionally
+ * over a genuinely unknown state (the #1133 condition).
+ *
+ * take_reinit_skip() is a ONE-SHOT read-and-clear: it reports true (and
+ * clears the latch) for every run of cc3501e_hw_wifi_get_rssi() -- success or
+ * its CC3501E_HW_ERR_IO exit alike -- and hands back @p skip_ok_out for
+ * whether Wi-Fi was ALREADY started when that run began (the drain may skip)
+ * or not (the drain must reinit as normal).  The stub / silicon-free build
+ * always reports false (no body ever runs there), which is safe: false means
+ * "not this run's call to make", so the drain falls through to its normal
+ * measured reinit + arm-check. */
+bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out);
+
 /* ---- async-connect status latch (CMD_WIFI_STATUS) -------------------------- *
  * The connect body (cc3501e_hw_wifi_connect_sta) BLOCKS for seconds on the
  * association event, so it is worker-routed off the SPI ISR.  The host no longer
