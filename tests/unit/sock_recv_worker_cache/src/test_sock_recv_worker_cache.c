@@ -99,6 +99,20 @@ static bool     g_wrap_large_mode;
 static uint16_t g_wrap_large_n;      /* bytes reported by the last large-mode call */
 static uint16_t g_wrap_last_cap;     /* @p cap worker.c passed on the last call */
 static uint16_t g_wrap_last_max_len; /* @p max_len worker.c passed on the last call */
+/* cc3501e-bridge-firmware bug 1 (worker-path recv after EOF answers
+ * RESP_ERR_RADIO): models what the REAL TI HAL now does after the
+ * hal/ti/cc3501e_hw_ti_sock.c sticky-EOF fix -- every recv on an fd that has
+ * already seen EOF reports CC3501E_HW_OK with 0 bytes, not just the first.
+ * The fix itself lives in that TI-SDK-only file and cannot link on the host
+ * (see the block comment above cc3501e_hw_sock_recv()'s sock_eof table for
+ * the full argument, and this suite's own top comment for why --wrap is
+ * this file's way of reaching a real RESP_OK on the host at all) -- this
+ * mode instead proves the PLUMBING this fix depends on: that
+ * protocol_sockets.c threads a HAL-reported OK/0-bytes through to the wire
+ * as RESP_OK on EVERY worker-routed poll, not just the first, so the fixed
+ * HAL's repeated OK/0 answers actually reach the host as EOF rather than
+ * falling into some other latent short-circuit. */
+static bool g_wrap_eof_mode;
 
 /* protocol.h's CC3501E_REPLY_DATA_MAX is the wire's own documented ceiling on
  * a handler's total reply DATA (status byte's payload); the recv-resp header
@@ -118,6 +132,12 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
 	g_wrap_calls++;
 	g_wrap_last_cap     = cap;
 	g_wrap_last_max_len = max_len;
+	if (g_wrap_eof_mode) {
+		if (recv_len_out != NULL) *recv_len_out = 0u;
+		if (from_addr != NULL) memset(from_addr, 0, 4u);
+		if (from_port_out != NULL) *from_port_out = 0u;
+		return CC3501E_HW_OK;
+	}
 	if (g_wrap_large_mode) {
 		/* Simulates a peer with AT LEAST this many bytes queued -- i.e. a
 		 * full read that consumes exactly what worker.c's own data_cap (the
@@ -789,10 +809,51 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_probe_shared_counter_wrap_via_other_o
 	zassert_equal(st, ALP_CC3501E_RESP_OK, "KNOWN RESIDUAL: served the stale recv as OK");
 }
 
+/* Bug 1 fix (worker-path recv after EOF answers RESP_ERR_RADIO, bench-
+ * measured run12 P2b, 3/3 boots): with the HAL reporting OK/0 on EVERY recv
+ * for an fd that already saw EOF (g_wrap_eof_mode above -- what
+ * hal/ti/cc3501e_hw_ti_sock.c's sticky-EOF table now guarantees on real
+ * silicon), the wire must answer RESP_OK with 0 bytes on repeated polls, not
+ * just the first.  Uses two DIFFERENT seqs on the same handle (not a
+ * same-seq retry) so each poll is a genuinely NEW logical recv reaching the
+ * HAL -- exactly "a socket that does not own the prefetch ring gets EOF,
+ * then a LATER recv on the same handle", the bug's own reproduction shape --
+ * rather than a cache hit replaying the first answer. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_eof_then_later_recv_answers_ok_zero_twice)
+{
+	uint8_t        reply[64];
+	uint8_t        req_a[8];
+	uint8_t        req_b[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req_a, 10u, 900u);
+	build_recv(req_b, 11u, 900u); /* same handle, different seq -- a later, new recv */
+
+	g_wrap_eof_mode = true;
+
+	int sub_a = poll_status(req_a, reply, sizeof reply);
+	zassert_equal(sub_a, ALP_CC3501E_RESP_ERR_BUSY, "first EOF recv submits");
+	int got_a = poll_status(req_a, reply, sizeof reply);
+	zassert_equal(got_a, ALP_CC3501E_RESP_OK, "first EOF recv answers OK, not RESP_ERR_RADIO");
+
+	int sub_b = poll_status(req_b, reply, sizeof reply);
+	zassert_equal(sub_b, ALP_CC3501E_RESP_ERR_BUSY, "second, later EOF recv submits fresh");
+	int got_b = poll_status(req_b, reply, sizeof reply);
+	zassert_equal(got_b,
+	              ALP_CC3501E_RESP_OK,
+	              "second EOF recv ALSO answers OK, not RESP_ERR_RADIO -- the bug this fix closes");
+
+	zassert_equal(g_wrap_calls,
+	              calls_before + 2u,
+	              "both recvs actually reached the HAL body, not a cache replay");
+
+	g_wrap_eof_mode = false;
+}
+
 static void reset_worker(void *fixture)
 {
 	(void)fixture;
 	g_wrap_large_mode = false;
+	g_wrap_eof_mode   = false;
 	worker_init();
 }
 

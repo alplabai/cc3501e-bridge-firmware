@@ -796,6 +796,19 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 				*reply_data_len = 0u;
 				return ALP_CC3501E_RESP_ERR_BUSY;
 			}
+			if (rc == -3) {
+				/* Ring drained AND the pump recorded a real lwIP failure on this
+				 * fd (RST etc, see hal/cc3501e_hw.h's doc comment on this
+				 * function and hal/ti/cc3501e_hw_ti_sock.c's peer_error field).
+				 * Terminal, same reason -2 above must not fall through
+				 * (#7) -- but unlike -2, nothing is ever coming, so answering
+				 * BUSY would just spin the host to its poll_by_repeat timeout
+				 * instead of reporting the failure.  Same status a genuine
+				 * worker-path socket failure gets (sock_worker_hw_err_to_resp()
+				 * above maps CC3501E_HW_ERR_IO to this too). */
+				*reply_data_len = 0u;
+				return ALP_CC3501E_RESP_ERR_RADIO;
+			}
 			if (rc >= 0) {
 				/* from[] is zeroed for STREAM sockets; data_len then the bytes. */
 				memset(reply_data, 0, hdr);

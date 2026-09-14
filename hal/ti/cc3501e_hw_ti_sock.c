@@ -44,6 +44,7 @@ extern size_t xPortGetFreeHeapSize(void);
  * why this is split out rather than inlined here. */
 #include "sock_prefetch_arm.h"
 #include "sock_recv_commit.h"
+#include "sock_recv_ring_status.h"
 
 #include "../cc3501e_hw.h"
 
@@ -83,6 +84,18 @@ extern size_t xPortGetFreeHeapSize(void);
  * returned 0 bytes for 81 s on a connection the server had already fed
  * 256 KiB (bench-measured, reverted). */
 #define CC3501E_SOCK_RCVTIMEO_MS 2
+
+/* True iff fd is a SOCK_STREAM (TCP) socket.  Shared by sock_connect() below
+ * (deciding whether to arm the prefetch ring) and, further down, the
+ * worker-path sticky-EOF fix (deciding whether an lwip_recvfrom() n==0 means
+ * "orderly close" rather than "empty UDP datagram"). */
+static bool sock_is_stream(int fd)
+{
+	int       so_type    = 0;
+	socklen_t so_type_sz = sizeof(so_type);
+	return lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_sz) == 0 &&
+	       so_type == SOCK_STREAM;
+}
 
 int cc3501e_hw_sock_open(uint8_t family, uint8_t type, uint8_t protocol, uint16_t *handle_out)
 {
@@ -151,10 +164,7 @@ int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, cons
 	 * locked out any STREAM socket's prefetch -- the case this fast path
 	 * actually exists for.  Check the real socket type with SO_TYPE rather
 	 * than trust a naming convention. */
-	int       so_type    = 0;
-	socklen_t so_type_sz = sizeof(so_type);
-	if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_sz) == 0 &&
-	    so_type == SOCK_STREAM) {
+	if (sock_is_stream(fd)) {
 		cc3501e_hw_sock_prefetch(handle, true);
 	}
 	return CC3501E_HW_OK;
@@ -453,6 +463,13 @@ static struct {
 	volatile uint32_t tail;     /* dispatch reads */
 	volatile uint16_t fd_plus1; /* socket being prefetched, 0 = none */
 	volatile bool     peer_closed;
+	/* Bug 2 fix (ring path never reports a reset): set by cc3501e_hw_sock_pump()
+	 * on a REAL lwip_recv() failure (RST etc, not EAGAIN/EWOULDBLOCK).  Before
+	 * this field existed the pump silently ignored n < 0 and the ring just
+	 * kept answering BUSY forever, so the host spun to timeout_ms and reported
+	 * ALP_ERR_TIMEOUT instead of an error -- see cc3501e_hw_sock_recv_ring()'s
+	 * drained-and-errored arm and cc3501e_hw_sock_pump() below. */
+	volatile bool peer_error;
 } rx_ring __attribute__((section(".bss.sock_ring")));
 
 static uint32_t ring_used(void)
@@ -620,7 +637,7 @@ void cc3501e_hw_sock_pump(void)
 	radio_speedtest_udp(); /* runs whether or not the host armed a TCP socket */
 #endif
 	const uint16_t h = rx_ring.fd_plus1;
-	if (h == 0u || rx_ring.peer_closed) {
+	if (h == 0u || rx_ring.peer_closed || rx_ring.peer_error) {
 		return;
 	}
 #ifdef CC3501E_RADIO_SPEEDTEST
@@ -663,8 +680,22 @@ void cc3501e_hw_sock_pump(void)
 		}
 		if (n == 0) {
 			rx_ring.peer_closed = true; /* orderly close */
+			return;
 		}
-		/* n < 0 with EAGAIN/EWOULDBLOCK is just "nothing yet" -- next tick. */
+		/* n < 0.  EAGAIN/EWOULDBLOCK is just "nothing yet" -- next tick, ring
+		 * stays armed.  Anything else (ECONNRESET etc) is a REAL failure: the
+		 * top-of-function guard above stops this task from calling lwip_recv()
+		 * on this fd again, so record it sticky for
+		 * cc3501e_hw_sock_recv_ring() to report once the already-buffered
+		 * bytes are drained (bug 2 fix -- see the peer_error field comment
+		 * above rx_ring). */
+		if (errno != EAGAIN
+#ifdef EWOULDBLOCK
+		    && errno != EWOULDBLOCK
+#endif
+		) {
+			rx_ring.peer_error = true;
+		}
 		return;
 	}
 }
@@ -750,6 +781,7 @@ void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 		}
 		rx_ring.head = rx_ring.tail = 0u;
 		rx_ring.peer_closed         = false;
+		rx_ring.peer_error          = false; /* bug 2 fix -- reset on arm, same as peer_closed */
 		sock_recv_commit_reset(&uncommitted);
 		rx_ring.fd_plus1 = handle; /* publish LAST -- see comment above */
 	} else if (rx_ring.fd_plus1 == handle) {
@@ -800,43 +832,17 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
 
 	if (n == 0u) {
 		rx_ring.tail = tail; /* nothing to copy -- safe to publish now */
-		if (rx_ring.peer_closed) {
-			/* CLOSED AND DRAINED -- this is END OF STREAM, and it must be answered
-			 * OK-with-0-bytes, not BUSY.
-			 *
-			 * #32 gave the empty ring a single answer (-2 -> RESP_ERR_BUSY) without
-			 * consulting peer_closed, which made EOF UNREACHABLE: once the peer
-			 * closes, cc3501e_hw_sock_pump() returns early on `peer_closed` (see the
-			 * guard at the top of it), so the ring can never refill.  The host then
-			 * got RESP_ERR_BUSY on every SOCK_RECV forever, and poll_by_repeat --
-			 * which retries precisely on BUSY -- span until its timeout instead of
-			 * seeing the 0-byte close the pre-#32 fall-through used to deliver.
-			 *
-			 * The -2/BUSY answer below is still right for the OTHER empty case: ring
-			 * empty but the connection still open, where more bytes really are
-			 * coming and 0 bytes would make poll_by_repeat give up early. */
-			return 0;
-		}
-		/* Armed but EMPTY.  This is its OWN answer (-2), distinct from "not my
-		 * handle" (-1), because the two need opposite handling and conflating them
-		 * cost a data-loss bug (#7):
-		 *
-		 *   -1 "not my handle" -> the worker is the ONLY reader of that fd, so the
-		 *      caller must fall through to it.
-		 *   -2 "armed but empty" -> the PUMP is the only reader of this fd.  Falling
-		 *      through submitted a SOCK_RECV worker job whose lwip_recvfrom() then
-		 *      pulled bytes B1 out of the same socket, while cc3501e_hw_tick ->
-		 *      cc3501e_hw_sock_pump (which main.c runs on the very next line) pulled
-		 *      B2 into this ring microseconds later.  The host's next poll hit the
-		 *      fast path, got B2 with RESP_OK, and B1 was stranded in the worker
-		 *      slot -- a TCP stream delivered with a hole and RESP_OK on every frame.
-		 *
-		 * Still NOT "OK with 0 bytes": cc3501e_sock_recv goes through
-		 * poll_by_repeat, which treats ALP_OK as final, so one recv on a socket
-		 * whose data had not landed yet returned 0 bytes and gave up (measured:
-		 * `NET recv -> 0 (0 B)` on a connection that was about to deliver 389 B).
-		 * The caller answers BUSY instead, which is what poll_by_repeat retries. */
-		return -2;
+		/* Nothing left to serve.  Which of the three answers this is (EOF /
+		 * terminal error / empty-for-now) is a pure decision over
+		 * peer_closed and peer_error -- see sock_recv_ring_status.h for the
+		 * full argument (in particular why EOF is checked first, why -2 vs
+		 * -1 matters (#7: the pump is the ONLY reader of this fd, so the
+		 * caller must NOT fall through to the worker path on either -2 or
+		 * -3), and why -3 must not be answered as BUSY: nothing further is
+		 * ever coming once peer_error is set, so BUSY would just spin the
+		 * host to its poll_by_repeat timeout instead of reporting the
+		 * failure (bug 2 fix)). */
+		return sock_recv_ring_drained_status(rx_ring.peer_closed, rx_ring.peer_error);
 	}
 
 	const uint32_t idx   = tail % CC3501E_SOCK_RING_BYTES;
@@ -855,6 +861,68 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
 	return (int)n;
 }
 
+/* WORKER-PATH STICKY EOF (bug: worker-path recv after EOF answers
+ * RESP_ERR_RADIO, bench-measured run12 P2b, 3/3 boots).  Mirrors the RING
+ * path's rx_ring.peer_closed above: that ring already survives an orderly
+ * close because cc3501e_hw_sock_pump() sets peer_closed exactly once (on
+ * lwip_recv() n == 0) and cc3501e_hw_sock_recv_ring() keeps answering OK/0
+ * for that handle forever after, without calling lwIP again.  The WORKER
+ * path -- serving UDP sockets, and STREAM sockets accepted but never armed
+ * for prefetch -- had no equivalent, and TI's lwIP (LWIP_NETCONN_FULLDUPLEX=0)
+ * punishes a second call after FIN:
+ *
+ *   1st post-FIN recv: netconn_recv_data_tcp()'s handle_fin arm calls
+ *      netconn_close_shutdown(conn, NETCONN_SHUT_RD) (lwip-stack/src/api/
+ *      api_lib.c:763), which frees conn->recvmbox and returns ERR_CLSD.
+ *      sockets.c's lwip_recv_tcp maps that to a 0-byte return with
+ *      errno = ENOTCONN (lwip-stack/src/api/sockets.c:958-962; err.c's
+ *      err_to_errno() table maps ERR_CLSD -> ENOTCONN).  This function
+ *      already handles that fine: n == 0, OK, 0 bytes (below).
+ *   2nd+ post-FIN recv: netconn_recv_data_tcp() now sees
+ *      !NETCONN_RECVMBOX_WAITABLE(conn) (the mbox is already freed) and
+ *      returns ERR_CONN before ever touching the pcb (api_lib.c:712-714).
+ *      sockets.c maps THAT to a genuine -1/error return, errno ENOTCONN
+ *      (err_to_errno(): ERR_CONN -> ENOTCONN too, but via the error path,
+ *      not the 0-byte one).  This function's EAGAIN/EWOULDBLOCK guard below
+ *      only excuses EAGAIN, so ENOTCONN falls to CC3501E_HW_ERR_IO ->
+ *      src/protocol_sockets.c's sock_worker_hw_err_to_resp() ->
+ *      RESP_ERR_RADIO -> the host's ALP_ERR_IO, even though the stream just
+ *      ended in an orderly way.
+ *
+ * FIX (chosen over "treat ENOTCONN like EAGAIN"): record the EOF on the
+ * FIRST 0-byte STREAM recv and short-circuit every LATER recv on that fd to
+ * OK/0 WITHOUT calling lwIP at all, below -- so the ENOTCONN branch above is
+ * simply never reached a second time.  An errno-based alternative (map
+ * ENOTCONN to "0 bytes, OK" the same as EAGAIN) is smaller but was rejected:
+ * it would ALSO quietly turn a genuinely stray recv on a LISTEN handle, or
+ * the 3rd+ recv after a completed RST teardown, into a false "0 bytes, OK"
+ * instead of an IO error -- ENOTCONN is not unique to "I already saw this
+ * fd's FIN".  The per-fd table costs MEMP_NUM_NETCONN bytes of .bss and
+ * removes that ambiguity entirely.
+ *
+ * ECONNRESET/ECONNABORTED are NOT masked by this: lwIP delivers a reset
+ * through lwip_netconn_err_to_msg() posting to conn->recvmbox BEFORE the
+ * mbox is torn down the FIN way (api_msg.c:445-469 above), so a reset
+ * always surfaces as its own errno on an actual lwip_recvfrom() call at
+ * least once -- this table is only ever set from the n == 0 (orderly close)
+ * arm below, never from an error return.
+ *
+ * Indexed by the lwIP fd directly (0 .. MEMP_NUM_NETCONN-1 -- lwipopts.h,
+ * visible here via lwip/sockets.h -> lwip/opt.h; LWIP_SOCKET_OFFSET is 0 on
+ * this SDK so alloc_socket()'s index IS the fd), not by the host handle
+ * (fd+1): fd is what lwip_close() and every lwip_* call in this file already
+ * key on, and lwIP will not reuse an fd number until it is freed by
+ * lwip_close() -- so clearing the bit in cc3501e_hw_sock_close() (below)
+ * makes a reused fd start clean regardless of what handle number the host
+ * sees it as next.  Confirmed against every OTHER lwip_close() site in this
+ * file (sock_open()'s failure path, and accept_pump()'s two failure paths):
+ * each of those closes an fd that was allocated moments earlier by
+ * lwip_socket()/lwip_accept() and never used for a recv, so it can never be
+ * marked here -- cc3501e_hw_sock_close() is the only path a marked fd can
+ * ever reach lwip_close() through, so clearing there is sufficient. */
+#define CC3501E_SOCK_EOF_MAX_FD MEMP_NUM_NETCONN
+static bool sock_eof[CC3501E_SOCK_EOF_MAX_FD];
+
 int cc3501e_hw_sock_recv(uint16_t  handle,
                          uint16_t  max_len,
                          uint8_t  *buf,
@@ -871,8 +939,14 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	if (handle == 0u || buf == 0) {
 		return CC3501E_HW_ERR_INVAL;
 	}
-	const int fd   = (int)handle - 1;
+	const int fd   = (int)handle - 1; /* handle != 0 here, so fd >= 0 always */
 	uint16_t  want = (max_len < cap) ? max_len : cap;
+
+	if (fd < CC3501E_SOCK_EOF_MAX_FD && sock_eof[fd]) {
+		/* Sticky EOF already recorded for this fd -- see the block comment
+		 * above.  Answer OK/0 without touching lwIP at all. */
+		return CC3501E_HW_OK;
+	}
 
 	struct sockaddr_in from;
 	socklen_t          fromlen = sizeof(from);
@@ -907,7 +981,14 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 		}
 		return CC3501E_HW_ERR_IO;
 	}
-	/* n == 0 on a STREAM socket means the peer closed -- still OK, 0 bytes. */
+	/* n == 0 on a STREAM socket means the peer closed -- still OK, 0 bytes.
+	 * Latch it (STREAM only -- a 0-byte UDP recv is a legitimate empty
+	 * datagram, not EOF) so the NEXT recv on this fd takes the short-circuit
+	 * above instead of reaching lwIP's post-FIN ENOTCONN path -- see the
+	 * block comment above sock_eof. */
+	if (n == 0 && fd < CC3501E_SOCK_EOF_MAX_FD && sock_is_stream(fd)) {
+		sock_eof[fd] = true;
+	}
 	if (recv_len_out != 0) *recv_len_out = (uint16_t)n;
 	if (from.sin_family == AF_INET) {
 		if (from_addr != 0) memcpy(from_addr, &from.sin_addr.s_addr, 4);
@@ -925,6 +1006,19 @@ int cc3501e_hw_sock_close(uint16_t handle)
 	listen_table_remove(handle);
 	if (handle == 0u) {
 		return CC3501E_HW_ERR_INVAL;
+	}
+	{
+		const int fd = (int)handle - 1;
+		/* Free the fd for the sticky-EOF table too (see the block comment
+		 * above sock_eof) -- unconditionally, whether or not lwip_close()
+		 * below reports success: a failed lwip_close() means this fd is
+		 * NOT freed for reuse, so leaving the bit cleared costs nothing
+		 * (any recv would just observe lwIP directly again), while leaving
+		 * it SET would risk short-circuiting a future close-then-reopen of
+		 * the same fd number. */
+		if (fd < CC3501E_SOCK_EOF_MAX_FD) {
+			sock_eof[fd] = false;
+		}
 	}
 	if (lwip_close((int)handle - 1) != 0) {
 		return CC3501E_HW_ERR_IO;
