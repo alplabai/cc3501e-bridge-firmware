@@ -136,3 +136,64 @@ target_compile_definitions(test_transport_spi_no_crc PRIVATE
 target_compile_options(test_transport_spi_no_crc PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_transport_spi_no_crc PRIVATE ztest_shim)
 add_test(NAME transport_spi_no_crc COMMAND test_transport_spi_no_crc)
+
+# worker_seq: worker_discard_stale_terminal()'s QUEUED/RUNNING-must-not-be-
+# discarded guarantee (protocol_sockets.c's SOCK_SEND stale-send guard),
+# talking to worker.c's submit/poll/discard API directly rather than through
+# the wire.  Needs its OWN executable, built WITH -DCC3501E_WIFI (unlike the
+# two above): only that build leaves worker_submit_payload()'s job QUEUED
+# for a separate drain call (see worker.c) instead of running it to a
+# terminal state SYNCHRONOUSLY inside the submit -- and the one case this
+# suite proves that the wire-level suites structurally cannot (their stub
+# build always resolves to DONE/ERR before a second call can ever observe
+# the job) is that a DIFFERENT request byte against a job that is still
+# QUEUED/RUNNING is left alone -- the discard is scoped to a TERMINAL result
+# on purpose (worker.c's comment on worker_discard_stale_terminal()).
+# Reuses the SAME FW_SOURCES link set as the suites above (CC3501E_WIFI only
+# changes a capabilities bitmask and worker.c's own synchronous-submit
+# branch, see protocol_meta.c / worker.c) rather than hand-picking a smaller
+# link set, so this stays a known-good, already-proven set of object files.
+add_executable(test_worker_seq
+    worker_seq/src/test_worker_seq.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_worker_seq PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_worker_seq PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1
+    CC3501E_WIFI=1)
+target_compile_options(test_worker_seq PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_worker_seq PRIVATE ztest_shim)
+add_test(NAME worker_seq COMMAND test_worker_seq)
+
+# sock_send_done: the WORKER_DONE / #88-cache path of protocol_sockets.c's
+# SOCK_SEND stale-send guard, unreachable on the plain stub HAL because
+# cc3501e_hw_sock_send() there always returns CC3501E_HW_ERR_NOTIMPL (no real
+# socket stack on the host) -- so a genuine RESP_OK, and therefore the #88
+# cache's store arm, never fires in test_transport_spi.c.  `--wrap` redirects
+# every firmware call to cc3501e_hw_sock_send() to
+# __wrap_cc3501e_hw_sock_send() (the test file), which reports success --
+# turning a real WORKER_DONE into a code path this suite can drive over the
+# wire.  Same FW_SOURCES + stub HAL as test_transport_spi (no CC3501E_WIFI:
+# the synchronous-submit stub shape is exactly what this needs to reach DONE
+# inside a single transaction()).
+add_executable(test_sock_send_done
+    sock_send_done/src/test_sock_send_done.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_sock_send_done PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_sock_send_done PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1)
+target_compile_options(test_sock_send_done PRIVATE ${TEST_FLAGS})
+target_link_options(test_sock_send_done PRIVATE -Wl,--wrap=cc3501e_hw_sock_send)
+target_link_libraries(test_sock_send_done PRIVATE ztest_shim)
+add_test(NAME sock_send_done COMMAND test_sock_send_done)
