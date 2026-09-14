@@ -638,13 +638,16 @@ static void worker_execute(uint8_t cmd)
 	}
 	/* SOCK_RECV-ONLY: the FINAL step of the 3-step split above -- small
 	 * scalars only (the byte copy already happened, unprotected, above).
-	 * The handle rides in job.req (unlike SOCK_SEND's seq, no separate
-	 * capture needed for it), computed identically to the SOCK_RECV case
-	 * above (wk_get_le16(job.req, 0u)) -- recomputed here rather than
-	 * threading it out of the switch, since this call must stay inside this
-	 * one critical section regardless of which case ran. */
+	 * The handle AND max_len both ride in job.req (unlike SOCK_SEND's seq,
+	 * no separate capture needed for either), computed identically to the
+	 * SOCK_RECV case above (wk_get_le16(job.req, 0u) / 2u) -- recomputed
+	 * here rather than threading them out of the switch, since this call
+	 * must stay inside this one critical section regardless of which case
+	 * ran.  max_len joins the cache key (host review of 9c989dc) -- see
+	 * protocol_sock_recv_worker_publish()'s own doc comment (worker.h). */
 	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
-		protocol_sock_recv_worker_publish(wk_get_le16(job.req, 0u), rv, len);
+		protocol_sock_recv_worker_publish(
+		    wk_get_le16(job.req, 0u), wk_get_le16(job.req, 2u), rv, len);
 	}
 	if (rv == CC3501E_HW_OK) {
 		job.result_len = (uint16_t)len;

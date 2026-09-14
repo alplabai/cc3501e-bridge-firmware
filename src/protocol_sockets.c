@@ -163,6 +163,19 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
 
 /* SOCK_RECV WORKER-FALLBACK retry-safe reply cache.
  *
+ * KEYED ON (seq, handle, max_len), NOT JUST (seq, handle) (host review of
+ * 9c989dc, MINOR residual): a same-seq, same-handle retry whose wire
+ * max_len differs from the ORIGINAL request's is not a byte-identical
+ * re-issue -- poll_by_repeat() always resends the identical frame, so this
+ * cannot happen against the SDK host today, but nothing here enforced that;
+ * the invalidation check and the cache fill both used to compare (seq,
+ * handle) alone, so a same-seq+handle poll carrying a DIFFERENT max_len
+ * (smaller than the cached entry's, e.g. 0 where the original was nonzero)
+ * would still have been served that entry's reply -- sized, and consumed
+ * off the socket, for the ORIGINAL max_len, not this request's.  See
+ * g_sock_recv_wk_max_len below and protocol_sock_recv_worker_publish()'s
+ * own doc comment (worker.h) for where it is captured.
+ *
  * Closes the KNOWN FOLLOW-UP handle_sock_recv()'s ring fast path used to
  * document below (host review): a handle NOT owned by the prefetch ring --
  * UDP, or a STREAM socket accepted but never armed for prefetch -- falls
@@ -322,9 +335,12 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * -- not fixes -- this. */
 #define CC3501E_SOCK_RECV_WK_CACHE_CAP CC3501E_REPLY_DATA_MAX
 
-static volatile bool               g_sock_recv_wk_cached;
-static volatile uint8_t            g_sock_recv_wk_seq;
-static volatile uint16_t           g_sock_recv_wk_handle;
+static volatile bool     g_sock_recv_wk_cached;
+static volatile uint8_t  g_sock_recv_wk_seq;
+static volatile uint16_t g_sock_recv_wk_handle;
+/* Part of the cache key alongside seq/handle (host review of 9c989dc) -- see
+ * the block comment above g_sock_recv_wk_cached for why. */
+static volatile uint16_t           g_sock_recv_wk_max_len;
 static volatile alp_cc3501e_resp_t g_sock_recv_wk_status;
 static volatile uint16_t           g_sock_recv_wk_reply_len;
 /* .bss.sock_ring: TCM placement (see the block comment above) -- ONLY the
@@ -376,10 +392,11 @@ void protocol_sock_recv_worker_copy(const uint8_t *data, size_t len)
  * critical section (the same one that flips job.state to DONE/ERR) --
  * cached = true is written LAST, same release-ordering reason job.state is
  * written last in worker.c. */
-void protocol_sock_recv_worker_publish(uint16_t handle, int hw_rv, size_t len)
+void protocol_sock_recv_worker_publish(uint16_t handle, uint16_t max_len, int hw_rv, size_t len)
 {
-	g_sock_recv_wk_seq    = g_sock_recv_job_seq;
-	g_sock_recv_wk_handle = handle;
+	g_sock_recv_wk_seq     = g_sock_recv_job_seq;
+	g_sock_recv_wk_handle  = handle;
+	g_sock_recv_wk_max_len = max_len;
 	if (hw_rv == CC3501E_HW_OK && len > sizeof(g_sock_recv_wk_reply)) {
 		/* UNREACHABLE IN PRACTICE, stated precisely (host review, NIT 8 of
 		 * the 1118c99 review): worker.c's SOCK_RECV data_cap bounds len to
@@ -643,6 +660,11 @@ alp_cc3501e_resp_t handle_sock_send(const uint8_t *req,
  * context ordering concern. */
 static uint8_t  last_recv_seq;
 static uint16_t last_recv_handle;
+/* Part of the replay identity alongside seq/handle (host review of
+ * 9c989dc) -- see the block comment above g_sock_recv_wk_cached (this same
+ * file) for the parallel fix on the worker-fallback cache; the argument is
+ * identical here. */
+static uint16_t last_recv_max_len;
 
 /* SOCK_RECV (0x23): req = alp_cc3501e_sock_recv_t { handle | max_len } = 4 B.
  * Reply DATA = alp_cc3501e_sock_recv_resp_t (24 B) + received bytes inline. */
@@ -681,7 +703,8 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * worker-routed rather than a single synchronous call, so it cannot reuse
 	 * this fast path's lazy-commit shape (there is no ring to hold bytes back
 	 * in) -- it gets its own completion-time reply cache instead, below. */
-	const uint16_t handle = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
+	const uint16_t handle  = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
+	const uint16_t max_len = (uint16_t)((uint16_t)req[2] | ((uint16_t)req[3] << 8));
 
 	/* seq 0 (ALP_CC3501E_REQ_SEQ_NONE) never claims a replay AGAINST A
 	 * DIFFERENT completion, same reservation the generic retry latch uses --
@@ -720,6 +743,15 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * moment its (seq, handle) differs, regardless of which path serves H2's
 	 * OWN reply.
 	 *
+	 * ALSO checks max_len (host review of 9c989dc, MINOR residual): a
+	 * same-seq, same-handle retry whose max_len does not match the cached
+	 * entry's is not a byte-identical re-issue of it (the SDK host always
+	 * resends an identical frame, so this is a defensive, not a
+	 * reachable-today, fix) -- without it, a same-seq+handle poll carrying a
+	 * DIFFERENT max_len would still have matched and been served the cached
+	 * entry, which was sized for the ORIGINAL request's max_len, not this
+	 * one's.
+	 *
 	 * NOT CLOSED, and cannot be from here: this check only runs when a
 	 * SOCK_RECV is dispatched.  A pre-#2108 host's shared counter can wrap
 	 * back to a stale entry's seq via 30 intervening NON-recv opcodes
@@ -729,13 +761,13 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * SECOND residual paragraph in the block comment above
 	 * g_sock_recv_wk_cached; deliberately not fixed by invalidating on every
 	 * other opcode (that trades this for BLOCKER 2's class of loss). */
-	if (g_sock_recv_wk_cached && (seq != g_sock_recv_wk_seq || handle != g_sock_recv_wk_handle)) {
+	if (g_sock_recv_wk_cached && (seq != g_sock_recv_wk_seq || handle != g_sock_recv_wk_handle ||
+	                              max_len != g_sock_recv_wk_max_len)) {
 		g_sock_recv_wk_cached = false;
 	}
 
 	{
-		const uint16_t max_len = (uint16_t)((uint16_t)req[2] | ((uint16_t)req[3] << 8));
-		const size_t   hdr     = sizeof(alp_cc3501e_sock_recv_resp_t);
+		const size_t hdr = sizeof(alp_cc3501e_sock_recv_resp_t);
 		if (reply_cap > hdr) {
 			size_t room = reply_cap - hdr;
 			/* PRE-EXISTING BUG, same class as the worker-path want == 0
@@ -767,7 +799,27 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 				room = (size_t)max_len;
 			}
 
-			const bool replay = (seq != 0u && seq == last_recv_seq && handle == last_recv_handle);
+			/* max_len JOINS the replay identity (host review of 9c989dc,
+			 * MINOR residual): a same-seq, same-handle retry whose max_len
+			 * differs from the ORIGINAL call's is not a byte-identical
+			 * re-issue of it.  sock_recv_commit() (sock_recv_commit.h)
+			 * treats @p replay == true as "re-serve the SAME bytes this
+			 * handle's LAST call served, do not retire them yet" -- on a
+			 * TRUE replay that is exactly what the host needs (its retry
+			 * never saw the reply), but a call that only matches on
+			 * (seq, handle) while asking for a DIFFERENT max_len is a
+			 * confused signal: sock_recv_commit() would still fold the
+			 * PREVIOUS call's *uncommitted count into a false "already
+			 * collected" state (replay's whole POINT is skipping that
+			 * fold) while THIS call's own room may now be smaller or
+			 * larger than what was actually served -- worst case, the
+			 * previous serve's bytes are never retired at all and a LATER
+			 * real read re-serves them (duplicate delivery).  The SDK host
+			 * always resends an identical frame, so this is a defensive
+			 * fix, not a reachable-today one: firmware correctness must
+			 * not depend on what a caller happens to do. */
+			const bool replay = (seq != 0u && seq == last_recv_seq && handle == last_recv_handle &&
+			                     max_len == last_recv_max_len);
 
 			uint16_t  got = 0u;
 			const int rc =
@@ -810,8 +862,9 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 			 * right number of INTERVENING seq-allocating calls) and why
 			 * only a dedicated host-side SOCK_RECV seq counter removes it
 			 * entirely. */
-			last_recv_seq    = seq;
-			last_recv_handle = handle;
+			last_recv_seq     = seq;
+			last_recv_handle  = handle;
+			last_recv_max_len = max_len;
 
 			if (rc == -2) {
 				if (max_len == 0u) {
@@ -879,9 +932,11 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	/* WORKER-FALLBACK REPLAY CACHE serve.  seq == 0 is INCLUDED here
 	 * (MAJOR, host review, 1118c99): the invalidation check above already
 	 * guarantees that a still-valid g_sock_recv_wk_cached means its
-	 * (seq, handle) is EXACTLY this dispatch's own -- including when both
-	 * are 0 -- since any mismatch, on ANY dispatch, would have already
-	 * cleared it.  Serving it here is therefore exactly "collect the job
+	 * (seq, handle, max_len) is EXACTLY this dispatch's own -- including
+	 * when seq and handle are both 0 -- since any mismatch, on ANY
+	 * dispatch, would have already cleared it (max_len joins this identity
+	 * too, host review of 9c989dc -- see the invalidation check's own
+	 * comment).  Serving it here is therefore exactly "collect the job
 	 * THIS SAME handle's immediately-preceding dispatch just submitted", the
 	 * identical plain submit/collect protocol every OTHER worker-routed
 	 * opcode already gives a seq-0 host.  An earlier version of this gate

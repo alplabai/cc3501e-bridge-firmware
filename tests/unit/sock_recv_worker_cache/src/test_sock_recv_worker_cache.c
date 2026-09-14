@@ -441,6 +441,42 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_different_handle_submits_new)
 	zassert_equal(g_wrap_calls, calls_before + 2u, "req_b's own cache hit ran no further hw recv");
 }
 
+/* MINOR residual (host review of 9c989dc): same seq, same handle, but a
+ * DIFFERENT max_len -- the invalidation check and the cache fill both used
+ * to key on (seq, handle) alone, so this used to be served req_a's cached
+ * reply (sized/consumed for req_a's OWN max_len) as if it were a
+ * byte-identical retry of it.  The SDK host never actually varies max_len
+ * on a retry (poll_by_repeat() always resends an identical frame), so this
+ * is a defensive fix, not a reachable-today one -- but firmware correctness
+ * must not depend on what a caller happens to do. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_same_seq_same_handle_different_max_len_submits_new)
+{
+	uint8_t        reply[64];
+	uint8_t        req_a[8];
+	uint8_t        req_b[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv_ml(req_a, 17u, 310u, 64u);
+	build_recv_ml(req_b, 17u, 310u, 0u); /* same seq + handle, DIFFERENT max_len */
+
+	transaction(req_a, sizeof req_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls, calls_before + 1u, "req_a's submit ran the HW body once");
+
+	/* Same seq (17), same handle (310), but max_len differs (0 vs 64) --
+	 * must NOT be served req_a's cached reply. */
+	transaction(req_b, sizeof req_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls,
+	              calls_before + 2u,
+	              "same seq+handle, different max_len (0 vs 64) submits a NEW hw recv");
+
+	transaction(req_b, sizeof req_b);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(RECV_REPLY_LEN), "req_b's own cache hit");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "req_b collects its own DONE");
+	zassert_equal(g_wrap_calls, calls_before + 2u, "req_b's own cache hit ran no further hw recv");
+}
+
 /* REWRITTEN TWICE.  First (MAJOR 3, host review of 1118c99): a seq-0 host
  * (one that never assigns a retry-protection identity -- every bare
  * cc3501e_request() call site, or a pre-v8 host) gets the PLAIN
