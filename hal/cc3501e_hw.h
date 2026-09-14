@@ -323,6 +323,33 @@ bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out);
  * measured reinit + arm-check. */
 bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out);
 
+/* ---- drain reinit handoff (connect-FAILURE flavour, advisor analysis) ------ *
+ * cc3501e_hw_wifi_connect_sta()'s FAILURE exit (bad args aside -- role-up
+ * fail, Wlan_Connect reject, association timeout, no DHCP lease) has always
+ * paid src/worker.c's drain reinit unconditionally, unlike the SUCCESS exit
+ * above.  Advisor analysis (moderate confidence, NOT bench-proven -- see
+ * src/wifi_connect_fail_skip.h for the full argument and its citation trail)
+ * argues that is the SAME destructive-reinit-on-a-live-slave hazard #106
+ * measured for RSSI and WIFI_DISCONNECT: Wlan_Connect and the failure path's
+ * own Wlan_Disconnect cleanup (wifi_clear_stale_assoc()) never touch the
+ * bridge's own DMA channels, so a slave the body armed before Wlan_Connect
+ * (the role-up reinit) stays armed through the whole failed attempt -- UNLESS
+ * it went dead by some mechanism this trace missed, in which case the built-in
+ * falsifier below still reinits.
+ *
+ * take_fail_skip() is a ONE-SHOT read-and-clear, set unconditionally at the
+ * top of the FAILURE-exit block (before wifi_clear_stale_assoc() can run),
+ * so it reports the same fact regardless of which failure reason exit took
+ * it.  @p skip_ok_out reports whether the bridge SPI slave served at least
+ * one full host transaction (cc3501e_hw_host_txn_count(), hal/ti/
+ * cc3501e_hw_ti_internal.h) between the body's own last reinit and this
+ * exit -- see src/wifi_connect_fail_skip.h's wifi_connect_fail_skip_reinit()
+ * for the pure comparison.  A run that took the SUCCESS exit instead never
+ * reaches this handoff, so this reports false for it and the drain's own
+ * reinit still runs as normal.  The stub / silicon-free build always
+ * reports false (no body ever takes this exit there). */
+bool cc3501e_hw_wifi_connect_sta_take_fail_skip(bool *skip_ok_out);
+
 /* ---- async-connect status latch (CMD_WIFI_STATUS) -------------------------- *
  * The connect body (cc3501e_hw_wifi_connect_sta) BLOCKS for seconds on the
  * association event, so it is worker-routed off the SPI ISR.  The host no longer

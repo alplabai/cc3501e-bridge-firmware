@@ -1237,9 +1237,28 @@ void worker_run_pending(void)
 		 * why it was taken OFF this list once already, and the 2026-09-14 note
 		 * appended there on why that removal's premise does not hold either. */
 		const bool wifi_disconnect = (cmd == ALP_CC3501E_CMD_WIFI_DISCONNECT);
+		/* WIFI_CONNECT_STA's FAILURE exit is its OWN group too (advisor analysis,
+		 * NOT bench-proven -- see src/wifi_connect_fail_skip.h for the full
+		 * argument and citation trail).  Unlike wifi_connect_body_reinit above,
+		 * which fires on the SUCCESS exit, this fires on the opposite one: bad
+		 * args aside, every FAILURE reason (REJECTED, TIMEOUT, no DHCP lease)
+		 * used to pay this drain's reinit unconditionally, the same
+		 * destructive-reinit-on-a-live-slave shape #106 measured for RSSI and
+		 * WIFI_DISCONNECT.  cc3501e_hw_wifi_connect_sta_take_fail_skip() reports
+		 * whether the slave served at least one host frame since the connect
+		 * body's own last reinit (its role-up reinit, or an earlier call's if the
+		 * role was already latched) -- CONDITIONAL, same shape as RSSI's skip,
+		 * because "no frame yet" does not prove the slave is dead, only that
+		 * there is no evidence it is alive, so the built-in falsifier is to keep
+		 * reinitting in that case exactly as before this fix. */
+		bool       skip_ok_by_connect_fail = false;
+		const bool connect_fail_reported_skip =
+		    (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) &&
+		    cc3501e_hw_wifi_connect_sta_take_fail_skip(&skip_ok_by_connect_fail);
+		const bool connect_fail_skip = connect_fail_reported_skip && skip_ok_by_connect_fail;
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read &&
-		    !wifi_disconnect) {
+		    !wifi_disconnect && !connect_fail_skip) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}

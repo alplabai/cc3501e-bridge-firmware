@@ -75,6 +75,11 @@ appControlBlock app_CB;
                           * down) calls into.  #include'd unconditionally, like
                           * wifi_last_reason_tag just below: wifi_retry_event_t has no TI-SDK
                           * dependency, so this compiles in both ti sub-builds. */
+#include "wifi_connect_fail_skip.h" /* wifi_connect_fail_skip_reinit() -- the silicon-free
+                                      * "has the slave served a frame since the body's own
+                                      * last reinit" decision the CONNECT failure exit calls
+                                      * into below.  Same unconditional-include reasoning as
+                                      * wifi_retry.h just above. */
 
 /* RUN12 MECHANISM (referenced by name from every other site in this file that
  * touches a reason/event pair -- this is the one place it is explained in
@@ -356,16 +361,19 @@ static void wifi_event_cb(WlanEvent_t *event)
 		break;
 	}
 	case WLAN_EVENT_CONNECT:
-		/* WlanEventConnect_t::Status is NOT a general result code with a
-		 * negative-on-failure convention: this SDK's only two writers
-		 * (cme_connection_mng.c ~8025/~8454) set it to
-		 * SL_WLAN_CONNECT_EVENT_STATUS_SUCCESS or _ALREADY_CONNECTED, both
-		 * non-negative -- a failed connect arrives as one of the three events
-		 * below instead, never as a negative CONNECT.Status.  An earlier
-		 * version of this cb stashed Status when negative; that branch never
-		 * fired on this SDK and a truncated int32 would not have decoded to
-		 * anything meaningful anyway, so it was removed rather than kept as
-		 * dead code. */
+		/* CORRECTED: this comment used to claim WlanEventConnect_t::Status
+		 * "never fired negative on this SDK", citing cme_connection_mng.c
+		 * ~8025 as one of only two writers, both non-negative.  That citation
+		 * is dead code -- ~8025 sits inside an `#if 0` block (cme_connection_
+		 * mng.c ~7966) and never compiles -- and the claim itself is false: a
+		 * real writer, cme_station_flow.c ~664-676, sets Status = -1
+		 * ("connection failed, probably timeout") and dispatches it via
+		 * CME_MESSAGE_ID_SCAN_DONE (cme.c ~2907-2919), which this SDK's event
+		 * plumbing delivers as WLAN_EVENT_CONNECT the same as a success.  The
+		 * plain assignment below already handles a negative Status correctly
+		 * (it is stored and read back as the signed int it is, no masking or
+		 * unsigned reinterpretation) -- nothing here needs to change, only
+		 * the claim that this path was unreachable. */
 		wifi_last_status = (int)event->Data.Connect.Status;
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
@@ -1087,6 +1095,30 @@ bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out)
 			*skip_ok_out = g_rssi_reinit_skip_ok;
 		}
 		g_rssi_reinit_skip_pending = false; /* one-shot: consumed */
+	}
+	return pending;
+}
+
+/* Handoff to src/worker.c's drain (connect-FAILURE flavour, advisor
+ * analysis): whether the FAILURE exit of THIS run of
+ * cc3501e_hw_wifi_connect_sta() may have its drain reinit skipped.  Set
+ * unconditionally at the top of the FAILURE-exit block below, before
+ * wifi_clear_stale_assoc() can run, so every failure reason reports the
+ * same fact.  Read-and-cleared once by
+ * cc3501e_hw_wifi_connect_sta_take_fail_skip(); same same-thread, no-ISR
+ * reasoning as the SUCCESS-exit handoff above applies (both run on the
+ * worker drain thread, nothing else touches either field in between). */
+static bool g_connect_fail_skip_pending;
+static bool g_connect_fail_skip_ok;
+
+bool cc3501e_hw_wifi_connect_sta_take_fail_skip(bool *skip_ok_out)
+{
+	const bool pending = g_connect_fail_skip_pending;
+	if (pending) {
+		if (skip_ok_out != 0) {
+			*skip_ok_out = g_connect_fail_skip_ok;
+		}
+		g_connect_fail_skip_pending = false; /* one-shot: consumed */
 	}
 	return pending;
 }
@@ -1915,15 +1947,27 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * call reachable in a shipped image for the first time.  See prebuilt/CHANGELOG.md.
 	 * Reinit-only is the proven-safe half: it is what GET_MAC and the scan already do.
 	 *
-	 * A FAILURE exit below still needs a reinit from somewhere and gets it from the
-	 * drain, same as always.  This one is BEFORE Wlan_Connect; the drain's runs after
-	 * worker_execute() returns.  Only the SUCCESS exit is different since #106: it
+	 * A FAILURE exit below used to always need a reinit from somewhere and get it
+	 * from the drain, unconditionally.  This one is BEFORE Wlan_Connect; the drain's
+	 * runs after worker_execute() returns.  The SUCCESS exit is still different: it
 	 * pays a SECOND reinit itself, right before publishing CONNECTED, and that one --
-	 * not this one -- is what the drain now skips.  See the SUCCESS exit below and
-	 * cc3501e_hw_wifi_connect_sta_take_reinit(). */
+	 * not this one -- is what the drain skips via cc3501e_hw_wifi_connect_sta_take_
+	 * reinit() (#106).  The FAILURE exit's drain reinit is now CONDITIONALLY skipped
+	 * too (advisor analysis, not bench-proven) when the slave has demonstrably
+	 * served a host frame since THIS reinit -- see txn_count_after_reinit
+	 * below and cc3501e_hw_wifi_connect_sta_take_fail_skip(). */
 	if (!role_up_was_latched) {
 		bridge_transport_spi_hw_reinit();
 	}
+	/* Snapshot right after the body's own last bridge_transport_spi_hw_reinit()
+	 * call on this call's path (the one just above -- this function makes no
+	 * other reinit call before either of its exits).  Taken unconditionally,
+	 * whether or not the reinit above actually ran this call (role_up_was_latched
+	 * true means it did NOT, because the role -- and so the slave's arm from an
+	 * EARLIER call's reinit -- was already up): either way this is the reference
+	 * point the FAILURE exit's skip decision measures forward progress against.
+	 * See src/wifi_connect_fail_skip.h for the full argument. */
+	const uint32_t txn_count_after_reinit = cc3501e_hw_host_txn_count();
 
 	if (wifi_rv != CC3501E_HW_OK) {
 		wifi_conn_set(
@@ -2243,6 +2287,15 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	if (connect_rv != CC3501E_HW_OK) {
 		wifi_conn_set(
 		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, connect_fail_reason, connect_reason_code);
+		/* Hand the drain the fail-skip verdict (advisor analysis, not bench-proven --
+		 * see src/wifi_connect_fail_skip.h): has the slave served a host frame since
+		 * txn_count_after_reinit above?  Set unconditionally, before
+		 * wifi_clear_stale_assoc()'s Wlan_Disconnect() below can run, so every
+		 * failure reason (REJECTED, TIMEOUT, no DHCP lease) reports the same fact --
+		 * same pattern as the RSSI skip's "set before either radio call can fail". */
+		g_connect_fail_skip_ok =
+		    wifi_connect_fail_skip_reinit(txn_count_after_reinit, cc3501e_hw_host_txn_count());
+		g_connect_fail_skip_pending = true;
 		/* #1437: leave the NWP ready for the next connect.  Harmless best-effort
 		 * double-call on the retry-then-fail path (the retry branch above
 		 * already ran this once for the SAME reason it always does): Wlan_Disconnect()
