@@ -39,7 +39,22 @@
  * from CC3501E_HW_ERR_IO: this is a deterministic, terminal reject, not a
  * transport/radio glitch worth retrying. */
 #define CC3501E_HW_ERR_STATE -4
-#define CC3501E_HW_BUSY      1 /* op accepted, runs off-ISR; caller must re-poll */
+/* NOT produced by any HAL body -- worker.c's own worker_poll() sets this
+ * (never a HAL implementation) when a completed job's result is LARGER than
+ * the caller's reply capacity, so a truncating memcpy is reported as a real
+ * error instead of a silent short reply (host review: this is the general
+ * form of the SOCK_RECV data-loss class -- a worker body reading more than
+ * the reply can ever carry, then the collect silently dropping the
+ * overrun).  Every worker-routed opcode's own cap is bounded by
+ * CC3501E_REPLY_DATA_MAX (protocol.h) at the source (see worker_execute()'s
+ * SOCK_RECV / WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ cases), so
+ * this should never actually fire for a well-behaved opcode -- it exists as
+ * a LOUD backstop for any future one that gets its own cap wrong, mapped by
+ * the three generic worker-routed helpers (protocol.c) to
+ * ALP_CC3501E_RESP_ERR_NO_MEM, the same wire code already used when a
+ * reply's known-minimum size does not fit. */
+#define CC3501E_HW_ERR_NO_MEM -5
+#define CC3501E_HW_BUSY       1 /* op accepted, runs off-ISR; caller must re-poll */
 
 /* --------------------------------------------------------------- */
 /* Lifecycle                                                         */
@@ -544,8 +559,22 @@ void cc3501e_hw_sock_prefetch(uint16_t handle, bool on);
  * EXCLUSIVITY RULE (#7): exactly one code path may call lwip_* on a prefetched
  * fd, and for an armed handle that path is cc3501e_hw_sock_pump().  Falling
  * through to the worker's cc3501e_hw_sock_recv() on an armed-but-empty ring made
- * two readers race the same socket and silently dropped a chunk of the stream. */
-int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len);
+ * two readers race the same socket and silently dropped a chunk of the stream.
+ *
+ * @p replay -- LAZY-COMMIT (a CRC-rejected reply's bytes must survive a
+ * retry, see src/sock_recv_commit.h): true when the caller has determined
+ * THIS request is a byte-identical re-issue of the immediately preceding
+ * one (same header seq, same handle -- protocol_sockets.c's
+ * handle_sock_recv()), i.e. the host never collected the last reply and is
+ * asking again rather than moving on.  On a replay this re-serves the SAME
+ * bytes (or more, if new data arrived) instead of advancing past bytes the
+ * host may never have received; on a non-replay it first retires the
+ * previous call's served bytes, then serves the next unconsumed chunk. */
+int cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                              uint8_t  *buf,
+                              uint16_t  cap,
+                              bool      replay,
+                              uint16_t *out_len);
 
 /* --------------------------------------------------------------- */
 /* BLE 5.4 (v0.3)                                                    */

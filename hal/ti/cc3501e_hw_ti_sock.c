@@ -39,6 +39,11 @@ extern size_t xPortGetFreeHeapSize(void);
  * EVT_SOCK_ACCEPTED entry the host drains with CMD_GET_PENDING_EVENTS -- the
  * same producer role hal/ti/cc3501e_hw_ti_wifi.c has for the Wi-Fi events. */
 #include "event_ring.h"
+/* Pure, silicon-free tail/uncommitted arithmetic for the lazy-commit fix
+ * below (cc3501e-bridge-firmware, host review) -- see its own header for
+ * why this is split out rather than inlined here. */
+#include "sock_prefetch_arm.h"
+#include "sock_recv_commit.h"
 
 #include "../cc3501e_hw.h"
 
@@ -136,8 +141,22 @@ int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, cons
 		return CC3501E_HW_ERR_IO;
 	}
 	/* A connected STREAM socket is the bulk-receive case -- start prefetching so
-	 * CMD_SOCK_RECV can be answered synchronously from the dispatch. */
-	cc3501e_hw_sock_prefetch(handle, true);
+	 * CMD_SOCK_RECV can be answered synchronously from the dispatch.
+	 *
+	 * STREAM ONLY (MINOR, host review of c354208): connect() is also legal on
+	 * a DGRAM (UDP) socket -- it just latches a default peer, no handshake --
+	 * and an earlier version of this call armed the ring for THAT too.  Under
+	 * sock_prefetch_should_arm()'s first-connect-wins rule (MAJOR 4, 1118c99),
+	 * a connected UDP socket then held the ring for its own lifetime and
+	 * locked out any STREAM socket's prefetch -- the case this fast path
+	 * actually exists for.  Check the real socket type with SO_TYPE rather
+	 * than trust a naming convention. */
+	int       so_type    = 0;
+	socklen_t so_type_sz = sizeof(so_type);
+	if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_sz) == 0 &&
+	    so_type == SOCK_STREAM) {
+		cc3501e_hw_sock_prefetch(handle, true);
+	}
 	return CC3501E_HW_OK;
 }
 
@@ -441,6 +460,54 @@ static uint32_t ring_used(void)
 	return rx_ring.head - rx_ring.tail; /* free-running; unsigned wrap is correct */
 }
 
+/* LAZY-COMMIT byte count: the most recent cc3501e_hw_sock_recv_ring() call's
+ * served-but-not-yet-retired byte count (see sock_recv_commit.h).  NOT
+ * dispatch-context-only, unlike an earlier draft of this comment claimed:
+ * cc3501e_hw_sock_prefetch() (below) also writes it, on the WORKER TASK,
+ * from the socket open/close paths (sock_connect / sock_close) -- see the
+ * CONCURRENCY comment below for why that makes this a genuine cross-context
+ * field and how the publish order there keeps it safe without `volatile`. */
+static uint32_t uncommitted;
+
+/* CONCURRENCY: SPSC for the ring's DATA (head/tail/buf), but lazy-commit
+ * gives `uncommitted` a SECOND writer beyond the dispatch/consumer:
+ * rx_ring.head is written ONLY by the task (cc3501e_hw_sock_pump, the
+ * producer) and read only by the dispatch/consumer.  rx_ring.tail is
+ * written ONLY by the dispatch/consumer (cc3501e_hw_sock_recv_ring) and
+ * read only by the task (ring_used(), for the pump's headroom guard).
+ * `uncommitted` is written by the dispatch/consumer on every serve, AND by
+ * the WORKER TASK's cc3501e_hw_sock_prefetch() on arm/disarm -- so, unlike
+ * head/tail, it is not single-writer, and an earlier version of this
+ * comment was wrong to say it "adds NO new cross-context field".
+ *
+ * That second writer is why cc3501e_hw_sock_prefetch()'s arm branch resets
+ * rx_ring.head/tail/uncommitted BEFORE publishing rx_ring.fd_plus1, not
+ * after: cc3501e_hw_sock_recv_ring() (dispatch context, can run at any SPI
+ * callback) only ever touches uncommitted/head/tail for a handle that
+ * currently matches fd_plus1.  Published last, fd_plus1 acts as the
+ * release: dispatch cannot observe the new handle until head, tail, and
+ * uncommitted are ALL already reset for it.  Publishing fd_plus1 first (an
+ * earlier version of this function did) opens a window where a dispatch
+ * call sees the new handle's fd_plus1 but a stale, not-yet-reset
+ * uncommitted from whatever handle used the ring last: sock_recv_commit()
+ * then folds that stale count into a tail that has ALREADY been zeroed,
+ * producing tail = stale_uncommitted while head = 0, which underflows
+ * ring_used()'s unsigned head - tail to a huge value -- stale ring memory
+ * gets served as a normal OK reply, and the pump never gets a chance to
+ * refill anything since the "used" it now sees is (falsely) enormous.
+ *
+ * The other new invariant lazy-commit relies on: cc3501e_hw_sock_recv_ring()
+ * computes the post-commit tail into a LOCAL variable, does the full memcpy
+ * out of the ring using that local value, and publishes it to the shared
+ * rx_ring.tail LAST -- exactly the order the pre-existing code already used
+ * (copy, then `tail += n`).  Publishing the advance before the copy would
+ * let the pump's headroom check (ring_used(), which reads rx_ring.tail)
+ * treat the not-yet-copied bytes as free room and overwrite them with
+ * newly-pumped data while this function was still reading them out -- the
+ * SAME hazard an eager, pre-copy tail advance would have had even without
+ * lazy-commit; this fix does not introduce it, it only has to keep not
+ * introducing it while holding the tail back for longer. */
+
 /* TASK CONTEXT ONLY -- called from cc3501e_hw_tick().  Does the lwIP read. */
 #ifdef CC3501E_RADIO_SPEEDTEST
 /* BENCH: radio-only throughput.  Drains the prefetch socket and DISCARDS the
@@ -567,6 +634,14 @@ void cc3501e_hw_sock_pump(void)
 	 * CC3501E_SOCK_RCVTIMEO_MS is small -- at the old 50 ms an extra pass cost
 	 * more than a transaction. */
 	for (uint32_t pass = 0u; pass < CC3501E_SOCK_PUMP_PASSES; ++pass) {
+		/* ring_used() = head - tail already treats LAZY-COMMIT's uncommitted
+		 * bytes as still "used": tail is not advanced past a served chunk
+		 * until the NEXT dispatch call proves the host moved on
+		 * (sock_recv_commit.h), so this headroom check sees exactly the
+		 * same (or a MORE conservative, never smaller) `used` it would have
+		 * without lazy-commit -- no change needed here for those bytes to
+		 * stay protected from being overwritten before a possible replay
+		 * re-serves them. */
 		uint32_t used = ring_used();
 		if (used > CC3501E_SOCK_RING_BYTES - (uint32_t)ALP_CC3501E_MAX_PAYLOAD) {
 			return; /* keep at least one max frame of headroom */
@@ -594,46 +669,154 @@ void cc3501e_hw_sock_pump(void)
 	}
 }
 
-/* Arm/disarm prefetch for a handle.  Called from the socket open/close paths. */
+/* Arm/disarm prefetch for a handle.  Called on the WORKER TASK, from the
+ * socket open/close paths (sock_connect / sock_close), which can run
+ * concurrently with a dispatch-context (SPI callback) call into
+ * cc3501e_hw_sock_recv_ring() below.
+ *
+ * Arm-on publishes rx_ring.fd_plus1 LAST, after head/tail/uncommitted are
+ * ALL already reset to 0 -- not first, as an earlier version of this
+ * function did.  fd_plus1 is the only field cc3501e_hw_sock_recv_ring()
+ * checks before touching the rest of the ring, so publishing it last makes
+ * it the release: dispatch cannot observe the new handle until everything
+ * else is already consistent for it.  Publishing it first left a window
+ * where a dispatch call could see the NEW handle's fd_plus1 while
+ * `uncommitted` still held the OLD handle's stale served-but-not-retired
+ * count -- sock_recv_commit() would then fold that stale count into a tail
+ * already zeroed for the new handle, underflowing ring_used()'s unsigned
+ * head - tail and serving stale ring memory as a normal OK reply forever
+ * (see the CONCURRENCY comment above rx_ring for the full trace).
+ *
+ * Resets `uncommitted` on BOTH arms, not just the arm-on head/tail reset: a
+ * fresh arm must never inherit a stale count from whatever handle used the
+ * ring last (arm-on, ordering above), and a disarm must not leave one
+ * behind to confuse a future arm that, for whatever reason, reads it before
+ * its own first serve sets it (arm-off) -- cheap insurance for a single
+ * uint32_t, not a case this needs to actually reach in practice; arm-off's
+ * ordering has no equivalent race since fd_plus1 = 0 immediately stops
+ * cc3501e_hw_sock_recv_ring() from touching the ring for this handle at
+ * all, regardless of what order the rest of this branch runs in.
+ *
+ * ARM-ON REFUSES TO STEAL THE RING FROM A DIFFERENT, ALREADY-ARMED HANDLE
+ * (MAJOR, host review, 1118c99).  sock_prefetch_should_arm()
+ * (sock_prefetch_arm.h) is the whole decision: an earlier version of this
+ * branch ran the head/tail/uncommitted reset UNCONDITIONALLY on every
+ * arm-on call, so a SECOND concurrently-open STREAM socket's connect()
+ * silently discarded the FIRST handle's already-pumped, not-yet-served
+ * bytes the instant it landed -- the first handle then fell to the
+ * worker-routed path and read PAST that hole with lwip_recvfrom(),
+ * reporting OK on a stream with a silent gap in it.  Refusing to re-arm here
+ * leaves the FIRST handle's ring untouched; the handle asking to arm just
+ * falls back to the worker-routed path for its own recvs instead (covered by
+ * protocol_sockets.c's own worker-fallback replay cache), same as any other
+ * never-armed handle.  DISARM (the `on == false` arm below, called from
+ * cc3501e_hw_sock_close()) is what frees the ring for a LATER connect to
+ * arm: closing the CURRENTLY-armed handle always reaches the
+ * `rx_ring.fd_plus1 == handle` branch and clears fd_plus1 to 0, so a
+ * connect() on a NEW handle after that CAN arm -- confirmed against
+ * cc3501e_hw_sock_close()'s own unconditional cc3501e_hw_sock_prefetch(handle,
+ * false) call.  A handle NUMBER the host reuses after closing therefore
+ * always arrives here as armed == 0 (disarmed by the close above), not
+ * armed == requested -- that is the ordinary cold-arm path above, not the
+ * same-handle no-op below.  NOT also cleared here: a peer that closes ITS
+ * end and drains to EOF (rx_ring.peer_closed, cc3501e_hw_sock_pump()) does
+ * NOT itself disarm the ring -- that is unrelated, pre-existing behaviour
+ * this fix does not change; the ring stays "armed" for a half-closed handle
+ * until the host explicitly issues SOCK_CLOSE on it.
+ *
+ * ARM-ON FOR THE SAME ALREADY-ARMED HANDLE IS A TRUE NO-OP (MINOR, host
+ * review of c354208): an earlier version ran the head/tail/uncommitted reset
+ * unconditionally whenever sock_prefetch_should_arm() allowed the arm at
+ * all, including armed == requested, so re-arming the SAME still-open
+ * handle dropped that handle's OWN already-pumped, not-yet-served bytes.
+ * Only a cold arm (fd_plus1 == 0) or taking the ring from a DIFFERENT
+ * handle resets it now; armed == requested returns immediately, below,
+ * leaving the ring exactly as it was. */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 {
 	if (on) {
+		if (!sock_prefetch_should_arm(rx_ring.fd_plus1, handle)) {
+			return;
+		}
+		if (rx_ring.fd_plus1 == handle) {
+			/* Already armed for THIS handle (MINOR, host review of c354208):
+			 * a true no-op, not a fresh arm -- the reset below is for taking
+			 * the ring from cold (fd_plus1 == 0) or from a DIFFERENT prior
+			 * handle, and running it here would drop whatever THIS SAME
+			 * handle's socket has already pumped into the ring but not yet
+			 * served.  Nothing to publish either: fd_plus1 already reads
+			 * `handle`. */
+			return;
+		}
 		rx_ring.head = rx_ring.tail = 0u;
 		rx_ring.peer_closed         = false;
-		rx_ring.fd_plus1            = handle;
+		sock_recv_commit_reset(&uncommitted);
+		rx_ring.fd_plus1 = handle; /* publish LAST -- see comment above */
 	} else if (rx_ring.fd_plus1 == handle) {
 		rx_ring.fd_plus1 = 0u;
+		sock_recv_commit_reset(&uncommitted);
 	}
 }
 
 /* DISPATCH CONTEXT (SWI/HWI) -- memcpy only, never lwIP.  Returns bytes taken,
  * or -1 when this handle is not the prefetched one so the caller can fall back
- * to the worker path. */
-int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len)
+ * to the worker path.
+ *
+ * @p replay -- see sock_recv_commit.h and hal/cc3501e_hw.h's doc comment on
+ * this function.  Threaded straight through to sock_recv_commit(), which
+ * owns the tail/uncommitted decision; this function still owns the ring
+ * buffer itself (the actual copy) and the publish-order guarantee (copy
+ * fully out BEFORE advancing the shared rx_ring.tail the pump's headroom
+ * check reads -- see the CONCURRENCY comment above rx_ring). */
+int cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                              uint8_t  *buf,
+                              uint16_t  cap,
+                              bool      replay,
+                              uint16_t *out_len)
 {
 	if (out_len != 0) *out_len = 0u;
 	if (rx_ring.fd_plus1 != handle || handle == 0u || buf == 0) {
 		return -1;
 	}
-	uint32_t used = ring_used();
-	if (used == 0u && rx_ring.peer_closed) {
-		/* CLOSED AND DRAINED -- this is END OF STREAM, and it must be answered
-		 * OK-with-0-bytes, not BUSY.
-		 *
-		 * #32 gave the empty ring a single answer (-2 -> RESP_ERR_BUSY) without
-		 * consulting peer_closed, which made EOF UNREACHABLE: once the peer
-		 * closes, cc3501e_hw_sock_pump() returns early on `peer_closed` (see the
-		 * guard at the top of it), so the ring can never refill.  The host then
-		 * got RESP_ERR_BUSY on every SOCK_RECV forever, and poll_by_repeat --
-		 * which retries precisely on BUSY -- span until its timeout instead of
-		 * seeing the 0-byte close the pre-#32 fall-through used to deliver.
-		 *
-		 * The -2/BUSY answer below is still right for the OTHER empty case: ring
-		 * empty but the connection still open, where more bytes really are
-		 * coming and 0 bytes would make poll_by_repeat give up early. */
-		return 0;
-	}
-	if (used == 0u) {
+
+	/* LAZY-COMMIT (issue: silent SOCK_RECV data loss on a CRC-rejected reply,
+	 * host review): fold in the PREVIOUS call's serve now, unless @p replay
+	 * says this call is poll_by_repeat() re-issuing that same request under
+	 * the identical seq -- see sock_recv_commit.h for the full contract.
+	 * This MUST run before the empty/closed checks below: they need the
+	 * POST-commit position, not the raw rx_ring.tail, or a genuinely NEW
+	 * (non-replay) request landing exactly on a ring with nothing past the
+	 * just-committed bytes would wrongly re-serve them as if they were new
+	 * instead of correctly reporting empty/closed.
+	 *
+	 * Computed into a LOCAL `tail`, NOT YET published to the shared,
+	 * pump-visible rx_ring.tail -- see the CONCURRENCY comment above rx_ring
+	 * for why that publish has to wait until after any copy below
+	 * completes (or happen immediately when there is no copy -- the empty/
+	 * closed paths below, where publishing right away is safe: nothing is
+	 * being read out of the ring for the pump to race). */
+	uint32_t       tail = rx_ring.tail;
+	const uint32_t n = sock_recv_commit(&tail, &uncommitted, rx_ring.head, replay, (uint32_t)cap);
+
+	if (n == 0u) {
+		rx_ring.tail = tail; /* nothing to copy -- safe to publish now */
+		if (rx_ring.peer_closed) {
+			/* CLOSED AND DRAINED -- this is END OF STREAM, and it must be answered
+			 * OK-with-0-bytes, not BUSY.
+			 *
+			 * #32 gave the empty ring a single answer (-2 -> RESP_ERR_BUSY) without
+			 * consulting peer_closed, which made EOF UNREACHABLE: once the peer
+			 * closes, cc3501e_hw_sock_pump() returns early on `peer_closed` (see the
+			 * guard at the top of it), so the ring can never refill.  The host then
+			 * got RESP_ERR_BUSY on every SOCK_RECV forever, and poll_by_repeat --
+			 * which retries precisely on BUSY -- span until its timeout instead of
+			 * seeing the 0-byte close the pre-#32 fall-through used to deliver.
+			 *
+			 * The -2/BUSY answer below is still right for the OTHER empty case: ring
+			 * empty but the connection still open, where more bytes really are
+			 * coming and 0 bytes would make poll_by_repeat give up early. */
+			return 0;
+		}
 		/* Armed but EMPTY.  This is its OWN answer (-2), distinct from "not my
 		 * handle" (-1), because the two need opposite handling and conflating them
 		 * cost a data-loss bug (#7):
@@ -655,15 +838,19 @@ int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint1
 		 * The caller answers BUSY instead, which is what poll_by_repeat retries. */
 		return -2;
 	}
-	uint32_t       n     = (used < cap) ? used : cap;
-	const uint32_t idx   = rx_ring.tail % CC3501E_SOCK_RING_BYTES;
+
+	const uint32_t idx   = tail % CC3501E_SOCK_RING_BYTES;
 	uint32_t       first = CC3501E_SOCK_RING_BYTES - idx;
 	if (first > n) first = n;
 	memcpy(buf, &rx_ring.buf[idx], first);
 	if (n > first) {
 		memcpy(&buf[first], &rx_ring.buf[0], n - first);
 	}
-	rx_ring.tail += n;
+	/* Publish LAST, after the copy above has fully read out [idx, idx+n) --
+	 * see the CONCURRENCY comment above rx_ring.  Until this line, the
+	 * pump's headroom check (ring_used(), which reads rx_ring.tail) still
+	 * sees the OLD tail and so still treats these bytes as used. */
+	rx_ring.tail = tail;
 	if (out_len != 0) *out_len = (uint16_t)n;
 	return (int)n;
 }
@@ -837,11 +1024,16 @@ void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 	(void)on;
 }
 
-int cc3501e_hw_sock_recv_ring(uint16_t handle, uint8_t *buf, uint16_t cap, uint16_t *out_len)
+int cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                              uint8_t  *buf,
+                              uint16_t  cap,
+                              bool      replay,
+                              uint16_t *out_len)
 {
 	(void)handle;
 	(void)buf;
 	(void)cap;
+	(void)replay;
 	if (out_len != 0) *out_len = 0u;
 	return -1; /* never the prefetched handle -> caller uses the worker path */
 }

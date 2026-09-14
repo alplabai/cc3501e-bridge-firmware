@@ -218,6 +218,19 @@ uint32_t g_retry_latch_hits;
 
 static uint8_t s_current_req_seq;
 
+/* Exposed for protocol_sockets.c's handle_sock_recv(): its own lazy-commit
+ * replay check (issue: silent SOCK_RECV data loss on a CRC-rejected reply,
+ * host review) needs this SAME per-dispatch seq -- alp_cc3501e_sock_recv_t
+ * carries none of its own, unlike SOCK_SEND's per-frame seq -- but
+ * s_current_req_seq is file-static here and SOCK_RECV is deliberately
+ * excluded from the generic retry latch below (retry_latch_applies()), so
+ * there is no other seam already carrying it out of this TU.  A function
+ * rather than `extern`ing the static keeps this TU the sole writer. */
+uint8_t protocol_current_req_seq(void)
+{
+	return s_current_req_seq;
+}
+
 /*
  * The single most-recently-COLLECTED worker-routed outcome, cached so a
  * matching-(cmd,seq) retry -- a lost/misframed reply that made
@@ -472,6 +485,15 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
 		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
+		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
@@ -526,6 +548,15 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
 		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
@@ -598,10 +629,27 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
 		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
+		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
-		/* No job in flight: queue THIS one (with its payload) + return BUSY. */
+		/* No job in flight: queue THIS one (with its payload) + return BUSY.
+		 * For SOCK_RECV, stash this dispatch's seq for the worker-fallback
+		 * replay cache BEFORE submitting -- see protocol_sock_recv_note_submit()
+		 * (worker.h) for why: alp_cc3501e_sock_recv_t carries no seq of its
+		 * own, unlike SOCK_SEND, so it cannot ride out to completion in
+		 * job.req the way SOCK_SEND's does. */
+		if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+			protocol_sock_recv_note_submit(s_current_req_seq);
+		}
 		(void)worker_submit_payload((uint8_t)cmd, req, (uint16_t)req_len);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* QUEUED / RUNNING (incl. another cmd in flight) */

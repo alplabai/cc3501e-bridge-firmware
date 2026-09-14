@@ -105,6 +105,7 @@ set(CC3501E_BRIDGE_SOURCES
     src/protocol_ota.c
     src/worker.c
     src/event_ring.c
+    src/sock_recv_commit.c
     src/transport_spi.c
     src/transport_sdio.c
     src/wifi_retry.c

@@ -176,8 +176,16 @@ static void worker_execute(uint8_t cmd)
 	}
 	case ALP_CC3501E_CMD_WIFI_SCAN_START:
 		/* Packs the AP-record list into buf in the host's wire format (see
-		 * cc3501e_hw_wifi_scan); blocks on the scan + event rendezvous. */
-		rv = cc3501e_hw_wifi_scan(buf, ALP_CC3501E_MAX_PAYLOAD, &len);
+		 * cc3501e_hw_wifi_scan); blocks on the scan + event rendezvous.
+		 * Capped at CC3501E_REPLY_DATA_MAX (protocol.h), not
+		 * ALP_CC3501E_MAX_PAYLOAD: that is the actual ceiling
+		 * protocol_build_reply() enforces on any handler's reply DATA (the
+		 * status byte and, under CC3501E_WIRE_CRC=ON, the CRC trailer both
+		 * ride inside the same MAX_PAYLOAD budget) -- passing the full
+		 * MAX_PAYLOAD here let the scan fill more records than a reply can
+		 * ever carry, silently truncated by worker_poll()'s collect (host
+		 * review, same class of bug as the SOCK_RECV data_cap fix below). */
+		rv = cc3501e_hw_wifi_scan(buf, CC3501E_REPLY_DATA_MAX, &len);
 		break;
 	case ALP_CC3501E_CMD_BLE_ENABLE:
 		/* Wi-Fi-first (shared HIF) then nimble_host_start -- blocks ~2s, so it
@@ -188,8 +196,10 @@ static void worker_execute(uint8_t cmd)
 	case ALP_CC3501E_CMD_BLE_SCAN_START:
 		/* Packs the discovered-advertiser list into buf (see cc3501e_hw_ble_scan);
 		 * runs a NimBLE GAP discovery that blocks for the scan window, so it is
-		 * worker-routed off the SPI ISR exactly like WIFI_SCAN_START. */
-		rv = cc3501e_hw_ble_scan(buf, ALP_CC3501E_MAX_PAYLOAD, &len);
+		 * worker-routed off the SPI ISR exactly like WIFI_SCAN_START.  Capped
+		 * at CC3501E_REPLY_DATA_MAX, not ALP_CC3501E_MAX_PAYLOAD -- see the
+		 * WIFI_SCAN_START case above for why. */
+		rv = cc3501e_hw_ble_scan(buf, CC3501E_REPLY_DATA_MAX, &len);
 		break;
 	case ALP_CC3501E_CMD_BLE_ADV_START: {
 		/* Ext-adv config+start BLOCKS on the shared-HIF HCI ack (2 s), so -- like
@@ -278,10 +288,12 @@ static void worker_execute(uint8_t cmd)
 		/* GATT read (blocks on the read-response HCI over the shared HIF), so it is
 		 * worker-routed off the SPI ISR.  Payload = handle(LE16); the attribute value
 		 * is packed into buf and published so the payload+reply worker path copies it
-		 * back to the host (see handle_worker_routed_payload_reply). */
+		 * back to the host (see handle_worker_routed_payload_reply).  Capped at
+		 * CC3501E_REPLY_DATA_MAX, not ALP_CC3501E_MAX_PAYLOAD -- see the
+		 * WIFI_SCAN_START case above for why. */
 		const uint16_t handle  = (uint16_t)job.req[0] | ((uint16_t)job.req[1] << 8);
 		uint16_t       out_len = 0u;
-		rv = cc3501e_hw_ble_gatt_read(handle, buf, (uint16_t)ALP_CC3501E_MAX_PAYLOAD, &out_len);
+		rv = cc3501e_hw_ble_gatt_read(handle, buf, (uint16_t)CC3501E_REPLY_DATA_MAX, &out_len);
 		if (rv == CC3501E_HW_OK) {
 			len = out_len;
 		}
@@ -379,15 +391,66 @@ static void worker_execute(uint8_t cmd)
 	}
 	case ALP_CC3501E_CMD_SOCK_RECV: {
 		/* job.req = alp_cc3501e_sock_recv_t: handle(LE16 @0) | max_len(LE16 @2).
-		 * Reply = recv_resp header (WK_SOCK_RECV_HDR) + up to max_len bytes.  Cap
-		 * the data so header + data + the status byte fit one frame. */
-		const uint16_t handle       = wk_get_le16(job.req, 0u);
-		const uint16_t max_len      = wk_get_le16(job.req, 2u);
-		const uint16_t data_cap     = (uint16_t)(ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1u);
-		uint8_t        from_addr[4] = { 0 };
-		uint16_t       from_port    = 0u;
-		uint16_t       recv_len     = 0u;
-		rv                          = cc3501e_hw_sock_recv(
+		 * Reply = recv_resp header (WK_SOCK_RECV_HDR) + up to max_len bytes.
+		 *
+		 * data_cap is bounded by TWO things, both load-bearing:
+		 *
+		 *   1. CC3501E_REPLY_DATA_MAX (protocol.h) minus the recv-resp header --
+		 *      the ACTUAL ceiling protocol_build_reply() enforces on this
+		 *      handler's reply DATA, not a flat "MAX_PAYLOAD - 1" that predates
+		 *      the wire MAJOR 4 CRC-trailer tax (#2035).  The old flat formula
+		 *      could ask cc3501e_hw_sock_recv() for up to 4071 B (24 + 4071 =
+		 *      4095), 2 B more than CC3501E_REPLY_DATA_MAX (4093 B) under the
+		 *      default CC3501E_WIRE_CRC=ON actually allows -- lwip_recvfrom()
+		 *      would CONSUME those bytes off the socket, then worker_poll()'s
+		 *      collect silently truncated the reply by 2 B, permanently losing
+		 *      already-read stream data with no error reported (host review:
+		 *      the host bench app reads exactly 4071 B per call, so a
+		 *      worker-fallback socket -- UDP, or STREAM accepted but not yet
+		 *      armed for prefetch -- hit this on every full read).
+		 *   2. The request's own max_len -- NOT "0 = no cap" (an earlier
+		 *      version of this comment claimed that; wrong, NIT, host review
+		 *      1118c99): the TI HAL's cc3501e_hw_sock_recv()
+		 *      (hal/ti/cc3501e_hw_ti_sock.c) computes
+		 *      `want = (max_len < cap) ? max_len : cap`, so max_len == 0
+		 *      makes it read ZERO bytes there, not "whatever the wire
+		 *      ceiling allows" -- a host is expected to always send its own
+		 *      receive-buffer's real capacity (nonzero) per
+		 *      alp_cc3501e_sock_recv_t's own "max_len: host receive-buffer
+		 *      capacity for this request" field doc.  Bounding by it here
+		 *      regardless keeps lwip_recvfrom() from EVER being asked for more
+		 *      than the host itself requested.  NOT the same as the ring fast
+		 *      path's room computation (protocol_sockets.c's handle_sock_recv(),
+		 *      NIT, host review of c354208 -- an earlier version of this comment
+		 *      claimed they mirrored each other; they do not): the ring treats
+		 *      max_len == 0 as "no cap beyond the reply buffer" (its own
+		 *      `if (max_len != 0u && room > max_len) room = max_len` leaves
+		 *      `room` at the buffer's own size when max_len is 0), while this
+		 *      path's cc3501e_hw_sock_recv() call passes max_len straight
+		 *      through, and the TI HAL's own `want = (max_len < cap) ? max_len :
+		 *      cap` then reads EXACTLY ZERO bytes for max_len == 0.  A
+		 *      worker-path recv with max_len 0 therefore always reports 0 bytes,
+		 *      where a ring-served one on the same request would return up to a
+		 *      full buffer -- a real behavioural difference between the two
+		 *      paths for that one input, not a bug this change introduces or
+		 *      fixes.
+		 *
+		 * With both bounds in place, cc3501e_hw_sock_recv() can never report
+		 * more than the reply -- and this cache's own
+		 * g_sock_recv_wk_reply[CC3501E_REPLY_DATA_MAX] -- can hold; the
+		 * defensive guard in protocol_sock_recv_worker_publish() and
+		 * worker_poll()'s own truncation guard below are both then
+		 * unreachable for this opcode, kept only as loud backstops. */
+		const uint16_t handle   = wk_get_le16(job.req, 0u);
+		const uint16_t max_len  = wk_get_le16(job.req, 2u);
+		uint16_t       data_cap = (uint16_t)(CC3501E_REPLY_DATA_MAX - WK_SOCK_RECV_HDR);
+		if (max_len != 0u && max_len < data_cap) {
+			data_cap = max_len;
+		}
+		uint8_t  from_addr[4] = { 0 };
+		uint16_t from_port    = 0u;
+		uint16_t recv_len     = 0u;
+		rv                    = cc3501e_hw_sock_recv(
 		    handle, max_len, &buf[WK_SOCK_RECV_HDR], data_cap, &recv_len, from_addr, &from_port);
 		if (rv == CC3501E_HW_OK) {
 			/* Build the from sock_addr (family | reserved | port(LE16) | addr[16]);
@@ -497,19 +560,68 @@ static void worker_execute(uint8_t cmd)
 		break;
 	}
 
-	/* Defensive clamp before the publish memcpy: every HAL body above is
-	 * CONTRACTED to report len <= ALP_CC3501E_MAX_PAYLOAD (it fills buf,
-	 * which is exactly that size), but a misbehaving backend that reports
-	 * a larger len must corrupt at most its own answer -- never overrun
-	 * job.result[] and smash the worker state the SPI ISR reads.
-	 * Truncation is safe to publish: the poller copies min(out_cap,
-	 * result_len) and the protocol layer length-checks every reply. */
+	/* Defensive clamp before publish: every HAL body above is CONTRACTED to
+	 * report len <= ALP_CC3501E_MAX_PAYLOAD (it fills buf, which is exactly
+	 * that size), but a misbehaving backend that reports a larger len must
+	 * corrupt at most its own answer -- never overrun job.result[] and smash
+	 * the worker state the SPI ISR reads.  Truncation is safe to publish:
+	 * the poller copies min(out_cap, result_len) and the protocol layer
+	 * length-checks every reply. */
 	if (len > sizeof(job.result)) {
 		len = sizeof(job.result);
 	}
 
-	/* Publish the result atomically wrt the SPI ISR: fill result[] first,
-	 * then flip state LAST so a poller never sees DONE with stale bytes. */
+	/* SOCK_RECV-ONLY: invalidate protocol_sockets.c's worker-fallback cache
+	 * FIRST, in its OWN short critical section, before either ~4 KB copy
+	 * below (MINOR, host review, 1118c99).  The ORIGINAL shape did both the
+	 * job.result copy AND the cache's own copy while holding ONE critical
+	 * section across both -- on real silicon worker_critical_enter() is
+	 * __disable_irq(), so that held the SPI-ISR-sensitive link's interrupts
+	 * masked for the time of an ~8 KB memcpy, once per worker-routed recv.
+	 * Clearing the cache here means a dispatch that lands in the gap between
+	 * this critical section and the final one below sees a clean cache MISS
+	 * (not a half-updated entry) -- see worker.h's block comment on
+	 * protocol_sock_recv_worker_invalidate/_copy/_publish for the full
+	 * 3-step argument. */
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+		const unsigned long inv_key = worker_critical_enter();
+		protocol_sock_recv_worker_invalidate();
+		worker_critical_exit(inv_key);
+	}
+
+	/* The actual byte copies -- OUTSIDE any critical section, interrupts
+	 * enabled throughout.
+	 *
+	 * job.result's copy is safe here for the SAME reason this file's own top
+	 * comment already states: "result[]/result_len/err are only WRITTEN
+	 * while state is QUEUED/RUNNING (the ISR never reads them then -- it
+	 * sees < DONE and replies BUSY), and only READ once state == DONE/ERR".
+	 * job.state is still WORKER_RUNNING for the whole of this function (it
+	 * was set QUEUED->RUNNING before worker_execute() was ever called, and
+	 * does not flip to DONE/ERR until the critical section below), so
+	 * nothing reads job.result until that flip publishes it -- writing it
+	 * unprotected, before the flip, is exactly the release-pattern the
+	 * ORIGINAL single critical section already relied on, just with the
+	 * write moved earlier and outside the lock.
+	 *
+	 * g_sock_recv_wk_reply's copy (protocol_sock_recv_worker_copy()) is safe
+	 * by the identical argument using g_sock_recv_wk_cached instead of
+	 * job.state: the critical section just above already published
+	 * g_sock_recv_wk_cached = false, so nothing reads that buffer until this
+	 * function's OWN final critical section below publishes cached = true. */
+	if (rv == CC3501E_HW_OK) {
+		memcpy((void *)job.result, buf, len);
+	}
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV && rv == CC3501E_HW_OK) {
+		protocol_sock_recv_worker_copy(buf, len);
+	}
+
+	/* Publish everything ELSE atomically wrt the SPI ISR, in ONE final short
+	 * critical section: job.result was already written above, so this
+	 * section is back down to small scalar stores (job.result_len/err/state,
+	 * SOCK_SEND's own <=2 B cache copy, and SOCK_RECV's cache scalars) --
+	 * state flips LAST so a poller never sees DONE with stale/partial
+	 * bytes. */
 	const unsigned long key = worker_critical_enter();
 	/* SOCK_SEND-ONLY: publish into protocol_sockets.c's #88 seq-keyed reply
 	 * cache in this SAME critical section, strictly BEFORE job.state flips
@@ -518,13 +630,23 @@ static void worker_execute(uint8_t cmd)
 	 * what stops worker_poll()'s orphan-discard arm (a DIFFERENT opcode's
 	 * poll, possibly on a different host thread) from ever observing this
 	 * job as terminal before the cache entry a same-seq re-issue would need
-	 * already exists. */
+	 * already exists.  Its OWN copy is at most 2 B, cheap enough to stay
+	 * inside this critical section unlike SOCK_RECV's -- see worker.h. */
 	if (cmd == ALP_CC3501E_CMD_SOCK_SEND) {
 		protocol_sock_send_on_worker_complete(
 		    job.req[offsetof(alp_cc3501e_sock_send_t, seq)], rv, buf, len);
 	}
+	/* SOCK_RECV-ONLY: the FINAL step of the 3-step split above -- small
+	 * scalars only (the byte copy already happened, unprotected, above).
+	 * The handle rides in job.req (unlike SOCK_SEND's seq, no separate
+	 * capture needed for it), computed identically to the SOCK_RECV case
+	 * above (wk_get_le16(job.req, 0u)) -- recomputed here rather than
+	 * threading it out of the switch, since this call must stay inside this
+	 * one critical section regardless of which case ran. */
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+		protocol_sock_recv_worker_publish(wk_get_le16(job.req, 0u), rv, len);
+	}
 	if (rv == CC3501E_HW_OK) {
-		memcpy((void *)job.result, buf, len);
 		job.result_len = (uint16_t)len;
 		job.err        = 0;
 		job.state      = WORKER_DONE;
@@ -642,7 +764,27 @@ worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *
 	}
 
 	if (st == WORKER_DONE) {
-		const size_t n = (out_cap < job.result_len) ? out_cap : job.result_len;
+		if (job.result_len > out_cap) {
+			/* NEVER silently truncate a payload reply.  job.result_len larger
+			 * than the CALLER's actual reply capacity means some opcode's own
+			 * cap (worker_execute()'s switch) let a HAL body read or produce
+			 * more than the reply frame can ever carry -- the general form of
+			 * the SOCK_RECV data-loss class (host review): a truncating
+			 * memcpy here used to silently drop the overrun and report OK
+			 * with a short reply, and for a socket recv those bytes were
+			 * already irrecoverably consumed from lwIP.  Report a real error
+			 * instead.  Every worker-routed opcode's own cap is now bounded
+			 * by CC3501E_REPLY_DATA_MAX at the source (worker_execute()'s
+			 * SOCK_RECV / WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ
+			 * cases), so this should never actually fire -- it is a LOUD
+			 * backstop, not a silent one, for any future opcode that gets its
+			 * own cap wrong. */
+			if (out_len != NULL) *out_len = 0u;
+			if (err != NULL) *err = CC3501E_HW_ERR_NO_MEM;
+			worker_critical_exit(key);
+			return WORKER_ERR;
+		}
+		const size_t n = job.result_len;
 		if (out != NULL && n > 0u) memcpy(out, (const void *)job.result, n);
 		if (out_len != NULL) *out_len = n;
 		worker_critical_exit(key);
@@ -699,6 +841,22 @@ int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_by
 	}
 	worker_critical_exit(key);
 	return reclaimed;
+}
+
+int worker_discard_stale_recv(void)
+{
+	const unsigned long key       = worker_critical_enter();
+	int                 discarded = 0;
+	if (job.job_cmd == ALP_CC3501E_CMD_SOCK_RECV &&
+	    (job.state == WORKER_DONE || job.state == WORKER_ERR)) {
+		job.state      = WORKER_IDLE;
+		job.job_cmd    = 0u;
+		job.result_len = 0u;
+		job.err        = 0;
+		discarded      = 1;
+	}
+	worker_critical_exit(key);
+	return discarded;
 }
 
 void worker_run_pending(void)

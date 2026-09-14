@@ -176,6 +176,31 @@ int worker_discard_stale_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte)
 int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_byte);
 
 /*
+ * worker_discard_stale_recv -- SOCK_RECV-only variant of the eviction half of
+ * worker_discard_stale_terminal() above, WITHOUT a req-byte compare.
+ * ATOMICALLY, in ONE critical section: if a TERMINAL (DONE/ERR) job for
+ * ALP_CC3501E_CMD_SOCK_RECV is sitting in the slot, resets it to IDLE
+ * (worker_reset()'s effect) and returns 1; otherwise (IDLE, QUEUED/RUNNING,
+ * or a DIFFERENT opcode's job) touches nothing and returns 0.
+ *
+ * Why SOCK_RECV cannot reuse the byte-keyed helper above: that helper needs
+ * a CALLER-OWNED identity byte inside job.req that reliably DIFFERS between
+ * the stale job and the current request.  SOCK_SEND has one (its own
+ * per-frame seq, alp_cc3501e_sock_send_t.seq).  alp_cc3501e_sock_recv_t is
+ * just { handle | max_len } -- nothing in it changes between two DIFFERENT
+ * logical recvs on the SAME handle, so a job.req[handle] byte-compare cannot
+ * tell "a stale recv on this same handle" from "this handle's own retry":
+ * both carry an identical handle byte.  The identity that DOES disambiguate
+ * them is the request's generic header seq, which protocol_sockets.c's own
+ * worker-fallback cache (g_sock_recv_wk_seq/g_sock_recv_wk_handle) tracks
+ * OUTSIDE job.req -- and by the time protocol_sockets.c calls this function,
+ * it has ALREADY compared this request's (seq, handle) against that cache
+ * with FULL precision and found no match.  Any terminal SOCK_RECV job still
+ * sitting in the slot at that point is, by construction, not this request's,
+ * so no further per-byte check is needed before evicting it. */
+int worker_discard_stale_recv(void);
+
+/*
  * protocol_sock_send_on_worker_complete -- SOCK_SEND-ONLY completion hook.
  * DEFINED in protocol_sockets.c (owner of the #88 seq-keyed reply cache:
  * g_sock_send_cached / g_sock_send_seq / g_sock_send_status /
@@ -220,6 +245,103 @@ int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_by
  * the cache's own comment for the different-seq invalidation rule that
  * keeps a stale entry from outliving its seq. */
 void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t *data, size_t len);
+
+/*
+ * protocol_sock_recv_note_submit -- SOCK_RECV-ONLY submit-edge hook.  DEFINED
+ * in protocol_sockets.c, CALLED from protocol.c's handle_worker_routed_payload_reply()
+ * on the WORKER_IDLE -> QUEUED submit edge, the SAME seam
+ * handle_worker_routed_payload() already special-cases for WIFI_CONNECT_STA
+ * (cc3501e_hw_wifi_mark_connecting()).
+ *
+ * Unlike SOCK_SEND, whose per-frame seq rides in the wire payload itself
+ * (alp_cc3501e_sock_send_t.seq) and is therefore still sitting in job.req at
+ * completion time, alp_cc3501e_sock_recv_t carries NO seq of its own (v9
+ * protocol) -- the identity the worker-fallback replay cache needs is the
+ * request's *generic* 5-bit header seq (protocol.c's s_current_req_seq /
+ * protocol_current_req_seq(), the same field the ring fast path's own
+ * lazy-commit replay check already uses).  That value is not part of job.req
+ * and would not survive the submit -> completion gap on its own, so this
+ * hook stashes it into protocol_sockets.c's own static right at submit time.
+ *
+ * @p seq is protocol.c's s_current_req_seq AT THE MOMENT OF SUBMIT.  Safe to
+ * read without a critical section and safe against being overwritten before
+ * this job resolves: worker_poll() matches an in-flight job by OPCODE ALONE,
+ * so a second SOCK_RECV dispatch landing while this one is QUEUED/RUNNING
+ * never reaches the IDLE submit edge again (it reads QUEUED/RUNNING and
+ * answers BUSY) -- the single job slot guarantees at most one SOCK_RECV
+ * submit is ever pending at a time. */
+void protocol_sock_recv_note_submit(uint8_t seq);
+
+/*
+ * protocol_sock_recv_worker_invalidate / _copy / _publish -- SOCK_RECV-ONLY
+ * completion hook, split into THREE steps (host review, MINOR 6 of the
+ * 1118c99 review) instead of one atomic call like protocol_sock_send's
+ * above.  SOCK_SEND's own cache copies at most 2 B, cheap enough to do
+ * inside worker_execute()'s single publish critical section; SOCK_RECV's
+ * copies up to CC3501E_REPLY_DATA_MAX (4093/4095 B) TWICE (once into
+ * job.result, once into protocol_sockets.c's own cache) -- doing both
+ * memcpys with interrupts masked (worker_critical_enter() is __disable_irq()
+ * on real silicon) held the SPI-ISR-sensitive link's interrupts off for the
+ * time of an ~8 KB copy, once per worker-routed recv.  worker.c's
+ * worker_execute() now calls these three in order:
+ *
+ *   1. protocol_sock_recv_worker_invalidate() -- INSIDE a short critical
+ *      section, BEFORE either copy: clears g_sock_recv_wk_cached so a
+ *      dispatch landing in the gap below sees a clean cache MISS rather than
+ *      a half-updated entry.
+ *   2. protocol_sock_recv_worker_copy() -- OUTSIDE any critical section
+ *      (interrupts stay enabled): the actual byte copy into the cache's own
+ *      buffer.  Safe precisely because step 1 already published
+ *      g_sock_recv_wk_cached = false: nothing reads g_sock_recv_wk_reply
+ *      while cached is false, so a concurrent dispatch cannot observe a
+ *      partially-written buffer.  (job.result's OWN copy is safe by the
+ *      IDENTICAL argument using job.state instead: see worker.c.)
+ *   3. protocol_sock_recv_worker_publish() -- INSIDE the SAME final critical
+ *      section that flips job.state to DONE/ERR: the small scalar fields
+ *      only (seq/handle/status/len, then cached = true last).
+ *
+ * A dispatch that lands between step 1 and step 3 sees g_sock_recv_wk_cached
+ * false (cache miss) AND job.state still WORKER_RUNNING (not yet DONE/ERR):
+ * it falls through to the generic worker-routed path, whose worker_poll()
+ * reports the job QUEUED/RUNNING and answers BUSY -- never a torn read,
+ * never data served from a half-copied buffer.
+ *
+ * TWO FACTS THIS SAFETY ARGUMENT RESTS ON (NIT, host review of c354208):
+ *
+ *   1. Dispatch (handle_sock_recv(), protocol_sockets.c) runs in the SPI
+ *      transport's SWI/HWI context (transport_hw_ti_spi.c's ISR chain), and
+ *      step 2's copy runs on the WORKER TASK -- different execution
+ *      contexts on the SAME core, so they cannot literally run at the same
+ *      instant; "lands between step 1 and step 3" above means a dispatch
+ *      whose ISR preempts the task mid-copy (or is already pending when the
+ *      task's critical section in step 1 or 3 exits), not a true SMP race.
+ *   2. SOCK_CLOSE is itself worker-routed and answers BUSY while a SOCK_RECV
+ *      job is QUEUED/RUNNING (worker_poll() matches the single job slot by
+ *      opcode alone, so a close landing mid-recv reads the WRONG opcode
+ *      in-flight and reports busy rather than running) -- so a close on the
+ *      handle a RUNNING recv is filling this cache for cannot complete until
+ *      a LATER dispatch, by which time the recv has already published and
+ *      handle_sock_close() (protocol_sockets.c) re-invalidates the entry it
+ *      just filled.  If SOCK_CLOSE ever became synchronous (answered from
+ *      dispatch context without going through the worker), this ordering
+ *      would break: a close could complete WHILE step 3 is still publishing,
+ *      and this cache would resurrect a closed handle's entry the next time
+ *      the closed handle NUMBER is reused.
+ *
+ * @p handle is read out of job.req (SOCK_RECV's own worker_execute() case
+ * already computes it at offset 0) -- unlike SOCK_SEND's seq, the handle
+ * DOES ride in the wire payload, so it needs no separate capture.  @p hw_rv /
+ * @p data / @p len follow the same contract as the SOCK_SEND hook: the raw
+ * HAL return code (mapped to an ALP_CC3501E_RESP_* by protocol_sockets.c, not
+ * here) and the reply bytes, valid on CC3501E_HW_OK only.  BOTH OUTCOMES ARE
+ * CACHED for the same reason: a same seq+handle poll is a retry of the SAME
+ * logical recv, GIVEN a host with a dedicated SOCK_RECV counter
+ * (alp-sdk#2108) -- a pre-#2108 host sharing one counter across every opcode
+ * can alias two DIFFERENT logical recvs onto the same (seq, handle) pair;
+ * see protocol_sockets.c's own RESIDUAL comment above g_sock_recv_wk_cached. */
+void protocol_sock_recv_worker_invalidate(void);
+void protocol_sock_recv_worker_copy(const uint8_t *data, size_t len);
+void protocol_sock_recv_worker_publish(uint16_t handle, int hw_rv, size_t len);
 
 /*
  * worker_run_pending -- THE DRAIN.  Runs OUTSIDE the ISR, from main()'s
