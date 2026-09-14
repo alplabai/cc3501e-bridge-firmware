@@ -187,15 +187,20 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * submit edge (the same seam WIFI_CONNECT_STA already special-cases there for
  * cc3501e_hw_wifi_mark_connecting()), and worker.c's worker_execute() reads
  * the handle straight out of job.req and pairs it with the noted seq to fill
- * this cache -- in the SAME critical section that publishes job.state,
- * exactly like protocol_sock_send_on_worker_complete() (see worker.h for why
- * that ordering is load-bearing).
+ * this cache -- split across protocol_sock_recv_worker_invalidate() / _copy()
+ * / _publish() (worker.h, MINOR 6 of the 1118c99 review) so the multi-KB
+ * memcpy runs OUTSIDE any critical section; only the final key/status/len/
+ * cached publish and job.state itself are set inside one, mirroring
+ * protocol_sock_send_on_worker_complete()'s own ordering (see worker.h for
+ * why that ordering is load-bearing).
  *
  * BOTH OUTCOMES ARE CACHED (OK with the received bytes, or a decoded ERR),
  * for the identical reason the SOCK_SEND cache does: a same seq+handle poll
- * is BY DEFINITION a retry of the SAME logical recv, so whatever the first
- * execution produced is the correct, final answer for every later poll of
- * it.
+ * is a retry of the SAME logical recv GIVEN a host with a dedicated SOCK_RECV
+ * counter (alp-sdk#2108) -- see the RESIDUAL paragraph below for the
+ * pre-#2108 case, where the header seq is a single counter shared by every
+ * opcode and a same (seq, handle) pair is not always the same logical
+ * request.
  *
  * SIZED TO THE WIRE'S OWN CEILING, NO EXEMPTION: the cap is
  * CC3501E_REPLY_DATA_MAX (protocol.h's "Maximum reply DATA bytes a handler
@@ -293,7 +298,28 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * dispatch invalidates H1's (A, H1) entry (different handle) before H2 ever
  * touches the cache, and H1's OWN next recv is assigned A+1, so H1's lost
  * block is gone for good.  Building per-handle state to close this is
- * deliberately NOT done here; filed as a follow-up. */
+ * deliberately NOT done here; filed as a follow-up.
+ *
+ * A SECOND, SEPARATE residual (MAJOR, host review of c354208): a PRE-#2108
+ * host -- one still using the single 5-bit header seq shared by every
+ * opcode, not a dedicated SOCK_RECV counter -- can alias THIS cache through
+ * opcodes that never touch it at all.  recv (5, H) completes and is
+ * collected (host advances past 5); 30 SUBSEQUENT SOCK_OPEN/SOCK_SEND/etc.
+ * polls (none of them SOCK_RECV, so none of them run this file's
+ * invalidate-on-mismatch check) wrap the shared counter back to 5; the
+ * host's NEXT recv on the SAME handle H, now logically a brand-new request,
+ * is ALSO assigned seq 5 -- indistinguishable from the first at this cache's
+ * (seq, handle) granularity -- and is served the FIRST recv's stale bytes as
+ * OK, with no socket read.  Deliberately NOT fixed by invalidating this
+ * cache on every OTHER worker-routed opcode: that closes this hole by
+ * reopening BLOCKER 2's (a same-seq SOCK_RECV retry landing after an
+ * intervening, unrelated opcode would then lose its own cached reply the
+ * identical way SOCK_OPEN's old unconditional invalidation did).  A
+ * dedicated per-opcode counter (alp-sdk#2108) is the actual fix, already
+ * adopted by the host this firmware ships against; a pre-#2108 host remains
+ * exposed to this alias.  See
+ * test_probe_shared_counter_wrap_via_other_opcodes for a test that documents
+ * -- not fixes -- this. */
 #define CC3501E_SOCK_RECV_WK_CACHE_CAP CC3501E_REPLY_DATA_MAX
 
 static volatile bool               g_sock_recv_wk_cached;
@@ -666,9 +692,12 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * down -- both key off this same generic per-dispatch seq.  The RING
 	 * fast path's own `replay` decision still excludes seq 0 explicitly
 	 * (`seq != 0u && ...` below); the WORKER-FALLBACK cache further down
-	 * does NOT need the identical explicit exclusion -- its invalidate-on-
-	 * mismatch check already enforces the same property (see its own
-	 * comment for why serving a seq-0 hit there is still safe). */
+	 * cannot rely on its invalidate-on-mismatch check alone for the same
+	 * safety -- a genuinely new seq-0 recv on the SAME handle is
+	 * byte-identical to the one that just filled the cache, so that check
+	 * has nothing to compare that differs (BLOCKER, host review of c354208).
+	 * It instead serves a seq-0 hit ONCE and then forgets it, at the serve
+	 * site further down -- see that comment for why. */
 	const uint8_t seq = protocol_current_req_seq();
 
 	/* WORKER-FALLBACK REPLAY CACHE invalidation (see the block comment above
@@ -689,7 +718,17 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * download.  Running this check on EVERY SOCK_RECV dispatch, ring-served
 	 * or not, closes that: H2's own dispatch now invalidates H1's entry the
 	 * moment its (seq, handle) differs, regardless of which path serves H2's
-	 * OWN reply. */
+	 * OWN reply.
+	 *
+	 * NOT CLOSED, and cannot be from here: this check only runs when a
+	 * SOCK_RECV is dispatched.  A pre-#2108 host's shared counter can wrap
+	 * back to a stale entry's seq via 30 intervening NON-recv opcodes
+	 * instead (SOCK_OPEN, SOCK_SEND, ...) -- none of them reach this file's
+	 * invalidation at all, so the entry survives untouched until a recv on
+	 * the SAME handle happens to land on the same wrapped seq.  See the
+	 * SECOND residual paragraph in the block comment above
+	 * g_sock_recv_wk_cached; deliberately not fixed by invalidating on every
+	 * other opcode (that trades this for BLOCKER 2's class of loss). */
 	if (g_sock_recv_wk_cached && (seq != g_sock_recv_wk_seq || handle != g_sock_recv_wk_handle)) {
 		g_sock_recv_wk_cached = false;
 	}
@@ -768,27 +807,41 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 		}
 	}
 
-	/* WORKER-FALLBACK REPLAY CACHE serve.  seq == 0 is INCLUDED here,
-	 * deliberately (MAJOR, host review, 1118c99): the invalidation check
-	 * above ALREADY GUARANTEES that a still-valid g_sock_recv_wk_cached
-	 * means its (seq, handle) is EXACTLY this dispatch's own -- including
-	 * when both are 0 -- since any mismatch, on ANY dispatch, would have
-	 * already cleared it.  Serving it here is therefore exactly "collect the
-	 * job THIS SAME handle's immediately-preceding dispatch just submitted",
-	 * the identical plain submit/collect protocol every OTHER worker-routed
+	/* WORKER-FALLBACK REPLAY CACHE serve.  seq == 0 is INCLUDED here
+	 * (MAJOR, host review, 1118c99): the invalidation check above already
+	 * guarantees that a still-valid g_sock_recv_wk_cached means its
+	 * (seq, handle) is EXACTLY this dispatch's own -- including when both
+	 * are 0 -- since any mismatch, on ANY dispatch, would have already
+	 * cleared it.  Serving it here is therefore exactly "collect the job
+	 * THIS SAME handle's immediately-preceding dispatch just submitted", the
+	 * identical plain submit/collect protocol every OTHER worker-routed
 	 * opcode already gives a seq-0 host.  An earlier version of this gate
 	 * additionally required `seq != 0u`, which sent EVERY seq-0 poll past
 	 * this branch into the unconditional STALE-JOB GUARD below instead --
 	 * discarding the just-finished job and resubmitting on EVERY poll, so a
-	 * seq-0 host could never collect, only ever re-read (silently consuming
-	 * fresh, different socket bytes on what the host believed was still
-	 * waiting for its FIRST answer).  This does NOT let seq 0 replay a
-	 * DIFFERENT completion: the invalidation check already cleared
-	 * g_sock_recv_wk_cached the moment ANY other (seq, handle) pair --
-	 * including a genuinely new seq-0 recv on a DIFFERENT handle -- was
-	 * dispatched, by the SAME unconditional equality compare regardless of
-	 * either side being 0. */
+	 * seq-0 host could never collect, only ever re-read.
+	 *
+	 * BLOCKER, host review of c354208: that fix alone let seq 0 replay a
+	 * DIFFERENT completion.  seq 0 carries no identity, so a GENUINELY NEW
+	 * seq-0 recv on the SAME handle is byte-identical to the one that just
+	 * filled this cache -- the invalidation check above cannot tell them
+	 * apart, since there is nothing for it to compare that differs.  Poll 1
+	 * submits, poll 2 collects (correct), and a THIRD, logically new recv on
+	 * the same handle then matched this same entry and was served recv 1's
+	 * bytes again as OK, with no socket read -- the exact class of bug this
+	 * cache exists to prevent, now on the read side.  Fixed by treating a
+	 * seq-0 hit as SERVE ONCE, THEN FORGET: the cache is cleared the instant
+	 * it is served for seq 0, below, so the NEXT seq-0 poll on this handle
+	 * -- collect-again or a genuinely new recv, indistinguishable at this
+	 * layer -- always falls through to the STALE-JOB GUARD and submits
+	 * fresh.  A seq-carrying host (seq != 0) is unaffected: its NEXT
+	 * same-key poll is a genuine retry of the SAME logical recv (the host
+	 * only advances its own counter after collecting OK), so its entry may
+	 * safely survive repeat serves the way SOCK_SEND's cache does. */
 	if (g_sock_recv_wk_cached) {
+		if (seq == 0u) {
+			g_sock_recv_wk_cached = false; /* serve once, then forget -- see above */
+		}
 		/* This exact poll is what would once have reached
 		 * handle_worker_routed_payload_reply()'s own WORKER_DONE/WORKER_ERR
 		 * -> worker_reset() path -- now short-circuited by the cache hit

@@ -31,7 +31,7 @@
 #include "alp/protocol/cc3501e.h"
 #include "alp/protocol/crc16.h" /* alp_crc16_ccitt_false[_update] -- the canonical algorithm */
 #include "cc3501e_hw.h"         /* CC3501E_HW_OK */
-#include "protocol.h"           /* CC3501E_REPLY_PAD / CC3501E_FRAME_MAX_BYTES / CC3501E_REPLY_DATA_MAX */
+#include "protocol.h" /* CC3501E_REPLY_PAD / CC3501E_FRAME_MAX_BYTES / CC3501E_REPLY_DATA_MAX */
 #include "transport.h"
 #include "worker.h" /* worker_init -- the worker `job` is a static; reset it per test */
 
@@ -176,9 +176,16 @@ ZTEST(cc3501e_worker_poll_guard, test_oversize_result_is_no_mem_not_truncated_ok
  * time the reply hits the wire.  This test calls worker_poll() directly
  * (bypassing the wire and protocol_build_reply() entirely) with a
  * deliberately undersized out_cap and a canary byte placed immediately after
- * the caller's buffer, so a 1-byte overrun is caught in the act: with the
- * guard intact the canary must survive; with M6 applied
- * (`if (job.result_len > out_cap)` neutered) the overrun clobbers it. */
+ * the caller's buffer.  With M6 applied (`if (job.result_len > out_cap)`
+ * neutered) the mutant is actually caught by `st` -- the memcpy runs and
+ * worker_poll() returns WORKER_DONE instead of WORKER_ERR, so the FIRST
+ * assertion below already fails and the test never reaches the canary
+ * check (NIT, host review of c354208 -- an earlier version of this comment
+ * called this "caught in the act" by the canary, which overstated what
+ * actually fires first).  The canary is kept anyway: it is the only thing
+ * in this test that would ALSO catch a future mutant narrow enough to
+ * leave `st`/`err`/`out_len` looking correct while still overrunning `out`
+ * by a small, bounded amount. */
 ZTEST(cc3501e_worker_poll_guard, test_guard_prevents_memcpy_overrun_past_out_cap)
 {
 	uint8_t req[2] = { 1u, 0u }; /* handle = 1, LE16 -- BLE_GATT_READ's whole payload */
@@ -196,8 +203,8 @@ ZTEST(cc3501e_worker_poll_guard, test_guard_prevents_memcpy_overrun_past_out_cap
 	} buf;
 	memset(buf.canary, 0xCCu, sizeof buf.canary);
 
-	size_t out_len = 0u;
-	int8_t err     = 0;
+	size_t                  out_len = 0u;
+	int8_t                  err     = 0;
 	const enum worker_state st =
 	    worker_poll(ALP_CC3501E_CMD_BLE_GATT_READ, buf.out, sizeof buf.out, &out_len, &err);
 

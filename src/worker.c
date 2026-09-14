@@ -418,10 +418,22 @@ static void worker_execute(uint8_t cmd)
 		 *      receive-buffer's real capacity (nonzero) per
 		 *      alp_cc3501e_sock_recv_t's own "max_len: host receive-buffer
 		 *      capacity for this request" field doc.  Bounding by it here
-		 *      regardless keeps lwip_recvfrom() from EVER being asked for
-		 *      more than the host itself requested, mirroring the ring fast
-		 *      path's identical room computation (protocol_sockets.c's
-		 *      handle_sock_recv()).
+		 *      regardless keeps lwip_recvfrom() from EVER being asked for more
+		 *      than the host itself requested.  NOT the same as the ring fast
+		 *      path's room computation (protocol_sockets.c's handle_sock_recv(),
+		 *      NIT, host review of c354208 -- an earlier version of this comment
+		 *      claimed they mirrored each other; they do not): the ring treats
+		 *      max_len == 0 as "no cap beyond the reply buffer" (its own
+		 *      `if (max_len != 0u && room > max_len) room = max_len` leaves
+		 *      `room` at the buffer's own size when max_len is 0), while this
+		 *      path's cc3501e_hw_sock_recv() call passes max_len straight
+		 *      through, and the TI HAL's own `want = (max_len < cap) ? max_len :
+		 *      cap` then reads EXACTLY ZERO bytes for max_len == 0.  A
+		 *      worker-path recv with max_len 0 therefore always reports 0 bytes,
+		 *      where a ring-served one on the same request would return up to a
+		 *      full buffer -- a real behavioural difference between the two
+		 *      paths for that one input, not a bug this change introduces or
+		 *      fixes.
 		 *
 		 * With both bounds in place, cc3501e_hw_sock_recv() can never report
 		 * more than the reply -- and this cache's own

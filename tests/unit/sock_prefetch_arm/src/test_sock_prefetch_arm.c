@@ -10,7 +10,13 @@
  * them.  This is the pure arm/no-arm DECISION split out of that TI-SDK-only
  * (lwIP, CC3501E_WIFI) file, the same way sock_recv_commit.h's tail/
  * uncommitted arithmetic is split out of it, so it is host-testable where
- * the ring itself cannot be linked at all. */
+ * the ring itself cannot be linked at all.
+ *
+ * NOT COVERED HERE: the call site itself -- cc3501e_hw_sock_connect()'s
+ * SO_TYPE == SOCK_STREAM gate, and cc3501e_hw_sock_prefetch()'s
+ * armed == requested no-reset skip (both MINOR, host review of c354208) --
+ * lives in hal/ti/cc3501e_hw_ti_sock.c and cannot link on the host.  Covered
+ * only by review and by the run12 two-concurrent-socket bench. */
 
 #include <stdint.h>
 #include <zephyr/ztest.h>
@@ -26,8 +32,16 @@ ZTEST(sock_prefetch_arm, test_nothing_armed_may_arm)
 
 ZTEST(sock_prefetch_arm, test_same_handle_may_rearm)
 {
+	/* "May arm" here means the call site is allowed to proceed, NOT that it
+	 * resets the ring: cc3501e_hw_sock_prefetch() (MINOR, host review of
+	 * c354208) treats armed == requested as a TRUE no-op and skips the
+	 * head/tail/uncommitted reset entirely, since the handle asking is the
+	 * one already holding the ring -- resetting here would drop that SAME
+	 * handle's own pumped-but-not-yet-served bytes.  This function only
+	 * answers "may the caller proceed", not "should it reset"; see
+	 * sock_prefetch_arm.h's own doc comment for the call site's split. */
 	zassert_true(sock_prefetch_should_arm(100u, 100u),
-	             "already armed for THIS handle -> legitimate no-op re-arm");
+	             "already armed for THIS handle -> call site proceeds as a true no-op");
 }
 
 ZTEST(sock_prefetch_arm, test_different_handle_may_not_steal_the_ring)

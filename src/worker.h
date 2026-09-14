@@ -306,14 +306,39 @@ void protocol_sock_recv_note_submit(uint8_t seq);
  * reports the job QUEUED/RUNNING and answers BUSY -- never a torn read,
  * never data served from a half-copied buffer.
  *
+ * TWO FACTS THIS SAFETY ARGUMENT RESTS ON (NIT, host review of c354208):
+ *
+ *   1. Dispatch (handle_sock_recv(), protocol_sockets.c) runs in the SPI
+ *      transport's SWI/HWI context (transport_hw_ti_spi.c's ISR chain), and
+ *      step 2's copy runs on the WORKER TASK -- different execution
+ *      contexts on the SAME core, so they cannot literally run at the same
+ *      instant; "lands between step 1 and step 3" above means a dispatch
+ *      whose ISR preempts the task mid-copy (or is already pending when the
+ *      task's critical section in step 1 or 3 exits), not a true SMP race.
+ *   2. SOCK_CLOSE is itself worker-routed and answers BUSY while a SOCK_RECV
+ *      job is QUEUED/RUNNING (worker_poll() matches the single job slot by
+ *      opcode alone, so a close landing mid-recv reads the WRONG opcode
+ *      in-flight and reports busy rather than running) -- so a close on the
+ *      handle a RUNNING recv is filling this cache for cannot complete until
+ *      a LATER dispatch, by which time the recv has already published and
+ *      handle_sock_close() (protocol_sockets.c) re-invalidates the entry it
+ *      just filled.  If SOCK_CLOSE ever became synchronous (answered from
+ *      dispatch context without going through the worker), this ordering
+ *      would break: a close could complete WHILE step 3 is still publishing,
+ *      and this cache would resurrect a closed handle's entry the next time
+ *      the closed handle NUMBER is reused.
+ *
  * @p handle is read out of job.req (SOCK_RECV's own worker_execute() case
  * already computes it at offset 0) -- unlike SOCK_SEND's seq, the handle
  * DOES ride in the wire payload, so it needs no separate capture.  @p hw_rv /
  * @p data / @p len follow the same contract as the SOCK_SEND hook: the raw
  * HAL return code (mapped to an ALP_CC3501E_RESP_* by protocol_sockets.c, not
  * here) and the reply bytes, valid on CC3501E_HW_OK only.  BOTH OUTCOMES ARE
- * CACHED for the same reason: a same seq+handle poll is BY DEFINITION a
- * retry of the SAME logical recv. */
+ * CACHED for the same reason: a same seq+handle poll is a retry of the SAME
+ * logical recv, GIVEN a host with a dedicated SOCK_RECV counter
+ * (alp-sdk#2108) -- a pre-#2108 host sharing one counter across every opcode
+ * can alias two DIFFERENT logical recvs onto the same (seq, handle) pair;
+ * see protocol_sockets.c's own RESIDUAL comment above g_sock_recv_wk_cached. */
 void protocol_sock_recv_worker_invalidate(void);
 void protocol_sock_recv_worker_copy(const uint8_t *data, size_t len);
 void protocol_sock_recv_worker_publish(uint16_t handle, int hw_rv, size_t len);

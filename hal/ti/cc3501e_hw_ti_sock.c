@@ -141,8 +141,22 @@ int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, cons
 		return CC3501E_HW_ERR_IO;
 	}
 	/* A connected STREAM socket is the bulk-receive case -- start prefetching so
-	 * CMD_SOCK_RECV can be answered synchronously from the dispatch. */
-	cc3501e_hw_sock_prefetch(handle, true);
+	 * CMD_SOCK_RECV can be answered synchronously from the dispatch.
+	 *
+	 * STREAM ONLY (MINOR, host review of c354208): connect() is also legal on
+	 * a DGRAM (UDP) socket -- it just latches a default peer, no handshake --
+	 * and an earlier version of this call armed the ring for THAT too.  Under
+	 * sock_prefetch_should_arm()'s first-connect-wins rule (MAJOR 4, 1118c99),
+	 * a connected UDP socket then held the ring for its own lifetime and
+	 * locked out any STREAM socket's prefetch -- the case this fast path
+	 * actually exists for.  Check the real socket type with SO_TYPE rather
+	 * than trust a naming convention. */
+	int       so_type    = 0;
+	socklen_t so_type_sz = sizeof(so_type);
+	if (lwip_getsockopt(fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_sz) == 0 &&
+	    so_type == SOCK_STREAM) {
+		cc3501e_hw_sock_prefetch(handle, true);
+	}
 	return CC3501E_HW_OK;
 }
 
@@ -701,15 +715,37 @@ void cc3501e_hw_sock_pump(void)
  * `rx_ring.fd_plus1 == handle` branch and clears fd_plus1 to 0, so a
  * connect() on a NEW handle after that CAN arm -- confirmed against
  * cc3501e_hw_sock_close()'s own unconditional cc3501e_hw_sock_prefetch(handle,
- * false) call.  NOT also cleared here: a peer that closes ITS end and drains
- * to EOF (rx_ring.peer_closed, cc3501e_hw_sock_pump()) does NOT itself
- * disarm the ring -- that is unrelated, pre-existing behaviour this fix does
- * not change; the ring stays "armed" for a half-closed handle until the host
- * explicitly issues SOCK_CLOSE on it. */
+ * false) call.  A handle NUMBER the host reuses after closing therefore
+ * always arrives here as armed == 0 (disarmed by the close above), not
+ * armed == requested -- that is the ordinary cold-arm path above, not the
+ * same-handle no-op below.  NOT also cleared here: a peer that closes ITS
+ * end and drains to EOF (rx_ring.peer_closed, cc3501e_hw_sock_pump()) does
+ * NOT itself disarm the ring -- that is unrelated, pre-existing behaviour
+ * this fix does not change; the ring stays "armed" for a half-closed handle
+ * until the host explicitly issues SOCK_CLOSE on it.
+ *
+ * ARM-ON FOR THE SAME ALREADY-ARMED HANDLE IS A TRUE NO-OP (MINOR, host
+ * review of c354208): an earlier version ran the head/tail/uncommitted reset
+ * unconditionally whenever sock_prefetch_should_arm() allowed the arm at
+ * all, including armed == requested, so re-arming the SAME still-open
+ * handle dropped that handle's OWN already-pumped, not-yet-served bytes.
+ * Only a cold arm (fd_plus1 == 0) or taking the ring from a DIFFERENT
+ * handle resets it now; armed == requested returns immediately, below,
+ * leaving the ring exactly as it was. */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 {
 	if (on) {
 		if (!sock_prefetch_should_arm(rx_ring.fd_plus1, handle)) {
+			return;
+		}
+		if (rx_ring.fd_plus1 == handle) {
+			/* Already armed for THIS handle (MINOR, host review of c354208):
+			 * a true no-op, not a fresh arm -- the reset below is for taking
+			 * the ring from cold (fd_plus1 == 0) or from a DIFFERENT prior
+			 * handle, and running it here would drop whatever THIS SAME
+			 * handle's socket has already pumped into the ring but not yet
+			 * served.  Nothing to publish either: fd_plus1 already reads
+			 * `handle`. */
 			return;
 		}
 		rx_ring.head = rx_ring.tail = 0u;
