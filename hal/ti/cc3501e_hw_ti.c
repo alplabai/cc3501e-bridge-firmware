@@ -608,3 +608,11 @@ void cc3501e_hw_notify_reply_sent(void)
 		g_host_txn_count++;
 	}
 }
+
+uint32_t cc3501e_hw_host_txn_count(void)
+{
+	/* Plain volatile read -- see g_host_txn_count's own declaration comment
+	 * for why that is enough (single aligned word, written only from the SPI
+	 * ISR, read from a task; no read-modify-write needed on either side). */
+	return g_host_txn_count;
+}

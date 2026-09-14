@@ -102,4 +102,12 @@ bool cc3501e_hw_take_soft_reset_mark(void);
 /* False when the last TASK-side radio apply failed while a role was up. */
 bool cc3501e_hw_power_radio_ok(void);
 
+/* Replies fully clocked back to the host since boot (defined + written only
+ * in cc3501e_hw_ti.c, from cc3501e_hw_notify_reply_sent() in SPI ISR context;
+ * see g_host_txn_count there).  Read from cc3501e_hw_ti_wifi.c to tell
+ * whether the bridge SPI slave has demonstrably served a host frame between
+ * two points in time -- see the CONNECT-failure reinit-skip handoff in
+ * ../cc3501e_hw.h for the one caller that needs this cross-TU. */
+uint32_t cc3501e_hw_host_txn_count(void);
+
 #endif /* CC3501E_HAL_TI_CC3501E_HW_TI_INTERNAL_H */

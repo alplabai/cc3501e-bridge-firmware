@@ -1055,17 +1055,22 @@ void worker_run_pending(void)
 		 * role_up_was_latched -- see cc3501e_hw_wifi_connect_sta) predates #106 and
 		 * does not appear here: the whole association after it -- Wlan_Connect, the
 		 * 30 s event wait, DHCP, and every FAILURE exit's Wlan_Disconnect cleanup --
-		 * still runs afterward and still needs a reinit from somewhere, which stays
-		 * this drain's job for every one of those exits.
+		 * still runs afterward and still needs a reinit from somewhere.  Whether that
+		 * "somewhere" is this drain or is skipped is now a THIRD, separate per-run
+		 * signal (connect_fail_skip below, one per FAILURE exit) -- it is NOT
+		 * unconditionally this drain's job any more for every FAILURE exit, unlike
+		 * before this whole fix.
 		 *
 		 * The SECOND (#106, right before the body's SUCCESS-path wifi_conn_set
 		 * (CONNECTED)) is what wifi_connect_body_reinit below skips.  Unlike
 		 * BLE_SCAN_STOP / BLE_DISCONNECT it is not a static per-opcode fact -- it is
 		 * signalled PER RUN by cc3501e_hw_wifi_connect_sta_take_reinit(), because
 		 * only the SUCCESS exit takes that reinit.  Do NOT fold WIFI_CONNECT_STA
-		 * into a static `cmd ==` entry here: that would wrongly skip the drain's
-		 * reinit on every FAILURE exit too, which still needs it exactly as before
-		 * #106.
+		 * into a static `cmd ==` entry here: a static fold cannot distinguish the
+		 * SUCCESS exit (which re-arms the slave itself) from a FAILURE exit (which
+		 * may or may not have found live-slave evidence THIS run) -- each needs its
+		 * own per-run handoff, exactly the two separate ones already wired in below
+		 * (wifi_connect_body_reinit and connect_fail_skip).
 		 *
 		 * Same static-exemption caution applies to WIFI_SCAN_START, which has had a
 		 * body reinit (between its own role-up and Wlan_Scan) since long before this
@@ -1240,9 +1245,45 @@ void worker_run_pending(void)
 		 * why it was taken OFF this list once already, and the 2026-09-14 note
 		 * appended there on why that removal's premise does not hold either. */
 		const bool wifi_disconnect = (cmd == ALP_CC3501E_CMD_WIFI_DISCONNECT);
+		/* WIFI_CONNECT_STA's FAILURE exits are their OWN group too (advisor
+		 * analysis, NOT bench-proven -- see src/wifi_connect_fail_skip.h for the
+		 * full argument and citation trail).  Unlike wifi_connect_body_reinit
+		 * above, which fires on the SUCCESS exit, this fires on the FAILURE ones:
+		 * bad args aside, every failure reason (role-up fail, REJECTED, TIMEOUT,
+		 * no DHCP lease) used to pay this drain's reinit unconditionally, the
+		 * same destructive-reinit-on-a-live-slave shape #106 measured for RSSI
+		 * and WIFI_DISCONNECT.  cc3501e_hw_wifi_connect_sta_take_fail_skip()
+		 * reports whether a host frame landed within a short POLL WINDOW taken
+		 * fresh at that failure exit (wifi_connect_fail_mark_skip(), hal/ti/
+		 * cc3501e_hw_ti_wifi.c) -- deliberately NOT a snapshot from the body's
+		 * earlier role-up reinit: an earlier version of this fix measured from
+		 * there and could report a frame served by host polling that happened
+		 * BEFORE a later Wlan_Connect or the untraced asynchronous association
+		 * work killed the slave, which wrongly skipped the reinit that would
+		 * have recovered it (host review of 580f748).  CONDITIONAL, same shape
+		 * as RSSI's skip, because "no frame in the window" does not prove the
+		 * slave is dead, only that there is no evidence it is alive, so the
+		 * built-in falsifier is to keep reinitting in that case exactly as
+		 * before this fix.
+		 *
+		 * What the count proves, same as every other skip group in this list
+		 * that reads it: the slave finished a request/reply cycle on ITS OWN
+		 * side -- it is bumped (cc3501e_hw_notify_reply_sent(), hal/ti/
+		 * transport_hw_ti_spi.c ~809) right after the whole reply clocked,
+		 * BEFORE that same call re-arms the next request header
+		 * (arm_request_header(), ~810) -- and it does NOT depend on whether
+		 * the HOST successfully decoded that reply.  A failed re-arm or a
+		 * desynced slave still reads as "live" by this count; recovery from
+		 * either then falls to cc3501e_hw_tick()'s own g_arm_fail_count /
+		 * g_resync_count self-heal, same as it always has, not to this skip. */
+		bool       skip_ok_by_connect_fail = false;
+		const bool connect_fail_reported_skip =
+		    (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) &&
+		    cc3501e_hw_wifi_connect_sta_take_fail_skip(&skip_ok_by_connect_fail);
+		const bool connect_fail_skip = connect_fail_reported_skip && skip_ok_by_connect_fail;
 		if (cmd != ALP_CC3501E_CMD_SOCK_RECV && cmd != ALP_CC3501E_CMD_SOCK_SEND &&
 		    !socket_control && !spi1_passthrough && !body_already_reinit && !rssi_read &&
-		    !wifi_disconnect) {
+		    !wifi_disconnect && !connect_fail_skip) {
 			cc3501e_bridge_busy();
 			rearmed = bridge_transport_spi_hw_reinit();
 		}

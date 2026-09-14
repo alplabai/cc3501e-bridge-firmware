@@ -240,6 +240,15 @@ bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out)
 	return false;
 }
 
+bool cc3501e_hw_wifi_connect_sta_take_fail_skip(bool *skip_ok_out)
+{
+	/* No connect body ever runs on the stub, so no FAILURE exit ever takes
+	 * this either -- src/worker.c's drain keeps paying its own reinit for
+	 * WIFI_CONNECT_STA here, same as before this fix. */
+	(void)skip_ok_out;
+	return false;
+}
+
 int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
                              uint8_t        ssid_len,
                              const uint8_t *psk,
