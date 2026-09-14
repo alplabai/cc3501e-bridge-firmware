@@ -247,6 +247,24 @@ target_compile_options(test_sock_recv_commit PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_sock_recv_commit PRIVATE ztest_shim)
 add_test(NAME sock_recv_commit COMMAND test_sock_recv_commit)
 
+# sock_prefetch_arm: the pure arm/no-arm decision behind the MAJOR 4 fix
+# (host review of 1118c99) in hal/ti/cc3501e_hw_ti_sock.c's
+# cc3501e_hw_sock_prefetch() -- do not re-arm the single prefetch ring while
+# a DIFFERENT handle already holds it.  Header-only (sock_prefetch_arm.h is a
+# single `static inline` comparison, no state to split into a .c like
+# sock_recv_commit's tail/uncommitted arithmetic needed), same reason: the
+# real ring (hal/ti/cc3501e_hw_ti_sock.c) is TI-SDK-only (lwIP,
+# CC3501E_WIFI) and never linked on the host.
+add_executable(test_sock_prefetch_arm
+    sock_prefetch_arm/src/test_sock_prefetch_arm.c
+)
+target_include_directories(test_sock_prefetch_arm PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_sock_prefetch_arm PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_prefetch_arm PRIVATE ztest_shim)
+add_test(NAME sock_prefetch_arm COMMAND test_sock_prefetch_arm)
+
 # sock_recv_worker_cache: the WORKER-FALLBACK reply cache in
 # protocol_sockets.c's handle_sock_recv() (g_sock_recv_wk_cached et al.) --
 # closes the KNOWN FOLLOW-UP the ring fast path's own fix (sock_recv_replay,
@@ -262,6 +280,16 @@ add_test(NAME sock_recv_commit COMMAND test_sock_recv_commit)
 # drive and inspect over the wire.  Same FW_SOURCES + stub HAL as
 # test_sock_send_done (no CC3501E_WIFI: the synchronous-submit stub shape is
 # exactly what this needs to reach DONE inside a single transaction()).
+#
+# ALSO wraps cc3501e_hw_sock_recv_ring (test_sock_recv_replay's own wrap) in
+# this SAME executable, for the BLOCKER 1 review probe
+# (test_probe_ring_recv_does_not_age_out_worker_cache): that scenario needs
+# ONE handle served by the ring fast path (a real, non -1 rc) interleaved
+# with another served by the worker fallback, in the same test run.  Safe
+# alongside every other test in this file: the ring wrap only engages for
+# handle 777 (see the wrap's own doc comment), a number no other test here
+# uses, so every other test's ring calls still see rc == -1 exactly as
+# before.
 add_executable(test_sock_recv_worker_cache
     sock_recv_worker_cache/src/test_sock_recv_worker_cache.c
     ${FW_SOURCES}
@@ -275,6 +303,30 @@ target_compile_definitions(test_sock_recv_worker_cache PRIVATE
     CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
     CC3501E_WIRE_CRC=1)
 target_compile_options(test_sock_recv_worker_cache PRIVATE ${TEST_FLAGS})
-target_link_options(test_sock_recv_worker_cache PRIVATE -Wl,--wrap=cc3501e_hw_sock_recv)
+target_link_options(test_sock_recv_worker_cache PRIVATE
+    -Wl,--wrap=cc3501e_hw_sock_recv
+    -Wl,--wrap=cc3501e_hw_sock_recv_ring)
 target_link_libraries(test_sock_recv_worker_cache PRIVATE ztest_shim)
 add_test(NAME sock_recv_worker_cache COMMAND test_sock_recv_worker_cache)
+
+# worker_poll_guard: worker_poll()'s WORKER_DONE truncation guard (worker.c),
+# proven on BLE_GATT_READ rather than SOCK_RECV so protocol_sockets.c's own
+# opcode-specific oversize guard cannot intercept the injected oversize
+# result before worker_poll() is ever reached -- see the test file's own top
+# comment.  Same FW_SOURCES + stub HAL, no CC3501E_WIFI (synchronous submit).
+add_executable(test_worker_poll_guard
+    worker_poll_guard/src/test_worker_poll_guard.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_worker_poll_guard PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_worker_poll_guard PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1)
+target_compile_options(test_worker_poll_guard PRIVATE ${TEST_FLAGS})
+target_link_options(test_worker_poll_guard PRIVATE -Wl,--wrap=cc3501e_hw_ble_gatt_read)
+target_link_libraries(test_worker_poll_guard PRIVATE ztest_shim)
+add_test(NAME worker_poll_guard COMMAND test_worker_poll_guard)

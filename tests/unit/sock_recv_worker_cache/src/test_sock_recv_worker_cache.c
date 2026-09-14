@@ -31,9 +31,18 @@
  *     wrap itself keeps, mirroring sock_send_done's g_worker_execs check);
  *   - a DIFFERENT seq (same handle) submits a new recv instead of replaying;
  *   - a DIFFERENT handle (same seq) submits a new recv instead of replaying;
- *   - seq 0 never replays, even against its own immediately-preceding call;
+ *   - seq 0 EVENTUALLY COLLECTS its own completion (plain submit/collect,
+ *     same as every other worker-routed opcode) but never replays a
+ *     DIFFERENT completion;
  *   - SOCK_CLOSE on the cached handle invalidates the cache, so the next
  *     recv on that same handle number submits fresh;
+ *   - a ring-served recv on a DIFFERENT, armed handle does NOT let a stale
+ *     worker-fallback entry age past a wrapped-seq collision (BLOCKER 1);
+ *   - an UNRELATED SOCK_OPEN between a recv's submit and its retry does NOT
+ *     drop the retry's cache hit (BLOCKER 2);
+ *   - a cross-handle interleave BEFORE a recv's own retry is a documented,
+ *     PINNED residual (three genuine reads, no misattribution) -- MAJOR 5,
+ *     not a bug this suite expects fixed;
  *   - a MAX-SIZE reply (the ACTUAL bug shape: an accepted TCP socket read
  *     reporting the full worker.c data_cap, ~4071 B -- the exact run10 loss
  *     size, well above a withdrawn 256 B cap that shipped in an earlier,
@@ -129,6 +138,31 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
 	return CC3501E_HW_OK;
 }
 
+/* Redirects every cc3501e_hw_sock_recv_ring() call to here
+ * (`-Wl,--wrap=cc3501e_hw_sock_recv_ring`, tests/unit/CMakeLists.txt) --
+ * ONLY for the BLOCKER 1 test below (test_ring_recv_does_not_age_out_the_
+ * worker_fallback_cache): reports "ring-owned, OK" for handle 777 and
+ * "not mine, fall through" (-1) for everything else, so every OTHER test in
+ * this file (none of which uses handle 777) sees the SAME rc == -1 the
+ * plain stub's own cc3501e_hw_sock_recv_ring() always returns, unaffected. */
+int __wrap_cc3501e_hw_sock_recv_ring(uint16_t  handle,
+                                     uint8_t  *buf,
+                                     uint16_t  cap,
+                                     bool      replay,
+                                     uint16_t *out_len)
+{
+	(void)replay;
+	(void)cap;
+	const bool mine = (handle == 777u);
+	if (!mine) {
+		if (out_len != NULL) *out_len = 0u;
+		return -1;
+	}
+	buf[0] = 0x77u;
+	if (out_len != NULL) *out_len = 1u;
+	return 1;
+}
+
 /* ---- Wire harness -- deliberately duplicated from test_transport_spi.c ----
  * rather than shared, matching this suite's own existing precedent
  * (test_sock_send_done.c / test_sock_recv_replay.c are likewise
@@ -215,6 +249,29 @@ static void build_close(uint8_t *out, uint16_t handle)
 	out[5] = (uint8_t)((handle >> 8) & 0xFFu);
 	out[6] = 0u;
 	out[7] = 0u;
+}
+
+/* alp_cc3501e_sock_open_t = family | type | protocol | reserved = 4 B. */
+static void build_open(uint8_t *out, uint8_t seq)
+{
+	out[0] = ALP_CC3501E_CMD_SOCK_OPEN;
+	out[1] = (uint8_t)(seq << ALP_CC3501E_FLAG_REQ_SEQ_SHIFT);
+	out[2] = 4u;
+	out[3] = 0u;
+	out[4] = (uint8_t)ALP_CC3501E_SOCK_FAMILY_IPV4;
+	out[5] = 1u; /* type: arbitrary, non-zero */
+	out[6] = 0u;
+	out[7] = 0u;
+}
+
+/* transaction() + drain() + return the status byte -- the shape every test
+ * below that only cares about BUSY/OK/NO_MEM (not the reply's own byte
+ * content) repeats. */
+static int poll_status(const uint8_t *req, uint8_t *reply, size_t cap)
+{
+	transaction(req, 8u);
+	(void)drain(reply, cap);
+	return reply[4];
 }
 
 /* Reply DATA = alp_cc3501e_sock_recv_resp_t (24 B) + 1 data byte (0x42, the
@@ -319,32 +376,73 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_different_handle_submits_new)
 	zassert_equal(g_wrap_calls, calls_before + 2u, "req_b's own cache hit ran no further hw recv");
 }
 
-ZTEST(cc3501e_sock_recv_worker_cache, test_seq_zero_never_replays)
+/* REWRITTEN (MAJOR 3, host review of 1118c99): a seq-0 host (one that never
+ * assigns a retry-protection identity -- every bare cc3501e_request() call
+ * site, or a pre-v8 host) still gets the PLAIN submit/collect protocol every
+ * OTHER worker-routed opcode already gives it, not a discard-and-reread on
+ * every poll.  The OLD version of this test asserted the OPPOSITE ("seq 0
+ * reissued against itself still submits fresh") -- that assertion was
+ * itself pinning the bug: worker_discard_stale_recv() firing unconditionally
+ * on every seq-0 poll (because seq 0 never hit the cache at all, by the OLD
+ * gate) discarded the just-finished job and re-read on EVERY poll, so a
+ * seq-0 host could never collect its own recv, only ever consume fresh
+ * (different) socket bytes believing it was still waiting for its FIRST
+ * answer -- the SAME class of data loss the rest of this cache exists to
+ * prevent.  A same-handle, same-key (seq 0, same handle) repeat is now a
+ * cache hit (see handle_sock_recv()'s own comment on why serving seq 0 here
+ * is still safe: the invalidation check guarantees an exact match), so
+ * EVERY poll after the first collects the SAME single hw read -- exactly
+ * "eventually collects", proven by g_wrap_calls staying at 1 across four
+ * polls. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_seq_zero_eventually_collects)
+{
+	uint8_t        reply[64];
+	uint8_t        req[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req, 0u, 990u); /* seq 0 -- ALP_CC3501E_REQ_SEQ_NONE */
+
+	transaction(req, sizeof req);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(reply[4], ALP_CC3501E_RESP_ERR_BUSY, "seq0 first poll submits -> BUSY");
+	zassert_equal(g_wrap_calls, calls_before + 1u, "seq0 submit ran the HW body once");
+
+	/* Second, third, fourth identical (seq 0, same handle) polls: each MUST
+	 * collect the SAME completion, none may trigger a further hw read. */
+	transaction(req, sizeof req);
+	int s1 = drain(reply, sizeof reply) > 0 ? reply[4] : -1;
+	transaction(req, sizeof req);
+	int s2 = drain(reply, sizeof reply) > 0 ? reply[4] : -1;
+	transaction(req, sizeof req);
+	int s3 = drain(reply, sizeof reply) > 0 ? reply[4] : -1;
+
+	zassert_equal(s1, ALP_CC3501E_RESP_OK, "seq0 second poll collects");
+	zassert_equal(s2, ALP_CC3501E_RESP_OK, "seq0 third poll collects (still cached)");
+	zassert_equal(s3, ALP_CC3501E_RESP_OK, "seq0 fourth poll collects (still cached)");
+	zassert_equal(g_wrap_calls, calls_before + 1u, "still exactly ONE hw read after four polls");
+}
+
+/* seq 0 must still never replay a DIFFERENT completion -- only its OWN
+ * immediately-preceding one (see test_seq_zero_eventually_collects' own
+ * comment for why THAT case is now safely a cache hit).  A seq-0 recv on a
+ * DIFFERENT handle is a mismatch by the invalidation check regardless of
+ * either side being 0, so it must submit fresh. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_seq_zero_does_not_replay_a_different_handle)
 {
 	uint8_t        reply[64];
 	uint8_t        req_a[8];
 	uint8_t        req_z[8];
 	const uint32_t calls_before = g_wrap_calls;
-	build_recv(req_a, 5u, 400u);
-	build_recv(req_z, 0u, 400u); /* same handle, seq 0 -- ALP_CC3501E_REQ_SEQ_NONE */
+	build_recv(req_a, 5u, 401u);
+	build_recv(req_z, 0u, 402u); /* DIFFERENT handle, seq 0 */
 
 	transaction(req_a, sizeof req_a);
 	(void)drain(reply, sizeof reply);
 	zassert_equal(g_wrap_calls, calls_before + 1u, "req_a's submit ran the HW body once");
 
-	/* seq 0 on the SAME handle must still submit fresh -- seq 0 never
-	 * claims a replay, same reservation the ring fast path and the generic
-	 * retry latch both use. */
-	transaction(req_z, sizeof req_z);
-	(void)drain(reply, sizeof reply);
-	zassert_equal(g_wrap_calls, calls_before + 2u, "seq 0 submits a NEW hw recv, never a replay");
-
-	/* seq 0's own immediate re-issue must ALSO not replay -- seq 0 never
-	 * matches itself either. */
 	transaction(req_z, sizeof req_z);
 	(void)drain(reply, sizeof reply);
 	zassert_equal(
-	    g_wrap_calls, calls_before + 3u, "seq 0 reissued against itself still submits fresh");
+	    g_wrap_calls, calls_before + 2u, "seq 0 on a DIFFERENT handle submits fresh, not a replay");
 }
 
 ZTEST(cc3501e_sock_recv_worker_cache, test_sock_close_invalidates_the_cache)
@@ -482,6 +580,129 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_max_len_4071_bounds_hw_cap_and_reply_
 	    g_wrap_calls, calls_before + 1u, "the cache hit did not call cc3501e_hw_sock_recv() again");
 
 	g_wrap_large_mode = false;
+}
+
+/* BLOCKER 1 (host review, 1118c99): the worker-fallback cache's invalidate-
+ * on-mismatch check used to run AFTER the ring fast path, which returns
+ * EARLY -- so a recv the RING serves never reached it at all.  Scenario:
+ * H1 (worker path) recvs and is COLLECTED (host advances its per-recv seq
+ * past the value it used); many SUBSEQUENT recvs on an ARMED, DIFFERENT
+ * handle H2 -- served entirely by the ring, never touching the code that
+ * used to sit after it -- eventually wrap the SHARED 5-bit header seq back
+ * to the value H1's OWN stale cache entry still held; H1's NEXT recv,
+ * carrying that wrapped value, then matched the stale entry and was served
+ * H1's OLD bytes as OK with NO hw read at all.  This test does not need 30
+ * intervening calls to reproduce it: ONE ring-served H2 recv is enough to
+ * either invalidate H1's entry (fixed) or leave it untouched (bug) -- the
+ * wrapped-seq collision is then simulated directly by reissuing H1's
+ * ORIGINAL wire bytes verbatim. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_ring_recv_does_not_age_out_the_worker_fallback_cache)
+{
+	uint8_t reply[64];
+	uint8_t h1[8];
+	uint8_t h2[8];
+	build_recv(h1, 1u, 994u); /* worker-path handle */
+	build_recv(h2, 2u, 777u); /* ring-owned handle, per __wrap_cc3501e_hw_sock_recv_ring above */
+
+	int sub = poll_status(h1, reply, sizeof reply);
+	zassert_equal(sub, ALP_CC3501E_RESP_ERR_BUSY, "H1 submit");
+	int got = poll_status(h1, reply, sizeof reply);
+	zassert_equal(got, ALP_CC3501E_RESP_OK, "H1 collected -- the host advances its seq from here");
+
+	int ring = poll_status(h2, reply, sizeof reply);
+	zassert_equal(ring, ALP_CC3501E_RESP_OK, "the armed H2 recv is served by the ring fast path");
+
+	/* H1's bytes reissued VERBATIM -- simulating the shared 5-bit counter
+	 * having wrapped back to seq 1 after enough intervening ring-served H2
+	 * calls.  With the invalidation check running on H2's OWN dispatch too,
+	 * H1's stale entry is already gone by the time this lands, so it MUST
+	 * submit a fresh recv, never replay the old one. */
+	const uint32_t calls_before = g_wrap_calls;
+	int            again        = poll_status(h1, reply, sizeof reply);
+	zassert_equal(g_wrap_calls,
+	              calls_before + 1u,
+	              "a new H1 recv at a wrapped-back seq must read the socket, not replay");
+	zassert_equal(again, ALP_CC3501E_RESP_ERR_BUSY, "the new H1 recv submits fresh");
+}
+
+/* BLOCKER 2 (host review, 1118c99): handle_sock_open() used to invalidate
+ * the worker-fallback cache UNCONDITIONALLY on every SOCK_OPEN, including
+ * one for a completely UNRELATED new socket -- dropping a same-seq retry's
+ * only chance to collect a worker-routed recv that had already completed
+ * (and, on the wire, been consumed off the peer socket) but not yet been
+ * collected by the host.  SOCK_OPEN must never touch this cache: only
+ * SOCK_CLOSE frees a host-visible handle number (verified against every
+ * hal/ti/cc3501e_hw_ti_sock.c lwip_close() site -- see handle_sock_open()'s
+ * own comment). */
+ZTEST(cc3501e_sock_recv_worker_cache, test_sock_open_between_retry_still_served_from_cache)
+{
+	uint8_t reply[64];
+	uint8_t req[8];
+	uint8_t open_req[8];
+	build_recv(req, 12u, 991u);
+	build_open(open_req, 7u);
+
+	int            sr           = poll_status(req, reply, sizeof reply);
+	int            so           = poll_status(open_req, reply, sizeof reply);
+	const uint32_t calls_before = g_wrap_calls;
+	int            sr2          = poll_status(req, reply, sizeof reply);
+
+	zassert_equal(sr, ALP_CC3501E_RESP_ERR_BUSY, "recv submit");
+	zassert_equal(so, ALP_CC3501E_RESP_ERR_BUSY, "an UNRELATED SOCK_OPEN submits too");
+	zassert_equal(sr2, ALP_CC3501E_RESP_OK, "the recv retry after SOCK_OPEN is still a cache hit");
+	zassert_equal(g_wrap_calls, calls_before, "the retry after SOCK_OPEN must not re-read");
+}
+
+/* MAJOR 5 (host review, 1118c99): the CROSS-handle residual, stated
+ * precisely and DEMONSTRATED here rather than fixed -- see
+ * protocol_sockets.c's own RESIDUAL comment (g_sock_recv_wk_cached) and
+ * sock_recv_commit.h's RESIDUAL 1/2 for the full argument.  A single cache
+ * entry cannot hold two DIFFERENT handles' completions at once: if a second
+ * handle's recv is dispatched BEFORE the first handle's own retry arrives
+ * (two sockets driven from two different host threads/ctxs are not
+ * serialised against each other -- ctx->sock_busy's own doc comment says so
+ * outright), the first handle's entry is correctly invalidated (never
+ * served to the WRONG handle) but is then gone -- its own eventual retry
+ * must submit fresh, consuming NEW socket bytes rather than recovering the
+ * original ones.  This is the SAFE, documented tradeoff (no corruption, no
+ * wedge -- worker_discard_stale_recv()'s unconditional-by-opcode reclaim
+ * keeps the single job slot from ever deadlocking on an abandoned job)
+ * versus the WORSE alternative of refusing the second handle until the
+ * first retries, which a host that never retries would wedge forever.
+ * Building per-handle state to close this is deliberately NOT done; this
+ * test exists to PIN the current, accepted behaviour (three genuine hw
+ * reads, one per logical recv, no misattribution) so a future change that
+ * accidentally reintroduces stale-data misattribution here is caught. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_cross_handle_interleave_is_a_documented_residual)
+{
+	uint8_t        reply[64];
+	uint8_t        r1[8];
+	uint8_t        r2[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(r1, 13u, 992u);
+	build_recv(r2, 13u, 993u); /* same candidate seq, DIFFERENT handle */
+
+	int a = poll_status(r1, reply, sizeof reply);
+	zassert_equal(a, ALP_CC3501E_RESP_ERR_BUSY, "H1 submit");
+	zassert_equal(g_wrap_calls, calls_before + 1u, "H1's own submit read the socket once");
+
+	/* H2 lands BEFORE H1's own retry: invalidates H1's entry (different
+	 * handle) and, since H1's job was never collected, discards it and
+	 * submits its own fresh recv -- a SECOND real read, not H1's stale
+	 * reply. */
+	int b = poll_status(r2, reply, sizeof reply);
+	zassert_equal(b, ALP_CC3501E_RESP_ERR_BUSY, "H2 submit");
+	zassert_equal(g_wrap_calls, calls_before + 2u, "H2's own submit read the socket once");
+
+	/* H1's retry: H2's entry is now cached, a mismatch for H1's own
+	 * (seq, handle) -- invalidated, and H2's uncollected job discarded in
+	 * turn.  H1 submits fresh: a THIRD real read.  This is the documented
+	 * residual, not a bug -- H1's ORIGINAL bytes are gone, but this fresh
+	 * read is genuinely H1's own, not H2's misattributed to H1. */
+	int c = poll_status(r1, reply, sizeof reply);
+	zassert_equal(
+	    c, ALP_CC3501E_RESP_ERR_BUSY, "H1 retry submits fresh (its original bytes are lost)");
+	zassert_equal(g_wrap_calls, calls_before + 3u, "H1's retry read the socket a THIRD time");
 }
 
 static void reset_worker(void *fixture)

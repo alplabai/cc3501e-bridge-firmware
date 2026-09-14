@@ -28,39 +28,54 @@
  * independently of the held-back tail) -- correct stream-prefix semantics,
  * never fewer.
  *
- * RESIDUAL 1 -- seq aliasing -- CLOSED BY THE HOST COUNTER.  Before
- * alp-sdk#2108 (branch fix/cc3501e-sock-recv-seq), protocol_sockets.c's
- * handle_sock_recv() identified a replay by the generic per-dispatch 5-bit
- * header seq (protocol.c's s_current_req_seq) plus handle -- shared by every
- * opcode the host issues through cc3501e_core.c's poll_by_repeat(), so two
- * consecutive ring recvs on the SAME handle could collide (the second wrongly
- * read as a replay of the first, duplicating a block, still reported OK)
- * whenever exactly 30 mod 31 OTHER seq-allocating calls separated them (31
- * non-zero values in the 5-bit field).  AFTER #2108: the host gives SOCK_RECV
- * its OWN dedicated seq counter, advanced ONLY after an ALP_OK recv -- no
- * other opcode can ever tick it, so two same-handle recvs can no longer
- * alias by construction.  A host that does not carry #2108 (an older SDK, or
- * one that never adopts the dedicated counter) still shares the generic
- * counter and keeps this residual; this firmware-side fix cannot close it
- * unilaterally, since the firmware only ever sees the seq the host chose to
- * send.
+ * RESIDUAL 1 -- seq aliasing -- NARROWED, NOT FULLY CLOSED, BY THE HOST
+ * COUNTER (host review, MAJOR 5 of the 1118c99 review: an earlier version of
+ * this comment said "closed"; that overclaimed).  Before alp-sdk#2108
+ * (branch fix/cc3501e-sock-recv-seq), protocol_sockets.c's handle_sock_recv()
+ * identified a replay by the generic per-dispatch 5-bit header seq
+ * (protocol.c's s_current_req_seq) plus handle -- shared by every opcode the
+ * host issues through cc3501e_core.c's poll_by_repeat(), so two consecutive
+ * ring recvs on the SAME handle could collide (the second wrongly read as a
+ * replay of the first, duplicating a block, still reported OK) whenever
+ * exactly 30 mod 31 OTHER seq-allocating calls separated them (31 non-zero
+ * values in the 5-bit field).  AFTER #2108: the host gives SOCK_RECV its OWN
+ * dedicated seq counter, advanced ONLY after an ALP_OK recv, which removes
+ * THAT SPECIFIC alias (two recvs on the SAME handle can no longer collide,
+ * since nothing else can tick their shared counter) -- but a DIFFERENT,
+ * CROSS-handle alias remains even with the dedicated counter: recv (A, H1)
+ * consumes bytes off the socket but the host's poll_by_repeat gives up before
+ * ever retrying with the SAME candidate seq A (so #2108's counter, which only
+ * advances on an ALP_OK collect, is still sitting on A); the VERY NEXT recv
+ * the host issues, on a DIFFERENT handle H2, is then assigned that SAME
+ * candidate seq A -- H2's dispatch reads (A, H2) against the ring's own
+ * last_recv_seq/last_recv_handle (still holding H1's (A, H1) from the lost
+ * reply) as a MISMATCH (different handle), which is handled correctly (H2 is
+ * not treated as a replay of H1) -- but it also means H1's own entry is now
+ * gone, and H1's NEXT recv carries A+1, so H1's lost block cannot be
+ * recovered.  Recovery is guaranteed ONLY for an IMMEDIATE same-handle
+ * retry, matching alp-sdk's own cc3501e_core.h contract; the cross-handle
+ * case above is NOT closed by #2108 and is not addressed here -- filed as a
+ * follow-up, not solved by adding per-handle state to this firmware-side fix.
+ * A host that does not carry #2108 at all keeps the WIDER, single-handle
+ * version of this residual on top.
  *
- * RESIDUAL 2 -- a dropped reply with no retry -- ALSO CLOSED BY THE HOST
- * COUNTER.  Lazy-commit retires the previous call's bytes when a DIFFERENT
- * request arrives, not when the previous reply is actually known to have
- * reached the host -- usually the same event (a lost reply provokes
- * poll_by_repeat()'s same-seq retry, which this fix catches), but not when
- * the host drops a lost reply WITHOUT issuing that retry (poll_by_repeat()'s
- * deadline expiring right after a CRC failure, or a corrupted status byte
- * decoding as a terminal code instead of the CRC error it should have been).
- * #2108's dedicated counter is advanced ONLY after an ALP_OK recv, so a
- * FAILED recv leaves the host's seq UNCHANGED -- its next recv on that handle
- * therefore carries the SAME seq as the one that was lost, which this fix's
- * replay check reads as a replay (not a new call), re-serving the
- * still-unacknowledged block instead of committing past it.  Closed as a
- * consequence of the counter's advance-on-success-only rule, not by a
- * separate grace re-poll.  A host that does not carry #2108 keeps this
- * residual, for the same reason RESIDUAL 1 does.
+ * RESIDUAL 2 -- a dropped reply with no retry -- SAME "narrowed, not fully
+ * closed" caveat as RESIDUAL 1 applies here too.  Lazy-commit retires the
+ * previous call's bytes when a DIFFERENT request arrives, not when the
+ * previous reply is actually known to have reached the host -- usually the
+ * same event (a lost reply provokes poll_by_repeat()'s same-seq retry, which
+ * this fix catches), but not when the host drops a lost reply WITHOUT
+ * issuing that retry (poll_by_repeat()'s deadline expiring right after a CRC
+ * failure, or a corrupted status byte decoding as a terminal code instead of
+ * the CRC error it should have been).  For an IMMEDIATE SAME-HANDLE retry,
+ * #2108's dedicated counter closes this: it is advanced ONLY after an
+ * ALP_OK recv, so a FAILED recv leaves the host's seq UNCHANGED, and that
+ * SAME handle's next recv carries the SAME seq, read as a replay and
+ * re-served rather than committing past it.  It does NOT close the
+ * CROSS-handle case RESIDUAL 1 describes: if a DIFFERENT handle's recv is
+ * assigned that same candidate seq before this handle retries, this handle's
+ * own held block is still lost.  A host that does not carry #2108 keeps the
+ * wider residual, for the same reason RESIDUAL 1 does.
  *
  * PURE ARITHMETIC, SILICON-FREE.  This file owns ONLY the tail/uncommitted
  * bookkeeping -- head/tail as plain integers, no ring buffer, no memcpy, no

@@ -408,15 +408,25 @@ static void worker_execute(uint8_t cmd)
 		 *      the host bench app reads exactly 4071 B per call, so a
 		 *      worker-fallback socket -- UDP, or STREAM accepted but not yet
 		 *      armed for prefetch -- hit this on every full read).
-		 *   2. The request's own max_len (0 = no cap beyond the wire ceiling):
-		 *      lwip_recvfrom() must never be asked for more than the host
-		 *      itself requested, mirroring the ring fast path's identical
-		 *      room computation (protocol_sockets.c's handle_sock_recv()).
+		 *   2. The request's own max_len -- NOT "0 = no cap" (an earlier
+		 *      version of this comment claimed that; wrong, NIT, host review
+		 *      1118c99): the TI HAL's cc3501e_hw_sock_recv()
+		 *      (hal/ti/cc3501e_hw_ti_sock.c) computes
+		 *      `want = (max_len < cap) ? max_len : cap`, so max_len == 0
+		 *      makes it read ZERO bytes there, not "whatever the wire
+		 *      ceiling allows" -- a host is expected to always send its own
+		 *      receive-buffer's real capacity (nonzero) per
+		 *      alp_cc3501e_sock_recv_t's own "max_len: host receive-buffer
+		 *      capacity for this request" field doc.  Bounding by it here
+		 *      regardless keeps lwip_recvfrom() from EVER being asked for
+		 *      more than the host itself requested, mirroring the ring fast
+		 *      path's identical room computation (protocol_sockets.c's
+		 *      handle_sock_recv()).
 		 *
 		 * With both bounds in place, cc3501e_hw_sock_recv() can never report
 		 * more than the reply -- and this cache's own
 		 * g_sock_recv_wk_reply[CC3501E_REPLY_DATA_MAX] -- can hold; the
-		 * defensive guard in protocol_sock_recv_on_worker_complete() and
+		 * defensive guard in protocol_sock_recv_worker_publish() and
 		 * worker_poll()'s own truncation guard below are both then
 		 * unreachable for this opcode, kept only as loud backstops. */
 		const uint16_t handle   = wk_get_le16(job.req, 0u);
@@ -538,19 +548,68 @@ static void worker_execute(uint8_t cmd)
 		break;
 	}
 
-	/* Defensive clamp before the publish memcpy: every HAL body above is
-	 * CONTRACTED to report len <= ALP_CC3501E_MAX_PAYLOAD (it fills buf,
-	 * which is exactly that size), but a misbehaving backend that reports
-	 * a larger len must corrupt at most its own answer -- never overrun
-	 * job.result[] and smash the worker state the SPI ISR reads.
-	 * Truncation is safe to publish: the poller copies min(out_cap,
-	 * result_len) and the protocol layer length-checks every reply. */
+	/* Defensive clamp before publish: every HAL body above is CONTRACTED to
+	 * report len <= ALP_CC3501E_MAX_PAYLOAD (it fills buf, which is exactly
+	 * that size), but a misbehaving backend that reports a larger len must
+	 * corrupt at most its own answer -- never overrun job.result[] and smash
+	 * the worker state the SPI ISR reads.  Truncation is safe to publish:
+	 * the poller copies min(out_cap, result_len) and the protocol layer
+	 * length-checks every reply. */
 	if (len > sizeof(job.result)) {
 		len = sizeof(job.result);
 	}
 
-	/* Publish the result atomically wrt the SPI ISR: fill result[] first,
-	 * then flip state LAST so a poller never sees DONE with stale bytes. */
+	/* SOCK_RECV-ONLY: invalidate protocol_sockets.c's worker-fallback cache
+	 * FIRST, in its OWN short critical section, before either ~4 KB copy
+	 * below (MINOR, host review, 1118c99).  The ORIGINAL shape did both the
+	 * job.result copy AND the cache's own copy while holding ONE critical
+	 * section across both -- on real silicon worker_critical_enter() is
+	 * __disable_irq(), so that held the SPI-ISR-sensitive link's interrupts
+	 * masked for the time of an ~8 KB memcpy, once per worker-routed recv.
+	 * Clearing the cache here means a dispatch that lands in the gap between
+	 * this critical section and the final one below sees a clean cache MISS
+	 * (not a half-updated entry) -- see worker.h's block comment on
+	 * protocol_sock_recv_worker_invalidate/_copy/_publish for the full
+	 * 3-step argument. */
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+		const unsigned long inv_key = worker_critical_enter();
+		protocol_sock_recv_worker_invalidate();
+		worker_critical_exit(inv_key);
+	}
+
+	/* The actual byte copies -- OUTSIDE any critical section, interrupts
+	 * enabled throughout.
+	 *
+	 * job.result's copy is safe here for the SAME reason this file's own top
+	 * comment already states: "result[]/result_len/err are only WRITTEN
+	 * while state is QUEUED/RUNNING (the ISR never reads them then -- it
+	 * sees < DONE and replies BUSY), and only READ once state == DONE/ERR".
+	 * job.state is still WORKER_RUNNING for the whole of this function (it
+	 * was set QUEUED->RUNNING before worker_execute() was ever called, and
+	 * does not flip to DONE/ERR until the critical section below), so
+	 * nothing reads job.result until that flip publishes it -- writing it
+	 * unprotected, before the flip, is exactly the release-pattern the
+	 * ORIGINAL single critical section already relied on, just with the
+	 * write moved earlier and outside the lock.
+	 *
+	 * g_sock_recv_wk_reply's copy (protocol_sock_recv_worker_copy()) is safe
+	 * by the identical argument using g_sock_recv_wk_cached instead of
+	 * job.state: the critical section just above already published
+	 * g_sock_recv_wk_cached = false, so nothing reads that buffer until this
+	 * function's OWN final critical section below publishes cached = true. */
+	if (rv == CC3501E_HW_OK) {
+		memcpy((void *)job.result, buf, len);
+	}
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV && rv == CC3501E_HW_OK) {
+		protocol_sock_recv_worker_copy(buf, len);
+	}
+
+	/* Publish everything ELSE atomically wrt the SPI ISR, in ONE final short
+	 * critical section: job.result was already written above, so this
+	 * section is back down to small scalar stores (job.result_len/err/state,
+	 * SOCK_SEND's own <=2 B cache copy, and SOCK_RECV's cache scalars) --
+	 * state flips LAST so a poller never sees DONE with stale/partial
+	 * bytes. */
 	const unsigned long key = worker_critical_enter();
 	/* SOCK_SEND-ONLY: publish into protocol_sockets.c's #88 seq-keyed reply
 	 * cache in this SAME critical section, strictly BEFORE job.state flips
@@ -559,22 +618,23 @@ static void worker_execute(uint8_t cmd)
 	 * what stops worker_poll()'s orphan-discard arm (a DIFFERENT opcode's
 	 * poll, possibly on a different host thread) from ever observing this
 	 * job as terminal before the cache entry a same-seq re-issue would need
-	 * already exists. */
+	 * already exists.  Its OWN copy is at most 2 B, cheap enough to stay
+	 * inside this critical section unlike SOCK_RECV's -- see worker.h. */
 	if (cmd == ALP_CC3501E_CMD_SOCK_SEND) {
 		protocol_sock_send_on_worker_complete(
 		    job.req[offsetof(alp_cc3501e_sock_send_t, seq)], rv, buf, len);
 	}
-	/* SOCK_RECV-ONLY, same ordering rationale as the SOCK_SEND call above:
-	 * the handle rides in job.req (unlike SOCK_SEND's seq, no separate
+	/* SOCK_RECV-ONLY: the FINAL step of the 3-step split above -- small
+	 * scalars only (the byte copy already happened, unprotected, above).
+	 * The handle rides in job.req (unlike SOCK_SEND's seq, no separate
 	 * capture needed for it), computed identically to the SOCK_RECV case
 	 * above (wk_get_le16(job.req, 0u)) -- recomputed here rather than
 	 * threading it out of the switch, since this call must stay inside this
 	 * one critical section regardless of which case ran. */
 	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
-		protocol_sock_recv_on_worker_complete(wk_get_le16(job.req, 0u), rv, buf, len);
+		protocol_sock_recv_worker_publish(wk_get_le16(job.req, 0u), rv, len);
 	}
 	if (rv == CC3501E_HW_OK) {
-		memcpy((void *)job.result, buf, len);
 		job.result_len = (uint16_t)len;
 		job.err        = 0;
 		job.state      = WORKER_DONE;

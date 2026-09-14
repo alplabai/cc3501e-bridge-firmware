@@ -42,6 +42,7 @@ extern size_t xPortGetFreeHeapSize(void);
 /* Pure, silicon-free tail/uncommitted arithmetic for the lazy-commit fix
  * below (cc3501e-bridge-firmware, host review) -- see its own header for
  * why this is split out rather than inlined here. */
+#include "sock_prefetch_arm.h"
 #include "sock_recv_commit.h"
 
 #include "../cc3501e_hw.h"
@@ -680,10 +681,37 @@ void cc3501e_hw_sock_pump(void)
  * uint32_t, not a case this needs to actually reach in practice; arm-off's
  * ordering has no equivalent race since fd_plus1 = 0 immediately stops
  * cc3501e_hw_sock_recv_ring() from touching the ring for this handle at
- * all, regardless of what order the rest of this branch runs in. */
+ * all, regardless of what order the rest of this branch runs in.
+ *
+ * ARM-ON REFUSES TO STEAL THE RING FROM A DIFFERENT, ALREADY-ARMED HANDLE
+ * (MAJOR, host review, 1118c99).  sock_prefetch_should_arm()
+ * (sock_prefetch_arm.h) is the whole decision: an earlier version of this
+ * branch ran the head/tail/uncommitted reset UNCONDITIONALLY on every
+ * arm-on call, so a SECOND concurrently-open STREAM socket's connect()
+ * silently discarded the FIRST handle's already-pumped, not-yet-served
+ * bytes the instant it landed -- the first handle then fell to the
+ * worker-routed path and read PAST that hole with lwip_recvfrom(),
+ * reporting OK on a stream with a silent gap in it.  Refusing to re-arm here
+ * leaves the FIRST handle's ring untouched; the handle asking to arm just
+ * falls back to the worker-routed path for its own recvs instead (covered by
+ * protocol_sockets.c's own worker-fallback replay cache), same as any other
+ * never-armed handle.  DISARM (the `on == false` arm below, called from
+ * cc3501e_hw_sock_close()) is what frees the ring for a LATER connect to
+ * arm: closing the CURRENTLY-armed handle always reaches the
+ * `rx_ring.fd_plus1 == handle` branch and clears fd_plus1 to 0, so a
+ * connect() on a NEW handle after that CAN arm -- confirmed against
+ * cc3501e_hw_sock_close()'s own unconditional cc3501e_hw_sock_prefetch(handle,
+ * false) call.  NOT also cleared here: a peer that closes ITS end and drains
+ * to EOF (rx_ring.peer_closed, cc3501e_hw_sock_pump()) does NOT itself
+ * disarm the ring -- that is unrelated, pre-existing behaviour this fix does
+ * not change; the ring stays "armed" for a half-closed handle until the host
+ * explicitly issues SOCK_CLOSE on it. */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on)
 {
 	if (on) {
+		if (!sock_prefetch_should_arm(rx_ring.fd_plus1, handle)) {
+			return;
+		}
 		rx_ring.head = rx_ring.tail = 0u;
 		rx_ring.peer_closed         = false;
 		sock_recv_commit_reset(&uncommitted);

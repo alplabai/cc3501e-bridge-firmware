@@ -273,27 +273,50 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
 void protocol_sock_recv_note_submit(uint8_t seq);
 
 /*
- * protocol_sock_recv_on_worker_complete -- SOCK_RECV-ONLY completion hook,
- * the mirror of protocol_sock_send_on_worker_complete() above.  DEFINED in
- * protocol_sockets.c (owner of the worker-fallback reply cache), CALLED from
- * HERE -- worker.c's worker_execute() -- the instant a SOCK_RECV job reaches
- * a terminal state, inside the SAME critical section that publishes
- * job.state, for the identical ordering reason documented on the SOCK_SEND
- * hook above (a same-key retry must find the cache entry BEFORE any poll, on
- * any context, could first observe the job as terminal).
+ * protocol_sock_recv_worker_invalidate / _copy / _publish -- SOCK_RECV-ONLY
+ * completion hook, split into THREE steps (host review, MINOR 6 of the
+ * 1118c99 review) instead of one atomic call like protocol_sock_send's
+ * above.  SOCK_SEND's own cache copies at most 2 B, cheap enough to do
+ * inside worker_execute()'s single publish critical section; SOCK_RECV's
+ * copies up to CC3501E_REPLY_DATA_MAX (4093/4095 B) TWICE (once into
+ * job.result, once into protocol_sockets.c's own cache) -- doing both
+ * memcpys with interrupts masked (worker_critical_enter() is __disable_irq()
+ * on real silicon) held the SPI-ISR-sensitive link's interrupts off for the
+ * time of an ~8 KB copy, once per worker-routed recv.  worker.c's
+ * worker_execute() now calls these three in order:
+ *
+ *   1. protocol_sock_recv_worker_invalidate() -- INSIDE a short critical
+ *      section, BEFORE either copy: clears g_sock_recv_wk_cached so a
+ *      dispatch landing in the gap below sees a clean cache MISS rather than
+ *      a half-updated entry.
+ *   2. protocol_sock_recv_worker_copy() -- OUTSIDE any critical section
+ *      (interrupts stay enabled): the actual byte copy into the cache's own
+ *      buffer.  Safe precisely because step 1 already published
+ *      g_sock_recv_wk_cached = false: nothing reads g_sock_recv_wk_reply
+ *      while cached is false, so a concurrent dispatch cannot observe a
+ *      partially-written buffer.  (job.result's OWN copy is safe by the
+ *      IDENTICAL argument using job.state instead: see worker.c.)
+ *   3. protocol_sock_recv_worker_publish() -- INSIDE the SAME final critical
+ *      section that flips job.state to DONE/ERR: the small scalar fields
+ *      only (seq/handle/status/len, then cached = true last).
+ *
+ * A dispatch that lands between step 1 and step 3 sees g_sock_recv_wk_cached
+ * false (cache miss) AND job.state still WORKER_RUNNING (not yet DONE/ERR):
+ * it falls through to the generic worker-routed path, whose worker_poll()
+ * reports the job QUEUED/RUNNING and answers BUSY -- never a torn read,
+ * never data served from a half-copied buffer.
  *
  * @p handle is read out of job.req (SOCK_RECV's own worker_execute() case
- * already computes it at offset 0) -- unlike @p seq above, the handle DOES
- * ride in the wire payload, so it needs no separate capture.  @p hw_rv / @p
- * data / @p len follow the same contract as the SOCK_SEND hook: the raw HAL
- * return code (mapped to an ALP_CC3501E_RESP_* by protocol_sockets.c, not
+ * already computes it at offset 0) -- unlike SOCK_SEND's seq, the handle
+ * DOES ride in the wire payload, so it needs no separate capture.  @p hw_rv /
+ * @p data / @p len follow the same contract as the SOCK_SEND hook: the raw
+ * HAL return code (mapped to an ALP_CC3501E_RESP_* by protocol_sockets.c, not
  * here) and the reply bytes, valid on CC3501E_HW_OK only.  BOTH OUTCOMES ARE
  * CACHED for the same reason: a same seq+handle poll is BY DEFINITION a
  * retry of the SAME logical recv. */
-void protocol_sock_recv_on_worker_complete(uint16_t       handle,
-                                           int            hw_rv,
-                                           const uint8_t *data,
-                                           size_t         len);
+void protocol_sock_recv_worker_invalidate(void);
+void protocol_sock_recv_worker_copy(const uint8_t *data, size_t len);
+void protocol_sock_recv_worker_publish(uint16_t handle, int hw_rv, size_t len);
 
 /*
  * worker_run_pending -- THE DRAIN.  Runs OUTSIDE the ISR, from main()'s
