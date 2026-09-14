@@ -40,7 +40,12 @@
  *     incorrect version of this fix and left this exact case uncached) is
  *     retained and re-served byte-for-byte identical, proving the cache is
  *     sized for the largest reply this path can ever produce, not a
- *     "typical small" case.
+ *     "typical small" case;
+ *   - the host bench app's OWN recv granularity (max_len 4071, which exceeds
+ *     the wire's real ceiling) bounds worker.c's own cap to the wire's real
+ *     ceiling and the reply carries exactly what was consumed, not a
+ *     silently truncated subset -- the worker.c data_cap fix this suite
+ *     exists to prove, independent of the cache above.
  *
  * Every assertion below compares g_wrap_calls against a BASELINE captured at
  * the START of the test (not an absolute count) -- reset_worker() (the
@@ -72,20 +77,19 @@
  * Two modes, selected by g_wrap_large_mode:
  *   - default (false): one fixed, recognisable byte (0x42) -- what every
  *     small-reply case below needs.
- *   - true: fills up to BIG_RECV_DATA_LEN bytes (below) of an incrementing
- *     0..255 pattern and reports that many received.  BIG_RECV_DATA_LEN is
- *     the wire's own true ceiling (protocol.h's CC3501E_REPLY_DATA_MAX) minus
- *     the recv-resp header -- the actual largest reply
- *     protocol_build_reply()'s reply_cap can ever carry for THIS opcode, not
- *     worker.c's own internal data_cap constant (which -- see
- *     protocol_sockets.c's cache block comment -- is 2 B more generous than
- *     that ceiling under CC3501E_WIRE_CRC=ON, a separate, pre-existing gap
- *     this suite does not exercise).  This is still the actual run10 bug
- *     shape: an ACCEPTED TCP socket read reporting a reply at the wire's real
- *     maximum, far above the withdrawn 256 B cap. */
+ *   - true: fills up to @p cap bytes (capped again at BIG_RECV_DATA_LEN, the
+ *     wire's own true ceiling -- protocol.h's CC3501E_REPLY_DATA_MAX minus
+ *     the recv-resp header) of an incrementing 0..255 pattern and reports
+ *     that many received -- simulating a peer with plenty of data queued, so
+ *     the byte count actually reported is whatever worker.c's own (now
+ *     wire-ceiling-bounded, see its SOCK_RECV case) @p cap allows.  This is
+ *     the actual run10 bug shape: an ACCEPTED TCP socket read reporting a
+ *     reply at the wire's real maximum, far above the withdrawn 256 B cap. */
 static uint32_t g_wrap_calls;
 static bool     g_wrap_large_mode;
-static uint16_t g_wrap_large_n; /* bytes reported by the last large-mode call */
+static uint16_t g_wrap_large_n;      /* bytes reported by the last large-mode call */
+static uint16_t g_wrap_last_cap;     /* @p cap worker.c passed on the last call */
+static uint16_t g_wrap_last_max_len; /* @p max_len worker.c passed on the last call */
 
 /* protocol.h's CC3501E_REPLY_DATA_MAX is the wire's own documented ceiling on
  * a handler's total reply DATA (status byte's payload); the recv-resp header
@@ -102,9 +106,14 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
                                 uint16_t *from_port_out)
 {
 	(void)handle;
-	(void)max_len;
 	g_wrap_calls++;
+	g_wrap_last_cap     = cap;
+	g_wrap_last_max_len = max_len;
 	if (g_wrap_large_mode) {
+		/* Simulates a peer with AT LEAST this many bytes queued -- i.e. a
+		 * full read that consumes exactly what worker.c's own data_cap (the
+		 * @p cap this call received) allows, the same shape a real
+		 * lwip_recvfrom() has when the socket has plenty of data queued. */
 		const uint16_t n = (cap < (uint16_t)BIG_RECV_DATA_LEN) ? cap : (uint16_t)BIG_RECV_DATA_LEN;
 		for (uint16_t i = 0u; i < n; i++) {
 			buf[i] = (uint8_t)(i & 0xFFu);
@@ -375,12 +384,12 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_sock_close_invalidates_the_cache)
 /* THE ACTUAL BUG SHAPE (host review of a5881d1): an ACCEPTED TCP socket read
  * -- STREAM, accepted but not yet armed for prefetch, exactly the fallback
  * this cache exists for -- reports up to worker.c's own data_cap
- * (ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1, ~4071 B), the exact run10
- * loss size.  A withdrawn version of this fix capped the cache at 256 B and
- * left exactly this case uncached -- it "fixed" only small UDP-sized
- * replies, missing the bug's own reproduction shape entirely.  This proves
- * the cache now covers the FULL range worker.c can ever report, not a
- * partial one. */
+ * (CC3501E_REPLY_DATA_MAX - WK_SOCK_RECV_HDR, ~4069 B under
+ * CC3501E_WIRE_CRC=ON), the exact run10 loss size.  A withdrawn version of
+ * this fix capped the cache at 256 B and left exactly this case uncached --
+ * it "fixed" only small UDP-sized replies, missing the bug's own
+ * reproduction shape entirely.  This proves the cache now covers the FULL
+ * range worker.c can ever report, not a partial one. */
 ZTEST(cc3501e_sock_recv_worker_cache, test_max_size_reply_replayed_byte_identical)
 {
 	static uint8_t reply[CC3501E_FRAME_MAX_BYTES];
@@ -421,6 +430,58 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_max_size_reply_replayed_byte_identica
 	    g_wrap_calls, calls_before + 1u, "the cache hit did not call cc3501e_hw_sock_recv() again");
 
 	g_wrap_large_mode = false; /* restore the default for every test after this one */
+}
+
+/* worker.c's SOCK_RECV data_cap fix, exercised at the HOST BENCH APP'S OWN
+ * recv granularity (host review): the bench issues max_len 4071 per call --
+ * ABOVE CC3501E_REPLY_DATA_MAX - sizeof(alp_cc3501e_sock_recv_resp_t) (4069 B
+ * under CC3501E_WIRE_CRC=ON) -- so a worker-fallback socket hit the
+ * pre-fix truncation on EVERY full read, not a rare boundary.  Proves
+ * worker.c never asks cc3501e_hw_sock_recv() for more than the wire can
+ * carry, and that the reply it builds carries EXACTLY what was consumed, not
+ * a silently truncated subset. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_max_len_4071_bounds_hw_cap_and_reply_matches_consumed)
+{
+	static uint8_t reply[CC3501E_FRAME_MAX_BYTES];
+	uint8_t        req[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req, 9u, 800u);
+	req[6] = (uint8_t)(4071u & 0xFFu); /* max_len LE16 = 4071 -- the bench's own recv() size */
+	req[7] = (uint8_t)((4071u >> 8) & 0xFFu);
+
+	g_wrap_large_mode = true;
+
+	/* First transaction is the IDLE->QUEUED submit: on the stub's synchronous
+	 * path the HW body already ran (and worker.c's cap arithmetic already
+	 * ran with it), but this handler's own ack is always BUSY on that edge
+	 * regardless -- same contract every other test in this suite relies on.
+	 * The bounds this test cares about are already latched in
+	 * g_wrap_last_cap/g_wrap_last_max_len at this point. */
+	transaction(req, sizeof req);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls, calls_before + 1u, "the submit ran the HW body once");
+	zassert_equal(
+	    g_wrap_last_max_len, 4071u, "the request's own max_len reached the HAL body unchanged");
+	zassert_true(
+	    g_wrap_last_cap <= (uint16_t)BIG_RECV_DATA_LEN,
+	    "hw recv's cap must never exceed CC3501E_REPLY_DATA_MAX minus the recv-resp header");
+	zassert_true(
+	    g_wrap_last_cap < 4071u,
+	    "4071 B genuinely exceeds the wire ceiling here, so the cap must be the SMALLER one");
+
+	/* Second, same-seq+handle transaction: the cache-hit collect -- proves
+	 * the reply actually delivered carries EXACTLY what was consumed. */
+	transaction(req, sizeof req);
+	size_t         got      = drain(reply, sizeof reply);
+	const uint16_t consumed = g_wrap_large_n; /* what the wrap actually reported back */
+	zassert_equal(got,
+	              reply_wire(sizeof(alp_cc3501e_sock_recv_resp_t) + (size_t)consumed),
+	              "the reply carries EXACTLY the consumed bytes -- no silent truncation");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "the capped read fits the reply -- no NO_MEM");
+	zassert_equal(
+	    g_wrap_calls, calls_before + 1u, "the cache hit did not call cc3501e_hw_sock_recv() again");
+
+	g_wrap_large_mode = false;
 }
 
 static void reset_worker(void *fixture)

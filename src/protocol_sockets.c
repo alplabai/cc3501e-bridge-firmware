@@ -214,21 +214,27 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * justify a partial cap here; this path has to cover the same range of reply
  * sizes the ring fast path does.
  *
- * PRE-EXISTING, SEPARATE, OUT OF SCOPE HERE: worker.c's own SOCK_RECV
- * data_cap (ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1) predates the wire
- * MAJOR 4 CRC-trailer tax (#2035) and was never adjusted for it, so under
- * CC3501E_WIRE_CRC=ON it can compute a reply up to 2 B LARGER than
- * CC3501E_REPLY_DATA_MAX actually allows (24 + 4071 = 4095 vs the 4093 B
- * ceiling) -- worker_poll()'s existing out_cap clamp already silently
- * truncates that 2 B overrun on an ordinary (non-cached) collect, so this is
- * not a new hazard this change introduces.  This cache's own defensive guard
- * below (`len > sizeof(g_sock_recv_wk_reply)`) means that one narrow
- * boundary size -- a SOCK_RECV that fills worker.c's data_cap to its exact
- * (already slightly oversized) limit -- is correctly NOT cached rather than
- * stored at the wrong length, so a same-key retry of THAT one exact size
- * falls back to a genuine re-recv (the pre-fix exposure, for that boundary
- * size only).  Fixing worker.c's own data_cap arithmetic to account for the
- * CRC tax is a separate change, not part of this replay-cache fix.
+ * CLOSED, NOT JUST NARROWED: an earlier version of this comment described a
+ * PRE-EXISTING gap in worker.c's own SOCK_RECV data_cap -- it predated the
+ * wire MAJOR 4 CRC-trailer tax (#2035) and could compute a reply up to 2 B
+ * LARGER than CC3501E_REPLY_DATA_MAX under CC3501E_WIRE_CRC=ON (24 + 4071 =
+ * 4095 vs the 4093 B ceiling), which worker_poll()'s out_cap clamp then
+ * silently truncated -- SILENT DATA LOSS, not merely a cache-defensive
+ * corner case: the truncated bytes had already been consumed off the lwIP
+ * socket by cc3501e_hw_sock_recv() before the truncation ever happened, and
+ * the host bench app's own recv granularity (exactly 4071 B/call) meant a
+ * worker-fallback socket hit this on EVERY full read, not a rare boundary.
+ * worker.c's data_cap (worker_execute()'s SOCK_RECV case) is now itself
+ * bounded by CC3501E_REPLY_DATA_MAX minus the recv-resp header, so a
+ * completed job can never again report more bytes than this cache -- or the
+ * wire -- can carry.  This cache's own defensive guard below
+ * (`len > sizeof(g_sock_recv_wk_reply)`) is consequently UNREACHABLE for
+ * SOCK_RECV in ordinary operation; kept as a LOUD backstop (caches a
+ * deterministic RESP_ERR_NO_MEM rather than the earlier silent
+ * decline-to-cache) for any future regression in that bound, not because the
+ * gap it once covered still exists.  worker_poll() itself (worker.c) carries
+ * the identical loud guard for every OTHER worker-routed payload-reply
+ * opcode.
  *
  * RAM: a MAX_PAYLOAD-sized second buffer does not fit in DRAM_NON_SECURE
  * alongside the WiFi+BLE stacks -- measured: the real `--wifi --ble`
@@ -275,10 +281,10 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * sock_recv_commit.h's RESIDUAL 1/2 for the host-side fix (a dedicated
  * SOCK_RECV seq counter) that removes this by construction; this
  * firmware-side cache cannot close it alone, for the identical reason the
- * ring fast path cannot.  Unlike the withdrawn 256 B attempt, there is no
- * separate SIZE-based residual for any reply within the wire's own ceiling --
- * only the pre-existing worker.c boundary case documented above, at exactly
- * one size, 2 B past that ceiling. */
+ * ring fast path cannot.  Unlike the withdrawn 256 B attempt, and unlike the
+ * now-fixed worker.c data_cap gap documented above, there is no remaining
+ * SIZE-based residual at all: every reply this path can produce fits and is
+ * cached. */
 #define CC3501E_SOCK_RECV_WK_CACHE_CAP CC3501E_REPLY_DATA_MAX
 
 static volatile bool               g_sock_recv_wk_cached;
@@ -314,21 +320,30 @@ void protocol_sock_recv_on_worker_complete(uint16_t       handle,
                                            const uint8_t *data,
                                            size_t         len)
 {
-	if (hw_rv == CC3501E_HW_OK && len > sizeof(g_sock_recv_wk_reply)) {
-		/* Not a "typical size" exemption -- the cache block's own sizing
-		 * comment covers the one PRE-EXISTING boundary size this can actually
-		 * trigger for (CC3501E_WIRE_CRC=ON, worker.c's SOCK_RECV data_cap
-		 * filled to its own exact, 2-B-too-generous limit).  Invalidate
-		 * rather than memcpy out of bounds or leave a stale cache entry
-		 * marked valid for a reply that was never actually stored -- a
-		 * same-key retry of that one exact size falls back to a genuine
-		 * re-recv, same as before this fix, rather than being served garbage
-		 * or a wrong-length answer. */
-		g_sock_recv_wk_cached = false;
-		return;
-	}
 	g_sock_recv_wk_seq    = g_sock_recv_job_seq;
 	g_sock_recv_wk_handle = handle;
+	if (hw_rv == CC3501E_HW_OK && len > sizeof(g_sock_recv_wk_reply)) {
+		/* MUST NOT HAPPEN: worker.c's SOCK_RECV data_cap is bounded by
+		 * CC3501E_REPLY_DATA_MAX (this cache's own size) at the source, so a
+		 * completed job can never report more bytes than fit here any more.
+		 * LOUD backstop, not a silent one: cache a DETERMINISTIC ERROR rather
+		 * than silently declining to cache (an earlier version of this guard
+		 * did exactly that) -- declining left the just-completed job sitting
+		 * DONE, uncollected, for the very next same-key poll's cache-MISS to
+		 * discard via worker_discard_stale_recv() (unconditional-by-opcode)
+		 * and blindly RESUBMIT a fresh recv, reading FURTHER bytes off the
+		 * socket and reporting them as if they were this request's answer --
+		 * exactly the class of corruption this whole cache exists to
+		 * prevent.  Caching RESP_ERR_NO_MEM instead makes that next poll a
+		 * cache HIT, served the error, no resubmission -- and
+		 * worker_poll()'s own truncation guard (worker.c) independently
+		 * reaches the identical RESP_ERR_NO_MEM if this job is ever collected
+		 * through the generic path instead. */
+		g_sock_recv_wk_reply_len = 0u;
+		g_sock_recv_wk_status    = ALP_CC3501E_RESP_ERR_NO_MEM;
+		g_sock_recv_wk_cached    = true;
+		return;
+	}
 	if (hw_rv == CC3501E_HW_OK) {
 		memcpy((void *)g_sock_recv_wk_reply, data, len);
 		g_sock_recv_wk_reply_len = (uint16_t)len;

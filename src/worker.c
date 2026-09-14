@@ -176,8 +176,16 @@ static void worker_execute(uint8_t cmd)
 	}
 	case ALP_CC3501E_CMD_WIFI_SCAN_START:
 		/* Packs the AP-record list into buf in the host's wire format (see
-		 * cc3501e_hw_wifi_scan); blocks on the scan + event rendezvous. */
-		rv = cc3501e_hw_wifi_scan(buf, ALP_CC3501E_MAX_PAYLOAD, &len);
+		 * cc3501e_hw_wifi_scan); blocks on the scan + event rendezvous.
+		 * Capped at CC3501E_REPLY_DATA_MAX (protocol.h), not
+		 * ALP_CC3501E_MAX_PAYLOAD: that is the actual ceiling
+		 * protocol_build_reply() enforces on any handler's reply DATA (the
+		 * status byte and, under CC3501E_WIRE_CRC=ON, the CRC trailer both
+		 * ride inside the same MAX_PAYLOAD budget) -- passing the full
+		 * MAX_PAYLOAD here let the scan fill more records than a reply can
+		 * ever carry, silently truncated by worker_poll()'s collect (host
+		 * review, same class of bug as the SOCK_RECV data_cap fix below). */
+		rv = cc3501e_hw_wifi_scan(buf, CC3501E_REPLY_DATA_MAX, &len);
 		break;
 	case ALP_CC3501E_CMD_BLE_ENABLE:
 		/* Wi-Fi-first (shared HIF) then nimble_host_start -- blocks ~2s, so it
@@ -188,8 +196,10 @@ static void worker_execute(uint8_t cmd)
 	case ALP_CC3501E_CMD_BLE_SCAN_START:
 		/* Packs the discovered-advertiser list into buf (see cc3501e_hw_ble_scan);
 		 * runs a NimBLE GAP discovery that blocks for the scan window, so it is
-		 * worker-routed off the SPI ISR exactly like WIFI_SCAN_START. */
-		rv = cc3501e_hw_ble_scan(buf, ALP_CC3501E_MAX_PAYLOAD, &len);
+		 * worker-routed off the SPI ISR exactly like WIFI_SCAN_START.  Capped
+		 * at CC3501E_REPLY_DATA_MAX, not ALP_CC3501E_MAX_PAYLOAD -- see the
+		 * WIFI_SCAN_START case above for why. */
+		rv = cc3501e_hw_ble_scan(buf, CC3501E_REPLY_DATA_MAX, &len);
 		break;
 	case ALP_CC3501E_CMD_BLE_ADV_START: {
 		/* Ext-adv config+start BLOCKS on the shared-HIF HCI ack (2 s), so -- like
@@ -278,10 +288,12 @@ static void worker_execute(uint8_t cmd)
 		/* GATT read (blocks on the read-response HCI over the shared HIF), so it is
 		 * worker-routed off the SPI ISR.  Payload = handle(LE16); the attribute value
 		 * is packed into buf and published so the payload+reply worker path copies it
-		 * back to the host (see handle_worker_routed_payload_reply). */
+		 * back to the host (see handle_worker_routed_payload_reply).  Capped at
+		 * CC3501E_REPLY_DATA_MAX, not ALP_CC3501E_MAX_PAYLOAD -- see the
+		 * WIFI_SCAN_START case above for why. */
 		const uint16_t handle  = (uint16_t)job.req[0] | ((uint16_t)job.req[1] << 8);
 		uint16_t       out_len = 0u;
-		rv = cc3501e_hw_ble_gatt_read(handle, buf, (uint16_t)ALP_CC3501E_MAX_PAYLOAD, &out_len);
+		rv = cc3501e_hw_ble_gatt_read(handle, buf, (uint16_t)CC3501E_REPLY_DATA_MAX, &out_len);
 		if (rv == CC3501E_HW_OK) {
 			len = out_len;
 		}
@@ -379,15 +391,44 @@ static void worker_execute(uint8_t cmd)
 	}
 	case ALP_CC3501E_CMD_SOCK_RECV: {
 		/* job.req = alp_cc3501e_sock_recv_t: handle(LE16 @0) | max_len(LE16 @2).
-		 * Reply = recv_resp header (WK_SOCK_RECV_HDR) + up to max_len bytes.  Cap
-		 * the data so header + data + the status byte fit one frame. */
-		const uint16_t handle       = wk_get_le16(job.req, 0u);
-		const uint16_t max_len      = wk_get_le16(job.req, 2u);
-		const uint16_t data_cap     = (uint16_t)(ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1u);
-		uint8_t        from_addr[4] = { 0 };
-		uint16_t       from_port    = 0u;
-		uint16_t       recv_len     = 0u;
-		rv                          = cc3501e_hw_sock_recv(
+		 * Reply = recv_resp header (WK_SOCK_RECV_HDR) + up to max_len bytes.
+		 *
+		 * data_cap is bounded by TWO things, both load-bearing:
+		 *
+		 *   1. CC3501E_REPLY_DATA_MAX (protocol.h) minus the recv-resp header --
+		 *      the ACTUAL ceiling protocol_build_reply() enforces on this
+		 *      handler's reply DATA, not a flat "MAX_PAYLOAD - 1" that predates
+		 *      the wire MAJOR 4 CRC-trailer tax (#2035).  The old flat formula
+		 *      could ask cc3501e_hw_sock_recv() for up to 4071 B (24 + 4071 =
+		 *      4095), 2 B more than CC3501E_REPLY_DATA_MAX (4093 B) under the
+		 *      default CC3501E_WIRE_CRC=ON actually allows -- lwip_recvfrom()
+		 *      would CONSUME those bytes off the socket, then worker_poll()'s
+		 *      collect silently truncated the reply by 2 B, permanently losing
+		 *      already-read stream data with no error reported (host review:
+		 *      the host bench app reads exactly 4071 B per call, so a
+		 *      worker-fallback socket -- UDP, or STREAM accepted but not yet
+		 *      armed for prefetch -- hit this on every full read).
+		 *   2. The request's own max_len (0 = no cap beyond the wire ceiling):
+		 *      lwip_recvfrom() must never be asked for more than the host
+		 *      itself requested, mirroring the ring fast path's identical
+		 *      room computation (protocol_sockets.c's handle_sock_recv()).
+		 *
+		 * With both bounds in place, cc3501e_hw_sock_recv() can never report
+		 * more than the reply -- and this cache's own
+		 * g_sock_recv_wk_reply[CC3501E_REPLY_DATA_MAX] -- can hold; the
+		 * defensive guard in protocol_sock_recv_on_worker_complete() and
+		 * worker_poll()'s own truncation guard below are both then
+		 * unreachable for this opcode, kept only as loud backstops. */
+		const uint16_t handle   = wk_get_le16(job.req, 0u);
+		const uint16_t max_len  = wk_get_le16(job.req, 2u);
+		uint16_t       data_cap = (uint16_t)(CC3501E_REPLY_DATA_MAX - WK_SOCK_RECV_HDR);
+		if (max_len != 0u && max_len < data_cap) {
+			data_cap = max_len;
+		}
+		uint8_t  from_addr[4] = { 0 };
+		uint16_t from_port    = 0u;
+		uint16_t recv_len     = 0u;
+		rv                    = cc3501e_hw_sock_recv(
 		    handle, max_len, &buf[WK_SOCK_RECV_HDR], data_cap, &recv_len, from_addr, &from_port);
 		if (rv == CC3501E_HW_OK) {
 			/* Build the from sock_addr (family | reserved | port(LE16) | addr[16]);
@@ -651,7 +692,27 @@ worker_poll(uint8_t cmd, uint8_t *out, size_t out_cap, size_t *out_len, int8_t *
 	}
 
 	if (st == WORKER_DONE) {
-		const size_t n = (out_cap < job.result_len) ? out_cap : job.result_len;
+		if (job.result_len > out_cap) {
+			/* NEVER silently truncate a payload reply.  job.result_len larger
+			 * than the CALLER's actual reply capacity means some opcode's own
+			 * cap (worker_execute()'s switch) let a HAL body read or produce
+			 * more than the reply frame can ever carry -- the general form of
+			 * the SOCK_RECV data-loss class (host review): a truncating
+			 * memcpy here used to silently drop the overrun and report OK
+			 * with a short reply, and for a socket recv those bytes were
+			 * already irrecoverably consumed from lwIP.  Report a real error
+			 * instead.  Every worker-routed opcode's own cap is now bounded
+			 * by CC3501E_REPLY_DATA_MAX at the source (worker_execute()'s
+			 * SOCK_RECV / WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ
+			 * cases), so this should never actually fire -- it is a LOUD
+			 * backstop, not a silent one, for any future opcode that gets its
+			 * own cap wrong. */
+			if (out_len != NULL) *out_len = 0u;
+			if (err != NULL) *err = CC3501E_HW_ERR_NO_MEM;
+			worker_critical_exit(key);
+			return WORKER_ERR;
+		}
+		const size_t n = job.result_len;
 		if (out != NULL && n > 0u) memcpy(out, (const void *)job.result, n);
 		if (out_len != NULL) *out_len = n;
 		worker_critical_exit(key);

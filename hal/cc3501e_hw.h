@@ -39,7 +39,22 @@
  * from CC3501E_HW_ERR_IO: this is a deterministic, terminal reject, not a
  * transport/radio glitch worth retrying. */
 #define CC3501E_HW_ERR_STATE -4
-#define CC3501E_HW_BUSY      1 /* op accepted, runs off-ISR; caller must re-poll */
+/* NOT produced by any HAL body -- worker.c's own worker_poll() sets this
+ * (never a HAL implementation) when a completed job's result is LARGER than
+ * the caller's reply capacity, so a truncating memcpy is reported as a real
+ * error instead of a silent short reply (host review: this is the general
+ * form of the SOCK_RECV data-loss class -- a worker body reading more than
+ * the reply can ever carry, then the collect silently dropping the
+ * overrun).  Every worker-routed opcode's own cap is bounded by
+ * CC3501E_REPLY_DATA_MAX (protocol.h) at the source (see worker_execute()'s
+ * SOCK_RECV / WIFI_SCAN_START / BLE_SCAN_START / BLE_GATT_READ cases), so
+ * this should never actually fire for a well-behaved opcode -- it exists as
+ * a LOUD backstop for any future one that gets its own cap wrong, mapped by
+ * the three generic worker-routed helpers (protocol.c) to
+ * ALP_CC3501E_RESP_ERR_NO_MEM, the same wire code already used when a
+ * reply's known-minimum size does not fit. */
+#define CC3501E_HW_ERR_NO_MEM -5
+#define CC3501E_HW_BUSY       1 /* op accepted, runs off-ISR; caller must re-poll */
 
 /* --------------------------------------------------------------- */
 /* Lifecycle                                                         */

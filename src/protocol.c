@@ -485,6 +485,15 @@ alp_cc3501e_resp_t handle_worker_routed(alp_cc3501e_cmd_t cmd,
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
 		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
+		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
@@ -539,6 +548,15 @@ alp_cc3501e_resp_t handle_worker_routed_payload(alp_cc3501e_cmd_t cmd,
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
 		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
@@ -610,6 +628,15 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 		if (err == CC3501E_HW_ERR_STATE) {
 			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_STATE, NULL, 0u);
 			return ALP_CC3501E_RESP_ERR_STATE;
+		}
+		/* CC3501E_HW_ERR_NO_MEM: NOT produced by any HAL body -- worker_poll()'s
+		 * own truncation guard (worker.c) sets this when a completed job's
+		 * result is larger than this request's actual reply capacity, so a
+		 * silent short reply is reported as a real error instead (see
+		 * CC3501E_HW_ERR_NO_MEM's own doc comment, hal/cc3501e_hw.h). */
+		if (err == CC3501E_HW_ERR_NO_MEM) {
+			retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_NO_MEM, NULL, 0u);
+			return ALP_CC3501E_RESP_ERR_NO_MEM;
 		}
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
