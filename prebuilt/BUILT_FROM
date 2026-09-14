@@ -87,7 +87,7 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.11.0 (measured 2026-09-14).
+# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.12.0 (measured 2026-09-14).
 #
 # That unit (module 2026W36-0003) was warm-programmed THREE TIMES that evening,
 # 0.254.2.0 -> 0.254.3.0 -> 0.254.4.0, the last streaming 1105668 bytes in
@@ -100,14 +100,14 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 #     0.254.0.0 set in cc3501e-release-0.254.0.0.  Both are rollbacks on it now.
 #   - 0.254.2.0 and 0.254.3.0 are ALSO rollbacks on it now -- each intermediate
 #     flash is spent the moment the next one lands.
-#   - any future image for it must be STRICTLY ABOVE 0.254.11.0.  A stamp chosen
-#     between 0.254.2.0 and 0.254.11.0 looks new against an older log entry and
+#   - any future image for it must be STRICTLY ABOVE 0.254.12.0.  A stamp chosen
+#     between 0.254.2.0 and 0.254.12.0 looks new against an older log entry and
 #     permanently bricks the part, which is why this entry is kept current rather
 #     than appended to.
 #
 #   - it ran the RELEASED v0.8.0 blob (GPE 0.254.5.0, sha256 c67ad58a...) and
 #     that was validated on it, but LATER bench builds at 0.254.6.0 through
-#     0.254.11.0 have since superseded it, so the released artifact is now a ROLLBACK on this one unit
+#     0.254.12.0 have since superseded it, so the released artifact is now a ROLLBACK on this one unit
 #     and cannot be re-flashed here without a fresh cut.  The v0.8.0 run streamed
 #     1105668 bytes in 17.479 s with PROGRAM_RC=0 and answered across 16 cold
 #     power cycles, each edge verified electrically via the SW-DP rather than
@@ -146,6 +146,14 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 #     Bytes 0x24..0x28 of the streamed file read 00 fe 0b 00 00.  It answered
 #     GET_VERSION on every later cold boot; which image runs is again inferred
 #     from behaviour (reason-30 retry connect timings), not read back.
+#
+#   - the 0.254.12.0 bench build (source 30b4075: the run11 set plus
+#     SOCK_RECV retry-safe b1f22dc and station/retry dfecd38; raw sha256
+#     74ca4e15..., signed image sha256 7ed7bcac..., streamed file 1108072
+#     bytes) streamed over XDS110 L50015YR with PROGRAM_RC=0 at 2026-09-14
+#     04:47 UTC.  Bytes 0x24..0x28 of the streamed file read 00 fe 0c 00 00.
+#     fw_version is 0x0800 on both 0.254.11.0 and 0.254.12.0, so the stamp
+#     is not read back: treat the unit as AT LEAST 0.254.12.0.
 #
 # The gpe-floor BELOW is deliberately NOT raised to 0.254.2.0 yet, and the
 # distinction matters.  That number gates the SHIPPED BLOB: raising it without
