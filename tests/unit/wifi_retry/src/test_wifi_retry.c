@@ -114,3 +114,51 @@ ZTEST(cc3501e_wifi_retry, test_restore_false_for_reason_200)
 	zassert_false(wifi_retry_should_restore_first_pass(200),
 	              "reason 200 (WLAN_DISCONNECT_USER_INITIATED) must not restore either");
 }
+
+/* Issue #144 (the persistent stale-deauth-reason-3 fix): wifi_retry_sanitize_reason(). */
+
+/* The whole point of the fix: once this firmware has issued its own
+ * Wlan_Disconnect() (own_disconnect_issued == true), a reason of exactly 3
+ * (WLAN_REASON_DEAUTH_LEAVING) -- e.g. a wrong-passphrase WPA3-SAE failure
+ * inheriting a PRIOR attempt's #1437-cleanup deauthReason, with no fresh
+ * write of its own -- is uninformative and must publish 0 instead. */
+ZTEST(cc3501e_wifi_retry, test_sanitize_reason_3_blanked_after_own_disconnect)
+{
+	const int16_t sanitized = wifi_retry_sanitize_reason(3, true);
+	zassert_equal(
+	    sanitized, 0, "reason 3 after our own Wlan_Disconnect() must publish uninformative 0");
+}
+
+/* Before this firmware has EVER issued its own Wlan_Disconnect() (fresh
+ * boot, first ever connect attempt), a reason of 3 cannot be OUR stale
+ * echo -- it must be a genuine event and is published as-is. */
+ZTEST(cc3501e_wifi_retry, test_sanitize_reason_3_kept_before_own_disconnect)
+{
+	const int16_t sanitized = wifi_retry_sanitize_reason(3, false);
+	zassert_equal(sanitized, 3, "reason 3 with no prior Wlan_Disconnect() must publish as-is");
+}
+
+/* Every OTHER reason value is real, specific information (a genuine AP
+ * reject code, or 0 itself) -- this function must never touch it, even
+ * after our own Wlan_Disconnect() has run. */
+ZTEST(cc3501e_wifi_retry, test_sanitize_reason_30_untouched_after_own_disconnect)
+{
+	const int16_t sanitized = wifi_retry_sanitize_reason(30, true);
+	zassert_equal(sanitized, 30, "a real AP reject code must never be sanitized");
+}
+
+ZTEST(cc3501e_wifi_retry, test_sanitize_reason_0_untouched_after_own_disconnect)
+{
+	const int16_t sanitized = wifi_retry_sanitize_reason(0, true);
+	zassert_equal(sanitized, 0, "reason 0 must pass through unchanged");
+}
+
+/* 200 (WLAN_DISCONNECT_USER_INITIATED) never reaches this function in
+ * practice (wifi_event_cb() filters it before it is ever recorded), but the
+ * function itself must still leave it untouched if it ever did -- only 3 is
+ * special-cased. */
+ZTEST(cc3501e_wifi_retry, test_sanitize_reason_200_untouched_after_own_disconnect)
+{
+	const int16_t sanitized = wifi_retry_sanitize_reason(200, true);
+	zassert_equal(sanitized, 200, "200 is not reason 3 and must not be blanked");
+}

@@ -24,3 +24,11 @@ bool wifi_retry_should_restore_first_pass(int16_t retry_pass_reason)
 {
 	return retry_pass_reason == 3 /* WLAN_REASON_DEAUTH_LEAVING */ || retry_pass_reason == 0;
 }
+
+int16_t wifi_retry_sanitize_reason(int16_t reason, bool own_disconnect_issued)
+{
+	if (reason == 3 /* WLAN_REASON_DEAUTH_LEAVING */ && own_disconnect_issued) {
+		return 0;
+	}
+	return reason;
+}

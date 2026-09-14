@@ -122,4 +122,77 @@ uint32_t wifi_retry_delay_ms(wifi_retry_event_t event,
  * only decides what gets PUBLISHED, not whether to retry again. */
 bool wifi_retry_should_restore_first_pass(int16_t retry_pass_reason);
 
+/* 3. wifi_retry_sanitize_reason(): is a reason value about to be PUBLISHED at
+ * a CONNECTING-window terminal transition (issue #144, the "stale deauth
+ * reason 3" bug) actually the wire's own verdict, or OUR OWN earlier cleanup
+ * leaking through?
+ *
+ * THE MECHANISM (SDK-traced, hal/ti/cc3501e_hw_ti_wifi.c's own call sites):
+ * every Wlan_Disconnect() THIS firmware issues -- wifi_clear_stale_assoc()'s
+ * post-failure cleanup (#1437) and cc3501e_hw_wifi_disconnect()'s host-
+ * requested teardown alike, both `Wlan_Disconnect(WLAN_ROLE_STA, NULL)` --
+ * resolves (when the STA state machine is not already idle) through
+ * CmeStationDisconnectKick() -> cmeWlanDisconnect(WLAN_REASON_DEAUTH_LEAVING)
+ * (cc3501e-bridge-firmware vendor trace: cme_station_flow.c:525-548) into
+ * ti_drv_deauthenticate()'s `pDrv->deauthReason = aReasonCode`
+ * (drv_ti_sta_specific.c:400) -- unconditionally 3, with NO per-attempt
+ * reset.  A SUBSEQUENT connect attempt that fails through a path which never
+ * itself writes a fresh deauthReason then republishes that stale 3 as if it
+ * were this attempt's own verdict.
+ *
+ * THE WRONG-PASSPHRASE WPA3-SAE SHAPE THIS CLOSES: a bad SAE Confirm is
+ * detected PURELY LOCALLY, by hash comparison, with no over-the-air
+ * deauth/disassoc frame involved at all -- hostap's sme_sae_auth()
+ * (auth_transaction==2 branch, third_party/hostap/wpa_supplicant/sme.c:1457)
+ * returns -1 straight from `sae_check_confirm() < 0`, and the caller,
+ * sme_event_auth() (sme.c:1583-1588), takes that failure through
+ * `wpas_connection_failed(); wpa_supplicant_set_state(wpa_s,
+ * WPA_DISCONNECTED);` -- NEITHER call takes or forwards a reason code, and
+ * NEITHER calls sme_deauth() (contrast sme_auth_timer/sme_assoc_timer/
+ * sme_event_assoc_reject, sme.c:2228-2287, which DO call sme_deauth() and so
+ * DO write a fresh 3 of their own -- a genuine, if generic, give-up code,
+ * not a stale one).  driver_ti_wifi.c's ti_driver_state_changed(), watching
+ * this exact WPA_AUTHENTICATING -> WPA_DISCONNECTED transition, republishes
+ * whatever pDrv->deauthReason ALREADY held via
+ * `CME_NotifyStaConnectionState(pDrv->roleId, LINK_CONNECTION_STATE_
+ * DISCONNECTED, pDrv->deauthReason)` (driver_ti_wifi.c:1594-1603) --
+ * verbatim, stale or not.  Bench-confirmed (run13 P4, e1m-aen-evk-01,
+ * WPA3-SAE): a SECOND `wifi connect` with the same wrong passphrase fails in
+ * 4.0-5.5 s (far too fast to be a wire round trip's worth of waiting) with
+ * reason 3, on every boot -- consistent with THIS attempt inheriting the
+ * PRIOR attempt's own #1437 cleanup value, not a fresh one.
+ *
+ * NO MORE INFORMATIVE SIGNAL IS AVAILABLE ON THIS PATH -- checked, not
+ * assumed: (a) no real SAE/auth status reaches here -- sme.c:1583-1588 pass
+ * no status of any kind, so there is nothing more specific to record
+ * instead; (b) WlanEventDisconnect_t's own IsStaIsDiscnctInitiator field
+ * (wlan_if.h) cannot distinguish a received frame from this stale echo
+ * either -- traced to its one real-reason writer, cmeStaSendDisConnectedEventToApp()
+ * (cme_station_flow.c:867-877), which hardcodes it to 0 unconditionally for
+ * every non-200-reason WLAN_EVENT_DISCONNECT it ever dispatches (the ONLY
+ * site where it reads 1 pairs exclusively with ReasonCode ==
+ * WLAN_DISCONNECT_USER_INITIATED/200, cme.c:3291-3313/3337, which this
+ * mechanism already never records -- see wifi_event_cb()'s DISCONNECT case).
+ * So this is the documented, coarser fallback: treat reason 3 as
+ * uninformative (publish 0 instead) once this firmware has EVER issued its
+ * own Wlan_Disconnect(), rather than trying to prove which specific past
+ * cleanup is the one still sitting in pDrv->deauthReason.
+ *
+ * RESIDUAL, stated plainly: this can ALSO blank a genuine AP-sent
+ * ReasonCode 3 (a real deauth/disassoc, ti_drv_rxDeauthPacket /
+ * ti_drv_rxDisassocPacket, drv_ti_mlme.c:1476/1521, copy the frame's own
+ * reason_code verbatim) arriving on any attempt AFTER the first ever
+ * Wlan_Disconnect() this boot -- there is no cheaper, precise way to tell
+ * the two apart with what the SDK exposes on this path (see above).  Once
+ * `own_disconnect_issued` goes true it is never expected to go false again
+ * (mirrors "since boot" in the issue's own accepted design) -- a boot-scoped
+ * over-approximation, not a per-attempt one, same tradeoff wifi_retry_
+ * should_restore_first_pass() above already accepts for the SAME reason
+ * value in the narrower retry-pass case.
+ *
+ * Applies ONLY to reason 3 -- every other value (including 0, 30, and 200,
+ * which is filtered upstream in wifi_event_cb() before it ever reaches here)
+ * is real, specific information this function must not touch. */
+int16_t wifi_retry_sanitize_reason(int16_t reason, bool own_disconnect_issued);
+
 #endif /* CC3501E_BRIDGE_WIFI_RETRY_H */
