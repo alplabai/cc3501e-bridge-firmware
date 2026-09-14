@@ -277,12 +277,18 @@ static volatile uint32_t wifi_cb_last_id;
  * comment claimed, which counted only the fixed delays and left out the
  * two association attempts themselves.  For a deny-list (auth, or any
  * other) shape, run11's bench (the always-11 s-delay predecessor of this
- * mechanism) measured 19.6-34.5 s for its 12 successes -- this fix changes
+ * mechanism) measured 19.6-34.5 s for its 12 successes -- RUN12 changes
  * WHICH events get which delay, not the deny-list delay itself, so that
  * shape's total is expected to land in the same range, not yet re-measured
- * under RUN12 specifically.  Both shapes stay bounded well under the 30 s
- * association window either way (see the retry's own deadline-arithmetic
- * comment). A
+ * under RUN12 specifically.  Those 19.6-34.5 s totals are END-TO-END
+ * connect-call time, NOT the association phase alone: they also include
+ * role-up (bounded 10 s, CC3501E_WIFI_ROLE_TIMEOUT_MS) and the DHCP lease
+ * poll (bounded 20 s, CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US)
+ * that follow a successful association.  What IS capped at 30 s from the
+ * first Wlan_Connect is the association phase itself (first attempt + this
+ * retry's own overhead + its own wait), enforced directly by the retry's
+ * own deadline-arithmetic check -- not the whole connect call, which these
+ * bench totals measure. A
  * wire field carrying the first-pass wake event id directly (GET_DIAG_INFO's
  * 18-byte reply and CMD_WIFI_STATUS's alp_cc3501e_wifi_status_t are BOTH
  * already fully packed, protocol_diag.c / protocol_wifi.c) stays a
@@ -508,10 +514,15 @@ static void wifi_event_cb(WlanEvent_t *event)
 		 * that 5 s window, comfortably inside it.
 		 *
 		 * FIX: 30 alone is NOT terminal here (17 is excluded -- see above).
-		 * Record the status into the live reason (still gated on
-		 * wifi_conn_is_connecting(), same rule as every other case) so a host
-		 * polling WIFI_STATUS mid-retry sees it, but do NOT set
-		 * wifi_last_status or signal -- the connect body simply keeps waiting
+		 * Record the status into the live tag (still gated on
+		 * wifi_conn_is_connecting(), same rule as every other case) so THIS
+		 * pass's reason survives to be read at the retry-eligibility check --
+		 * NOT so a host can observe it mid-retry: CMD_WIFI_STATUS reads
+		 * g_wifi_conn.reason, the FROZEN copy wifi_conn_set() writes only at
+		 * the terminal transition, and that stays whatever it was before this
+		 * attempt (typically 0) for the whole CONNECTING window -- a polling
+		 * host sees nothing new until this attempt actually ends.  Do NOT set
+		 * wifi_last_status or signal here -- the connect body simply keeps waiting
 		 * on its EXISTING osi_SyncObjWait(&wifi_event_sync, 30s) in
 		 * cc3501e_hw_wifi_connect_sta(), for the vendor's own retry to either
 		 * succeed (WLAN_EVENT_CONNECT) or -- within its own ~5 s SME ceiling,
@@ -1376,13 +1387,18 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason, int16_t reason)
 	 * reading a live association as somehow still carrying a past reject.
 	 *
 	 * CONNECTED also clears the LIVE wifi_last_reason_tag itself, not just
-	 * the frozen g_wifi_conn.reason above -- otherwise the two disagree from
-	 * this point on: a later cc3501e_hw_wifi_disconnect() call passes 0 as
-	 * its own reason precisely because the live tag is guaranteed clean by
-	 * then (nothing writes it between CONNECTED and a host-issued
-	 * WIFI_DISCONNECT -- see g_wifi_conn's own comment on why a post-connect
-	 * deauth is dropped, not tracked), and clearing it here is what keeps
-	 * that guarantee true. */
+	 * the frozen g_wifi_conn.reason above, purely as hygiene for the NEXT
+	 * connect attempt -- NOT because anything downstream of THIS attempt
+	 * still reads the live tag: cc3501e_hw_wifi_disconnect() passes
+	 * g_wifi_conn.reason itself, not the live tag (see that function's own
+	 * comment), specifically so a later WIFI_DISCONNECT republishes
+	 * whatever this call just froze (0, right here) regardless of what the
+	 * live tag does or does not hold by then.  mark_connecting() clears the
+	 * tag again anyway at the START of the next attempt, so this clear is
+	 * redundant with that one in practice -- kept for the same reason
+	 * mark_connecting()'s own comment gives: a live tag that reads 0
+	 * whenever no attempt is in flight is a simpler invariant to reason
+	 * about than one that is sometimes stale between attempts. */
 	if (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) {
 		wifi_last_reason_tag = 0;
 		g_wifi_conn.reason   = 0;
@@ -2041,7 +2057,13 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 					connect_reason_code = first_pass_reason_code;
 				} else {
 					connect_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT;
-					connect_reason_code = 0;
+					/* NOT forced to 0 (e92d626 read the live value here too): a
+					 * timed-out wait means no event satisfied THIS wait, but the tag
+					 * can still hold whatever the cb last wrote under the
+					 * connecting-state gate (a late REJECTED/DISCONNECT that missed
+					 * the signal, or a spurious write outside the wait window) --
+					 * a single load, decoded once. */
+					connect_reason_code = wifi_reason_tag_reason(wifi_last_reason_tag);
 				}
 				connect_rv = CC3501E_HW_ERR_IO;
 				break;
@@ -2231,9 +2253,18 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	if (ip == 0u) {
 		/* Associated at L2 but no DHCP lease within the budget -- TERMINAL (there is no
 		 * usable IP, so a "connected" report would mislead the host into failing socket
-		 * ops).  The host reads this as CONN_FAILED/TIMEOUT via CMD_WIFI_STATUS. */
-		wifi_conn_set(
-		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT, 0);
+		 * ops).  The host reads this as CONN_FAILED/TIMEOUT via CMD_WIFI_STATUS.
+		 *
+		 * reason is NOT hardcoded 0 here: state is STILL CONNECTING throughout this
+		 * whole DHCP poll (nothing has published a terminal state or CONNECTED yet),
+		 * so wifi_event_cb() can still record a real reason into the live tag during
+		 * it -- a spontaneous AP deauth/disassoc arriving mid-poll, or a leftover
+		 * ASSOCIATION_REJECTED(30) from a comeback the vendor's own retry ultimately
+		 * WON (see that case's non-terminal handling) that this L2-success path never
+		 * cleared.  Freeze whatever is actually there with a single load. */
+		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
+		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT,
+		              wifi_reason_tag_reason(wifi_last_reason_tag));
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0);
@@ -2246,18 +2277,27 @@ int cc3501e_hw_wifi_disconnect(void)
 		return CC3501E_HW_OK; /* nothing to disconnect */
 	}
 	/* No "we asked for this" flag to arm here any more -- see
-	 * wifi_event_cb()'s DISCONNECT case for why.  Nothing to gate here either:
-	 * a host WIFI_DISCONNECT is only ever issued while state is CONNECTED (the
-	 * only state a host would sensibly send one from), so the connecting-state
-	 * gate that replaced the flag is already closed the whole time this
-	 * function runs -- the vendor's own async DISCONNECT event for THIS call
-	 * cannot land inside a CONNECTING window it never opened. */
+	 * wifi_event_cb()'s DISCONNECT case for why.  Nothing here actually ENFORCES
+	 * that a host only calls this from CONNECTED (protocol_wifi.c:87-104 /
+	 * worker.c:307-314 dispatch WIFI_DISCONNECT unconditionally) -- passing
+	 * g_wifi_conn.reason below, rather than a hardcoded 0, is what makes this
+	 * correct regardless: that field is 0 whenever state is CONNECTED (wifi_conn_set()
+	 * clears it there) and the last FROZEN reason otherwise, so a WIFI_DISCONNECT
+	 * republishes exactly what was already true, no matter which state it is
+	 * actually called from. */
 	if (Wlan_Disconnect(WLAN_ROLE_STA, NULL) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	/* Host-requested teardown succeeded: mirror the state into the latch and
-	 * queue an async EVT_WIFI_DISCONNECTED (wifi_conn_set does both). */
-	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_DISCONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0);
+	 * queue an async EVT_WIFI_DISCONNECTED (wifi_conn_set does both).  reason is
+	 * g_wifi_conn.reason itself (the FROZEN value from whatever terminal
+	 * wifi_conn_set() call last ran), NOT the live tag and NOT a hardcoded 0 --
+	 * see this function's own top comment for why, and hal/cc3501e_hw.h's
+	 * cc3501e_hw_wifi_last_reason() contract for what a host is meant to read
+	 * out of this republish. */
+	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_DISCONNECTED,
+	              (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE,
+	              g_wifi_conn.reason);
 	return CC3501E_HW_OK;
 }
 

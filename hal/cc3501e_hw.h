@@ -293,6 +293,17 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * (which never sees a real WLAN event), and what a fresh attempt reads until
  * it records one of its own.
  *
+ * "Recorded" here means the underlying live tag (hal/ti/cc3501e_hw_ti_wifi.c),
+ * NOT this accessor's own return value.  cc3501e_hw_wifi_last_reason() returns
+ * g_wifi_conn.reason, the FROZEN copy wifi_conn_set() writes ONLY at the
+ * terminal transition -- a host polling CMD_WIFI_STATUS WHILE this attempt is
+ * still OPEN (CONNECTING) sees whatever this byte held before THIS attempt
+ * started (typically 0), not a live view of what is being recorded underneath
+ * it right now.  Some non-terminal cases in wifi_event_cb() (e.g.
+ * ASSOCIATION_REJECTED's comeback-IE handling) record into the live tag
+ * specifically so a LATER read within the SAME attempt (the retry-eligibility
+ * check) sees it -- that is an internal handoff, not a host-visible one.
+ *
  * FIRST REAL CODE WINS for a DISCONNECT specifically: it is recorded only
  * while this value is still 0 for the attempt.  ASSOCIATION_REJECTED status
  * 30 (WITH the AP's comeback-time IE) is non-terminal -- the vendor driver
@@ -310,11 +321,18 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * this arrived", not to "did WE cause it".  A disconnect this firmware itself
  * issues while actually connected or mid-association (a host WIFI_DISCONNECT
  * while connected, or the #1437 stale-association cleanup after a failed
- * connect) is excluded not because it is specially flagged, but because
- * neither can run while an attempt is open: the cleanup always runs AFTER its
- * caller's own wifi_conn_set(FAILED, ...), and a host WIFI_DISCONNECT only
- * ever fires from CONNECTED. Both leave the gate closed the whole time they
- * run.  The converse gap also exists and is NOT recorded: a reject event
+ * connect) is excluded not because either is specially flagged, but because
+ * the #1437 cleanup genuinely cannot run while an attempt is open -- it
+ * always runs AFTER its caller's own wifi_conn_set(FAILED, ...), which is
+ * itself the terminal transition that closes the gate.  A host WIFI_DISCONNECT
+ * is NOT similarly guaranteed to arrive only from CONNECTED -- nothing in
+ * protocol_wifi.c:87-104 / worker.c:307-314 enforces that a host sends one
+ * only then -- but cc3501e_hw_wifi_disconnect() does not depend on the
+ * assumption either: it passes g_wifi_conn.reason (the frozen value from
+ * whichever state actually preceded it) as its own `reason`, not a live
+ * re-read, so it republishes correctly regardless of which state it is
+ * actually called from (see that function's own comment).  The converse gap
+ * also exists and is NOT recorded: a reject event
  * that arrives after the attempt has already been declared a TIMEOUT is
  * lost -- the attempt is already terminal (state is no longer CONNECTING)
  * by the time that late event shows up, so the gate is already closed
@@ -370,11 +388,15 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * even if a since-succeeded retry left a transient rejection status (e.g. 30)
  * recorded during the attempt: a CONNECTED attempt was neither ended nor
  * rejected, so this byte must not carry a stale reject alongside it.
- * Reaching CONNECTED also clears the underlying live value, not only the
- * published one, so it stays 0 afterward too -- including for a LATER
- * publish that copies the live value again (a host-requested
- * WIFI_DISCONNECT ending a clean, connected session must read 0, not resurface
- * an old rejection from earlier in the same attempt).  Once an attempt
+ * Reaching CONNECTED also clears the underlying live tag, not only the
+ * published g_wifi_conn.reason -- both read 0 from that point on.  A LATER
+ * publish (a host-requested WIFI_DISCONNECT ending a clean, connected
+ * session) passes g_wifi_conn.reason itself as its own reason, not the live
+ * tag (see cc3501e_hw_wifi_disconnect()'s own comment, hal/ti/
+ * cc3501e_hw_ti_wifi.c) -- it reads 0 because CONNECTED already froze that
+ * field to 0, not because the live tag happens to still be clean at the
+ * moment WIFI_DISCONNECT runs.  Either way it must read 0, not resurface an
+ * old rejection from earlier in the same attempt.  Once an attempt
  * reaches CONNECTED this value is frozen at 0; a deauth that arrives AFTER a
  * successful CONNECTED does not update it (there is no post-connect tracking
  * here by design -- see the fuller note on g_wifi_conn's `reason`

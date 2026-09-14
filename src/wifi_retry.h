@@ -75,23 +75,27 @@ uint32_t wifi_retry_delay_ms(wifi_retry_event_t event,
  * as-is?
  *
  * True for:
- *   - reason 3 (WLAN_REASON_DEAUTH_LEAVING).  TWO vendor writers can produce
- *     this on a retry pass with no per-attempt reset in between: our own
- *     pre-retry wifi_clear_stale_assoc() -> Wlan_Disconnect() ->
+ *   - reason 3 (WLAN_REASON_DEAUTH_LEAVING).  SEVERAL vendor paths can
+ *     produce this on a retry pass with no per-attempt reset in between --
+ *     NOT an exhaustive list, and not always our own cleanup echoing back:
+ *     (a) our own pre-retry wifi_clear_stale_assoc() -> Wlan_Disconnect() ->
  *     cmeWlanDisconnect(WLAN_REASON_DEAUTH_LEAVING) (cme_station_flow.c:521-548,
  *     cme_connection_mng.c:2721-2722), which sets pDrv->deauthReason to 3 and
- *     is echoed back on the very next DISCONNECT this cb sees; and hostap's
+ *     is echoed back on the very next DISCONNECT this cb sees; (b) hostap's
  *     SME give-up timers, sme_auth_timer/sme_assoc_timer -> sme_deauth()
- *     (sme.c:2325-2345), the ONLY path that reaches
- *     ti_drv_deauthenticate()'s `pDrv->deauthReason = aReasonCode`
- *     (drv_ti_sta_specific.c:400) with WLAN_REASON_DEAUTH_LEAVING, when an
- *     auth or assoc timeout fires with nothing else having ended the attempt
- *     first.  An auth/assoc timeout that instead lands via
- *     sme_event_auth_timed_out/sme_event_assoc_timed_out (sme.c:2291-2306) or
- *     the SAE failure path (sme.c:1580-1592) does NOT call sme_deauth and
- *     writes no new deauthReason at all -- it leaves whatever value was
- *     already there STALE, which could be an earlier real code, not
- *     necessarily 3.
+ *     (sme.c:2325-2345); (c) sme_event_assoc_reject() -> sme_deauth()
+ *     (sme.c:2287) when an ASSOCIATION_REJECTED arrives WITHOUT the
+ *     comeback-time IE (a real AP rejection, unconditionally re-deauthed);
+ *     and (d) sme_event_disassoc() (sme.c:2322) calling
+ *     wpa_drv_deauthenticate(..., WLAN_REASON_DEAUTH_LEAVING) directly on a
+ *     stray disassociation.  (b)-(d) all reach ti_drv_deauthenticate()'s
+ *     `pDrv->deauthReason = aReasonCode` (drv_ti_sta_specific.c:400) with
+ *     WLAN_REASON_DEAUTH_LEAVING.  An auth/assoc timeout that instead lands
+ *     via sme_event_auth_timed_out/sme_event_assoc_timed_out
+ *     (sme.c:2291-2306) or the SAE failure path (sme.c:1580-1592) does NOT
+ *     call sme_deauth and writes no new deauthReason at all -- it leaves
+ *     whatever value was already there STALE, which could be an earlier
+ *     real code, not necessarily 3.
  *   - reason 0 (no vendor reason recorded THIS pass at all) -- the retry's
  *     own Wlan_Connect-refused (KICK) and wait-timed-out (TIMEOUT) exits
  *     already restore the first pass's outcome at their own call sites; this
