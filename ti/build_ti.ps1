@@ -554,30 +554,6 @@ if ((Get-Content $localCmd -Raw) -notmatch '\.bss\.sock_ring') {
     throw "sock-ring TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape. The ring would fall back to the FULL DRAM bank and the link would overflow."
 }
 
-# Alp #142: the LINK-HEALER TASK STACK also lives in TCM_DRAM, not DRAM --
-# same "DRAM is full" reasoning as the sock-ring block above (this file's own
-# comment on it already cites the 431-byte spare figure), ported the same
-# way: a SECOND GROUP inserted before the SAME catch-all anchor, so it lands
-# in TCM ahead of it too.  See src/main.c's link_stack for the full sizing
-# story -- left in DRAM this stack alone starved every size tried, from 1024
-# words down to 80.  Verify in cc3501e-bridge.map that link_stack resolves
-# at 0x200xxxxx, NOT 0x28xxxxxx, same check the sock-ring comment prescribes.
-$cmdText  = Get-Content $localCmd -Raw
-$linkstack = @"
-    /* Alp #142: link-healer task stack in TCM (DRAM is full, same as sock_ring above). */
-    GROUP {
-        .bss.link_stack: {} palign(8)
-    } > TCM_DRAM_NON_SECURE
-
-"@
-if ($cmdText -notmatch '\.bss\.link_stack') {
-    $cmdText = $cmdText.Replace($anchor, $linkstack + $anchor)
-    Set-Content $localCmd $cmdText -NoNewline
-}
-if ((Get-Content $localCmd -Raw) -notmatch '\.bss\.link_stack') {
-    throw "link-healer stack TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape. The stack would fall back to the FULL DRAM bank and the link would overflow (#142)."
-}
-
 if ($cmdText -notmatch '\.TI\.noinit') {
     $cmdText = $cmdText -replace '(?m)^[ \t]*/\* System memory in DRAM \*/[ \t]*\r?\n', $noinit
     Set-Content $localCmd $cmdText -NoNewline

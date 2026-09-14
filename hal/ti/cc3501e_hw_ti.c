@@ -437,17 +437,11 @@ void cc3501e_hw_tick(void)
 	}
 #endif
 
-	/* #142: the four SPI self-heals that used to live HERE (dead-handle
-	 * reopen, resync-burst reinit, arm-fail reinit, reply-stall reinit) now
-	 * run on cc3501e_link_task, a dedicated 10 ms FreeRTOS task, instead of
-	 * being frozen for up to 70 s while this task is blocked inside a
-	 * WIFI_CONNECT/Wlan_Start body -- see cc3501e_hw_link_tick() below and
-	 * src/main.c's cc3501e_link_task.  g_resync_count/g_arm_fail_count are
-	 * still declared just above (this TU also reads them nowhere else) and
-	 * are now read ONLY from cc3501e_hw_link_tick() -- plus
-	 * bridge_transport_spi_probe_tick() under CC3501E_WEDGE_PROBE below,
-	 * which is a second, harmless volatile READER (the SPI ISR is still the
-	 * sole WRITER of both). */
+	/* #142: the four SPI self-heals (dead handle, resync burst, arm failure,
+	 * reply stall) plus the quiet-armed detector now live in
+	 * cc3501e_hw_link_heal() below, called from here with in_connect_wait =
+	 * false -- see that function's own comment. */
+	cc3501e_hw_link_heal(false);
 
 	/* Deferred self-reset, gated on reply_drained so the CMD_RESET ack has
 	 * FULLY clocked to the host before the chip resets (audit
@@ -490,24 +484,23 @@ void cc3501e_hw_tick(void)
 	}
 }
 
-/* #142: how long the slave may sit parked at PH_REQ_HEADER, unarmed, with no
- * host traffic at all, before the quiet-armed detector treats it as an
- * armed-but-deaf wedge rather than an ordinarily-idle host.  Long enough
- * that a host's own worst-case poll gap (WIFI_STATUS every 50 ms,
- * CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS's own 150 ms window, or a human
- * pausing between `alp companion` commands on the bench) never trips it;
- * short enough to recover well inside the ~70 s a WIFI_CONNECT body can
- * hold the bring-up task. */
+/* #142: how long the slave may sit parked at PH_REQ_HEADER, quiet, before
+ * the quiet-armed detector treats it as an armed-but-deaf wedge rather than
+ * an ordinarily-idle host.  Long enough that the host's own worst-case
+ * WIFI_STATUS poll gap (50 ms) is nowhere close; short enough to recover
+ * well inside the ~70 s a WIFI_CONNECT body can otherwise hold the bring-up
+ * task. */
 #define CC3501E_LINK_QUIET_REARM_MS 3000u
 
-/* #142 item 2: count of quiet-rearm heals fired -- link-task-owned (single
- * writer, cc3501e_hw_link_tick() below; no ISR or other task touches it), so
- * a plain non-volatile counter is enough.  NOT wired onto the wire: no
- * existing GET_DIAG_INFO/OTA_STATUS reserved field has spare room without a
- * protocol MAJOR bump (see ALP_CC3501E_PROTOCOL_MAJOR's own guard in
- * <alp/protocol/cc3501e.h>), which is out of scope for this fix -- read over
- * SWD like g_spi_reopen_count/g_rx_overrun_count until a future wire change
- * has room to carry it. */
+/* #142: count of quiet-rearm heals fired -- single writer
+ * (cc3501e_hw_link_heal(), always on the bring-up task, never an ISR or a
+ * second task), so a plain non-volatile counter is enough.  NOT wired onto
+ * the wire: no existing GET_DIAG_INFO/OTA_STATUS reserved field has spare
+ * room without a protocol MAJOR bump (see ALP_CC3501E_PROTOCOL_MAJOR's own
+ * guard in <alp/protocol/cc3501e.h>), out of scope for this fix -- exposed
+ * instead through the bench-only diag loglevel selector 10 (hal/ti/
+ * transport_hw_ti_spi.c's bridge_transport_spi_probe_read(),
+ * CC3501E_WEDGE_PROBE only). */
 static uint32_t g_quiet_rearm_heal_count;
 
 uint32_t cc3501e_hw_link_quiet_rearm_count(void)
@@ -515,32 +508,30 @@ uint32_t cc3501e_hw_link_quiet_rearm_count(void)
 	return g_quiet_rearm_heal_count;
 }
 
-/* #142: the SPI self-heal checks, moved OFF the bring-up task and onto their
- * own dedicated 10 ms FreeRTOS task (cc3501e_link_task, src/main.c) so they
- * keep running while the bring-up task is blocked for up to ~70 s inside a
- * WIFI_CONNECT/Wlan_Start body -- see this file's own header and
- * cc3501e_hw_tick()'s comment at the old call site for the root-cause
- * writeup this closes.
+/* #142 (host review of b3dc1e2): the SPI self-heal checks, factored into ONE
+ * function so it can be called from BOTH cc3501e_hw_tick() (the idle-tick
+ * path, @p in_connect_wait = false) AND from inside
+ * cc3501e_hw_wifi_connect_sta()'s own wait points (@p in_connect_wait =
+ * true) -- see that function's call sites (hal/ti/cc3501e_hw_ti_wifi.c) for
+ * exactly which windows and why each is safe to reinit in.
  *
- * NO-OP while polled (bridge_transport_spi_polled(): the whole-boot OTA
- * update-mode loop owns the slave single-threaded and every one of these
- * calls already self-guards for that case, but skipping the whole function
- * here keeps this task from doing any work at all during a mode where it
- * has nothing useful to check) or quiesced (bridge_transport_spi_quiesced():
- * an OTA flush in NORMAL mode legitimately holds the slave dead for the
- * DURATION of a psa_fwu flash burst -- up to a 22-41 s slot erase, see
- * src/main.c's update-mode loop comment for where that figure comes from --
- * and this task must not race cc3501e_hw_ota_pump()'s own release/reinit
- * pair around it). */
-void cc3501e_hw_link_tick(void)
+ * REJECTED FIRST DESIGN (b3dc1e2): an independent 10 ms FreeRTOS task called
+ * this unconditionally.  That let a reinit fire inside windows the rest of
+ * this codebase guarantees are reinit-free -- mid BLE_SCAN, inside
+ * Wlan_Start's host-off bracket, right after an OTA erase's quiesce(false),
+ * or simply on an ordinarily-idle host/console session -- because nothing
+ * about "called from a background task" proves the MOMENT it runs is safe.
+ * See src/link_quiet_rearm.h's own top comment for the full writeup.
+ *
+ * The four heals below are UNCONDITIONAL regardless of @p in_connect_wait --
+ * each is evidence-based (a counter moved, a handle died, a reply stalled),
+ * not a blind timer, and they ran exactly this way, from cc3501e_hw_tick(),
+ * before this whole fix -- no behaviour change for the idle-tick path.  The
+ * quiet-armed detector is the ONLY part gated on @p in_connect_wait: it is a
+ * blind timer (3 s of silence), and firing it from the unconditional idle
+ * tick is exactly what the rejected design got wrong. */
+void cc3501e_hw_link_heal(bool in_connect_wait)
 {
-	const bool polled   = bridge_transport_spi_polled();
-	const bool quiesced = bridge_transport_spi_quiesced();
-
-	if (polled || quiesced) {
-		return;
-	}
-
 	/* === Bridge SPI open-failure recovery (#1610) ===
 	 * The two self-heals below both key off counters (g_resync_count,
 	 * g_arm_fail_count) that can only move while the slave HAS a handle.  If every
@@ -598,24 +589,34 @@ void cc3501e_hw_link_tick(void)
 	}
 
 	/* === Quiet-armed recovery (#142) ===
-	 * See src/link_quiet_rearm.h's top comment for the full writeup: an SPI
-	 * slave armed in PH_REQ_HEADER whose DMA never completes is invisible to
-	 * every self-heal above.  0u below is PH_REQ_HEADER's own enum value in
-	 * hal/ti/transport_hw_ti_spi.c's file-local `enum spi_phase` -- not
-	 * exported as a named constant because bridge_transport_spi_phase()'s
-	 * own contract (see transport.h) already documents it as the wire value
-	 * OTA_STATUS reserved[2] reports, so this is the SAME public contract,
-	 * not a new one. */
+	 * See src/link_quiet_rearm.h's top comment for the full writeup.  ONLY
+	 * evaluated when called from cc3501e_hw_wifi_connect_sta()'s own wait
+	 * points -- never from the unconditional idle tick, so an ordinarily-
+	 * idle host/console session can never trip it. */
+	if (!in_connect_wait) {
+		return;
+	}
+
+	/* 0u below is PH_REQ_HEADER's own enum value in hal/ti/
+	 * transport_hw_ti_spi.c's file-local `enum spi_phase` -- not exported as
+	 * a named constant because bridge_transport_spi_phase()'s own contract
+	 * (see transport.h) already documents it as the wire value OTA_STATUS
+	 * reserved[2] reports, so this is the SAME public contract, not a new
+	 * one. */
 	static link_quiet_rearm_state_t quiet_state;
 	const bool                      at_idle_header = (bridge_transport_spi_phase() == 0u);
-	const bool fire = link_quiet_rearm_tick(&quiet_state,
-	                                        at_idle_header,
-	                                        bridge_transport_spi_reply_armed(),
-	                                        bridge_transport_spi_quiet_ms(),
-	                                        cc3501e_hw_uptime_ms(),
-	                                        CC3501E_LINK_QUIET_REARM_MS,
-	                                        false /* polled/quiesced already handled above */);
+	const bool                      fire = link_quiet_rearm_tick(&quiet_state,
+	                                                             at_idle_header,
+	                                                             bridge_transport_spi_quiet_ms(),
+	                                                             cc3501e_hw_uptime_ms(),
+	                                                             CC3501E_LINK_QUIET_REARM_MS);
 	if (fire) {
+		/* Matches every other reinit call site in this file/cc3501e_hw_ti_
+		 * wifi.c: drop READY before the reinit so the host sees the line go
+		 * LOW across the teardown/re-open window instead of clocking a
+		 * live-looking READY into a slave whose reinit has not finished
+		 * re-arming yet. */
+		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 		g_quiet_rearm_heal_count++;
 	}

@@ -1187,19 +1187,7 @@ static void wifi_connect_fail_skip_sleep_ms(uint32_t ms)
 
 static void wifi_connect_fail_mark_skip(void)
 {
-	/* #142 item 5: bridge_transport_spi_valid_req_count(), NOT
-	 * cc3501e_hw_host_txn_count().  The old witness bumps once a whole REPLY
-	 * has clocked back out (cc3501e_hw_notify_reply_sent(), only reachable
-	 * after dispatch_frame() already ran) -- so it says "the slave answered
-	 * something", not "the slave decoded a genuine request", and a lagged/
-	 * misaligned slave that dispatches garbage still drains a reply and
-	 * bumps it.  The new counter is bumped earlier and more narrowly, at
-	 * on_transfer()'s own header-decode gate (hal/ti/transport_hw_ti_spi.c),
-	 * the same opcode < ALP_CC3501E_CMD_RESERVED_VENDOR_BASE check that
-	 * rejects a desynced/reserved header into g_resync_count instead -- so
-	 * it only counts a REQUEST the slave itself judged well-formed, whether
-	 * or not its reply ever finishes clocking out. */
-	g_connect_fail_skip_ok      = wifi_wait_host_frame(bridge_transport_spi_valid_req_count,
+	g_connect_fail_skip_ok      = wifi_wait_host_frame(cc3501e_hw_host_txn_count,
 	                                                   wifi_connect_fail_skip_sleep_ms,
 	                                                   CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS,
 	                                                   CC3501E_WIFI_CONNECT_FAIL_SKIP_STEP_MS);
@@ -1969,6 +1957,69 @@ static void wifi_clear_stale_assoc(void)
  * with this 3 s floor left for that re-issued connect's own wait. */
 #define CC3501E_WIFI_RETRY_MIN_WAIT_MS 3000u
 
+/* #142 (host review of b3dc1e2): the SPI link self-heals (dead handle,
+ * resync burst, arm failure, reply stall, quiet-armed) froze for the whole
+ * duration of this function's own waits -- up to ~70 s -- because the ONLY
+ * place they ran, cc3501e_hw_tick(), is drained on the SAME bring-up task
+ * this function itself blocks.  A background task calling the heals
+ * independently was tried and REJECTED (see src/link_quiet_rearm.h's top
+ * comment for the full writeup) -- it let a reinit fire inside windows the
+ * rest of this codebase guarantees are reinit-free.  The fix instead is to
+ * call cc3501e_hw_link_heal(true) FROM INSIDE this function's own wait
+ * points, sliced to <= CC3501E_WIFI_HEAL_SLICE_MS, in the THREE windows
+ * below where this function itself already establishes the slave is safe to
+ * touch: READY is high (an earlier reinit in this body already ran and
+ * raised it, or the SPI ISR's own per-request re-arm cycle is keeping it
+ * high), the host is known to be polling WIFI_STATUS every 50 ms (state is
+ * CONNECTING the whole time), and no cc3501e_bridge_busy()-bracketed
+ * section of THIS body is open.  NEVER call it between role-up and this
+ * body's own post-role-up reinit (bridge_transport_spi_hw_reinit() above,
+ * gated on !role_up_was_latched) -- READY is not yet known-good there -- and
+ * NEVER inside a busy()/reinit() bracket anywhere in this file. */
+#define CC3501E_WIFI_HEAL_SLICE_MS 100u
+
+/* Slice an osi_SyncObjWait() into <= CC3501E_WIFI_HEAL_SLICE_MS chunks,
+ * calling cc3501e_hw_link_heal(true) between them, so a long association
+ * wait no longer freezes the link heals for its whole duration.  Returns
+ * OSI_OK the moment @p sync signals (matching plain osi_SyncObjWait's own
+ * contract); returns the LAST slice's non-OK return value once @p total_ms
+ * is exhausted with no signal -- callers here only ever test `!= OSI_OK`,
+ * so which specific non-OK code survives does not matter. */
+static OsiReturnVal_e wifi_assoc_wait_sliced(OsiSyncObj_t *sync, uint32_t total_ms)
+{
+	uint32_t       remaining = total_ms;
+	OsiReturnVal_e rv        = OSI_OK;
+
+	while (remaining > 0u) {
+		const uint32_t slice =
+		    (remaining < CC3501E_WIFI_HEAL_SLICE_MS) ? remaining : CC3501E_WIFI_HEAL_SLICE_MS;
+		rv = osi_SyncObjWait(sync, slice);
+		if (rv == OSI_OK) {
+			return OSI_OK; /* the event signalled -- stop slicing immediately */
+		}
+		remaining -= slice;
+		cc3501e_hw_link_heal(true);
+	}
+	return rv;
+}
+
+/* Slice a ClockP_usleep() delay into <= CC3501E_WIFI_HEAL_SLICE_MS chunks,
+ * calling cc3501e_hw_link_heal(true) between them -- same reasoning as
+ * wifi_assoc_wait_sliced() above, for the retry's own deny-list/comeback
+ * delay (up to CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS, ~11 s). */
+static void wifi_sleep_sliced(uint32_t total_ms)
+{
+	uint32_t remaining = total_ms;
+
+	while (remaining > 0u) {
+		const uint32_t slice =
+		    (remaining < CC3501E_WIFI_HEAL_SLICE_MS) ? remaining : CC3501E_WIFI_HEAL_SLICE_MS;
+		ClockP_usleep(slice * 1000u);
+		remaining -= slice;
+		cc3501e_hw_link_heal(true);
+	}
+}
+
 int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
                                 uint8_t        ssid_len,
                                 const uint8_t *psk,
@@ -2250,7 +2301,15 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 			const uint32_t wait_ms    = (elapsed_ms < CC3501E_WIFI_ASSOC_WAIT_MS)
 			                                ? (CC3501E_WIFI_ASSOC_WAIT_MS - elapsed_ms)
 			                                : 0u;
-			if (wait_ms == 0u || osi_SyncObjWait(&wifi_event_sync, wait_ms) != OSI_OK) {
+			/* #142: sliced (wifi_assoc_wait_sliced(), <= CC3501E_WIFI_HEAL_SLICE_MS
+			 * per slice) instead of one blocking osi_SyncObjWait(), so the link
+			 * heals -- cc3501e_hw_link_heal(true), called between slices -- keep
+			 * running through the whole wait instead of being frozen for it (up
+			 * to 30 s).  Safe here: READY is already known-good (the gated reinit
+			 * above already ran, or a prior pass's re-arm cycle kept it high), the
+			 * host is polling WIFI_STATUS every 50 ms the whole time, and no
+			 * busy()/reinit() bracket is open across this wait. */
+			if (wait_ms == 0u || wifi_assoc_wait_sliced(&wifi_event_sync, wait_ms) != OSI_OK) {
 				/* No connect event within what was left of the budget.  On the
 				 * FIRST pass this is a genuine TERMINAL timeout (was masked as a
 				 * retryable IO that looped the host's poll-by-repeat -> -4).  On
@@ -2335,7 +2394,14 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 				    wifi_retry_delay_ms(first_pass_reason_event,
 				                        CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS,
 				                        CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS);
-				ClockP_usleep(retry_delay_ms * 1000u);
+				/* #142: sliced (wifi_sleep_sliced()) instead of one blocking
+				 * ClockP_usleep(), same reasoning as the association wait's own
+				 * slicing above -- this delay can run up to
+				 * CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS (~11 s).  Safe for the same
+				 * reason: the disconnect cleanup above already ran, READY is
+				 * known-good, the host is still polling WIFI_STATUS (state is
+				 * still CONNECTING), and no busy()/reinit() bracket is open. */
+				wifi_sleep_sliced(retry_delay_ms);
 				continue; /* re-issue Wlan_Connect; loop top clears state again. */
 			}
 		}
@@ -2470,6 +2536,14 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		}
 
 		ClockP_usleep(CC3501E_STA_DHCP_POLL_US);
+		/* #142: one heal per DHCP poll iteration (this loop's own cadence is
+		 * already CC3501E_STA_DHCP_POLL_US == 200 ms, well under
+		 * CC3501E_WIFI_HEAL_SLICE_MS, so no further slicing is needed here).
+		 * Safe for the same reason as the association-wait/retry-sleep call
+		 * sites above: L2 is already associated (this loop only runs after
+		 * that), READY is known-good, the host is still polling WIFI_STATUS,
+		 * and no busy()/reinit() bracket is open across this loop. */
+		cc3501e_hw_link_heal(true);
 	}
 	if (ip == 0u) {
 		/* Associated at L2 but no DHCP lease within the budget -- TERMINAL (there is no

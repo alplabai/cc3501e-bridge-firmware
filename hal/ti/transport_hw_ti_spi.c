@@ -189,9 +189,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <FreeRTOS.h> /* #142 item 3: g_reinit_mutex serialises reinit/release/suspend */
-#include <semphr.h>
-
 #include <ti/drivers/GPIO.h> /* GPIO_read -- READY level in the wedge snapshot */
 #include "ti_drivers_config.h"
 
@@ -265,14 +262,6 @@ static uint8_t dummy_tx_zero[ALP_CC3501E_MAX_PAYLOAD];
  * link-health observability).  Counts header-phase re-arms triggered by a
  * reserved-range / all-0xFF header (a host sync-probe, or byte-misalignment). */
 volatile uint32_t g_resync_count;
-
-/* #142 item 5: count of request headers that decoded as a VALID v1 frame
- * (opcode < ALP_CC3501E_CMD_RESERVED_VENDOR_BASE) -- the mirror of
- * g_resync_count, bumped at the same gate's opposite branch (on_transfer's
- * PH_REQ_HEADER case).  Read cross-TU via bridge_transport_spi_valid_req_
- * count(); see that accessor's own comment for why this replaced
- * cc3501e_hw_host_txn_count() as the CONNECT-failure fail-skip witness. */
-volatile uint32_t g_valid_req_count;
 
 /* Count of bridge SPI (re-)opens: 1 = initial open, then +1 per radio-op
  * recovery (bridge_transport_spi_hw_reinit).  Observable for link-health. */
@@ -525,19 +514,6 @@ void bridge_transport_spi_hw_quiesce(bool on)
 	g_quiesce = on;
 }
 
-/* #142 item 1: cc3501e_hw_link_tick() reads this to stay off the slave for the
- * DURATION of an OTA flash op in NORMAL mode -- cc3501e_hw_ota_pump()
- * (hal/ti/cc3501e_hw_ti_ota.c) sets g_quiesce true BEFORE bridge_transport_
- * spi_hw_release() and false right before its own closing bridge_transport_
- * spi_hw_reinit(), i.e. exactly the window the slave has no handle
- * (bridge_transport_spi_is_dead() would read true) for a REASON, not a
- * wedge.  Without this gate the link task would race that same window and
- * try to reinit a slave the OTA pump is still mid-flash on. */
-bool bridge_transport_spi_quiesced(void)
-{
-	return g_quiesce;
-}
-
 /* Polled bridge (OTA update mode): the pending phase descriptor.  arm_transfer()
  * only RECORDS it; bridge_transport_spi_poll_service() executes it with a
  * BLOCKING SPI_transfer and then re-enters the very same phase machine.  Unused
@@ -711,44 +687,34 @@ bool bridge_transport_spi_phase_stalled(void)
 	return (uint32_t)(cc3501e_hw_uptime_ms() - reply_armed_ms) > CC3501E_REPLY_STALL_MS;
 }
 
-bool bridge_transport_spi_reply_armed(void)
-{
-	return reply_armed;
-}
-
-/* ---- Quiet-armed detector (#142) -----------------------------------------
+/* ---- Quiet-armed detector (#142, host review of b3dc1e2) -----------------
  *
- * The stall watchdog above (bridge_transport_spi_phase_stalled) only ever
- * watches an ARMED reply/payload phase -- PH_REQ_HEADER is deliberately
- * excluded because it is the legitimate idle state, waiting for the host's
- * next request, and can wait forever.  That is exactly the blind spot: a
- * slave that armed a phase whose DMA never completed (an armed-but-deaf
- * slave, #142's root-cause writeup) can be stuck EITHER mid-transaction
- * (caught above) OR back at PH_REQ_HEADER with reply_armed already false --
- * on_transfer() sets reply_armed = false unconditionally on every callback
- * entry (see below), including the CANCELED/failed-arm paths that re-arm the
- * header and return without ever setting it true again.  A slave in that
- * second shape looks IDENTICAL to a healthy, quietly-idle link from every
- * existing self-heal: g_resync_count does not move (no header is being
- * misframed), g_arm_fail_count does not move (the last arm succeeded),
- * bridge_transport_spi_is_dead() is false (the handle is fine), and
- * phase_stalled() is false (reply_armed is false).  Nothing watches it.
+ * The stall watchdog above only ever watches an ARMED reply/payload phase --
+ * PH_REQ_HEADER is deliberately excluded because it is the legitimate idle
+ * state, waiting for the host's next request, and can wait forever.  That is
+ * the blind spot cc3501e_hw_link_heal()'s quiet-armed detector closes (see
+ * hal/ti/cc3501e_hw_ti.c and src/link_quiet_rearm.h): a slave armed in
+ * PH_REQ_HEADER whose DMA never actually completes looks IDENTICAL to a
+ * healthy, quietly-idle link from every other self-heal.
  *
- * g_last_xfer_ms stamps every on_transfer() ENTRY (next to reply_armed =
- * false, below) -- i.e. every time a phase transfer-complete callback fires,
- * whether it advanced the phase machine, re-armed the header on a bad frame,
- * or was a CANCELED/failed-arm bounce.  bridge_transport_spi_quiet_ms() is
- * therefore "how long since the slave last heard ANYTHING from the host",
- * which is the one signal none of the other self-heals compute.
+ * g_last_xfer_ms stamps every on_transfer() ENTRY (below) -- i.e. every time
+ * a phase transfer-complete callback fires, whether it advanced the phase
+ * machine, re-armed the header on a bad frame, or was a CANCELED/failed-arm
+ * bounce -- AND every spi_open_and_arm()/bridge_transport_spi_hw_release()/
+ * _hw_suspend() (a deliberate re-arm or teardown is itself evidence the
+ * quiet clock should restart, not carry forward a stamp from before it).
+ * That second half is load-bearing: the REJECTED first design (b3dc1e2) only
+ * stamped on_transfer(), so a reinit fired right after an OTA erase's
+ * quiesce(false) could inherit a last-xfer stamp tens of seconds stale from
+ * BEFORE the flash op and read as "already wedged" the instant it re-armed.
  *
- * cc3501e_hw_link_tick() (hal/ti/cc3501e_hw_ti.c) is the sole reader: it
- * fires bridge_transport_spi_hw_reinit() once when parked at PH_REQ_HEADER,
- * unarmed, for >= CC3501E_LINK_QUIET_REARM_MS -- see that file and
- * src/link_quiet_rearm.h (the pure once-per-episode decision) for the rest
- * of the mechanism.  Deliberately NOT gated on phase/reply_armed HERE: this
- * file only stamps and reports the raw quiet duration; every "is this the
- * idle-and-unarmed shape, and have we already healed this episode" decision
- * lives in the pure header so it is unit-testable without the TI SDK. */
+ * bridge_transport_spi_quiet_ms() is therefore "how long since the slave
+ * last heard ANYTHING from the host, or was itself last touched" -- the one
+ * signal none of the other self-heals compute.  Its sole caller is
+ * cc3501e_hw_link_heal(), and ONLY from cc3501e_hw_wifi_connect_sta()'s own
+ * wait points -- never from the unconditional idle tick.  See that call
+ * path's own comments (hal/ti/cc3501e_hw_ti_wifi.c) for the WHO/WHEN safety
+ * argument; this file only stamps and reports the raw quiet duration. */
 static volatile uint32_t g_last_xfer_ms;
 
 uint32_t bridge_transport_spi_quiet_ms(void)
@@ -817,16 +783,6 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 			arm_request_header();
 			break;
 		}
-		/* #142 item 5: a header that reaches HERE decoded as a valid v1 request
-		 * (opcode < ALP_CC3501E_CMD_RESERVED_VENDOR_BASE -- the same gate that
-		 * mirrors g_resync_count's rejection just above).  UNLIKE
-		 * g_host_txn_count (cc3501e_hw_notify_reply_sent(), bumped only once
-		 * the WHOLE reply has clocked back out), this counts the REQUEST side,
-		 * so a host that abandons the transaction before the reply drains --
-		 * and every self-heal that never reaches a reply at all -- still
-		 * proves the slave decoded a real frame.  src/worker.c's connect-
-		 * failure fail-skip group reads this one instead of g_host_txn_count. */
-		g_valid_req_count++;
 
 		/* Bound the declared payload to the wire ceiling so a garbage length
 		 * can't overrun the RX into frame_buf; an over-long declared length then
@@ -1226,35 +1182,15 @@ static bool spi_open_and_arm(void)
 	 * clock at any moment. */
 	protocol_crc16_table_init();
 
+	/* #142: a fresh open/re-arm is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms().  Stamped BEFORE arm_request_header()
+	 * so quiet_ms reads ~0 from the moment this function returns, not from
+	 * whatever traffic (or silence) preceded this open. */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
+
 	return arm_request_header();
 }
-
-/* #142 item 3: created once, before any second task exists to race it -- see
- * bridge_transport_spi_hw_init() below (transport_spi_init()'s call into
- * this file runs synchronously on the bring-up task, before src/main.c
- * creates cc3501e_link_task).  A real MUTEX (xSemaphoreCreateMutexStatic),
- * not a binary semaphore, for priority inheritance -- belt-and-braces: every
- * call site of the three functions it guards (grep across cc3501e_hw_ti{,
- * _ble,_wifi,_ota}.c and src/worker.c, plus cc3501e_hw_link_tick() added by
- * this same change) is plain TASK context, never an ISR or a TI OSI thread,
- * so there is no higher-priority interrupt this protects against.  What it
- * DOES protect: cc3501e_link_task and the bring-up task run at the SAME
- * FreeRTOS priority (CC3501E_BRINGUP_TASK_PRIO, src/main.c) with
- * configUSE_TIME_SLICING == 0 (main.c's own OTA-loop comment), so without
- * this lock one task's SPI_close()..SPI_open() pair could interleave with
- * the other's -- e.g. the link task's quiet-rearm reinit racing the worker
- * drain's post-radio-op reinit, each leaving spi/phase/reply_armed in a
- * mix of the two calls' writes.
- *
- * WORST-CASE HOLD TIME: spi_open_and_arm()'s own 12-attempt SPI_open retry
- * budget, 2 ms..18.5 ms backoff summing to ~123 ms (that function's own
- * comment already cites this exact figure for the bring-up-task-blocking
- * case) -- bounded, and short against either caller's own period (worker
- * drain runs per host request; the link task's period is 10 ms, though it
- * only actually CALLS a guarded function once per 3 s quiet episode or on a
- * genuine desync/arm-fail/stall burst, not every tick). */
-static SemaphoreHandle_t g_reinit_mutex;
-static StaticSemaphore_t g_reinit_mutex_buf;
 
 /* Release the slave and its DMA WITHOUT SPI_transferCancel.  The cancel has now
  * hung the bridge twice on silicon (inside reinit, and inside suspend called from
@@ -1263,7 +1199,7 @@ static StaticSemaphore_t g_reinit_mutex_buf;
  * called at BOOT with no slave armed it returns promptly (PSA_ERROR_BAD_STATE
  * 0x77), called from the pump with a live SPI_MODE_CALLBACK transfer it never
  * returns at all.  Pair this with bridge_transport_spi_hw_reinit() afterwards. */
-static void bridge_transport_spi_hw_release_locked(void)
+void bridge_transport_spi_hw_release(void)
 {
 	/* OTA update mode: NEVER close the handle.  This bare SPI_close is precisely
 	 * what closed the handle out from under a task blocked inside a polled
@@ -1283,16 +1219,10 @@ static void bridge_transport_spi_hw_release_locked(void)
 	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
 	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
 	reply_armed = false;
-}
-
-/* #142 item 3: take the mutex around the _locked body above.  See
- * g_reinit_mutex's own comment just above for why a real mutex, who else
- * calls this, and the worst-case hold time. */
-void bridge_transport_spi_hw_release(void)
-{
-	xSemaphoreTake(g_reinit_mutex, portMAX_DELAY);
-	bridge_transport_spi_hw_release_locked();
-	xSemaphoreGive(g_reinit_mutex);
+	/* #142: a deliberate teardown is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms(). */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
 }
 
 /* Re-open + re-arm the bridge slave after a radio op (boot Wlan_Start or a
@@ -1313,17 +1243,7 @@ uint8_t bridge_transport_spi_phase(void)
 	return (uint8_t)phase;
 }
 
-/* #142 item 5: read-only accessor for g_valid_req_count -- see that global's
- * own comment.  Plain volatile read, same reasoning as
- * cc3501e_hw_host_txn_count()'s own accessor: a single aligned word, written
- * only from the SPI ISR (on_transfer), read from a task; no read-modify-write
- * needed on either side. */
-uint32_t bridge_transport_spi_valid_req_count(void)
-{
-	return g_valid_req_count;
-}
-
-static bool bridge_transport_spi_hw_reinit_locked(void)
+bool bridge_transport_spi_hw_reinit(void)
 {
 	/* OTA update mode with a LIVE handle: nothing was ever torn down, so there is
 	 * nothing to re-establish -- and re-rolling spi_open_and_arm()'s SPI_open retry
@@ -1361,15 +1281,6 @@ static bool bridge_transport_spi_hw_reinit_locked(void)
 	return spi_open_and_arm();
 }
 
-bool bridge_transport_spi_hw_reinit(void)
-{
-	bool ok;
-	xSemaphoreTake(g_reinit_mutex, portMAX_DELAY);
-	ok = bridge_transport_spi_hw_reinit_locked();
-	xSemaphoreGive(g_reinit_mutex);
-	return ok;
-}
-
 /* Quiesce the bridge slave + RELEASE its DMA (ch12/13) for the DURATION of a radio op
  * that re-arbitrates the shared HIF DMA (BLE-controller enable).  Unlike reinit (which
  * recovers AFTER an op), this runs BEFORE the op so the bridge SPI's DMA is not a live
@@ -1379,7 +1290,7 @@ bool bridge_transport_spi_hw_reinit(void)
  * SPI_transferCancel drops the armed CALLBACK transfer (frees its DMA) before SPI_close;
  * the worker calls bridge_transport_spi_hw_reinit() after the op to bring the slave back
  * (the host poll-retries on IO across the down-window). */
-static void bridge_transport_spi_hw_suspend_locked(void)
+void bridge_transport_spi_hw_suspend(void)
 {
 	/* OTA update mode: no radio op ever runs (the update-mode loop does nothing
 	 * but service the bridge and pump OTA), so there is nothing to stand down for
@@ -1400,25 +1311,14 @@ static void bridge_transport_spi_hw_suspend_locked(void)
 	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
 	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
 	reply_armed = false;
-}
-
-/* #142 item 3: mutex wrapper -- see g_reinit_mutex's own comment. */
-void bridge_transport_spi_hw_suspend(void)
-{
-	xSemaphoreTake(g_reinit_mutex, portMAX_DELAY);
-	bridge_transport_spi_hw_suspend_locked();
-	xSemaphoreGive(g_reinit_mutex);
+	/* #142: a deliberate teardown is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms(). */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
 }
 
 void bridge_transport_spi_hw_init(void)
 {
-	/* #142 item 3: create the mutex HERE, synchronously on the bring-up task,
-	 * before src/main.c creates cc3501e_link_task -- the second task that will
-	 * ever call reinit/release/suspend.  Static allocation (matches every
-	 * other static FreeRTOS object in this firmware, e.g. src/main.c's
-	 * bringup_stack/bringup_tcb): no heap, and the object's lifetime is
-	 * link-time-obvious. */
-	g_reinit_mutex = xSemaphoreCreateMutexStatic(&g_reinit_mutex_buf);
 	spi_open_and_arm();
 }
 
@@ -1573,6 +1473,9 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag loglevel 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
  *   alp companion diag loglevel 8  -> ADC internal temp: [15:0] raw, [31:16] count
  *   alp companion diag loglevel 9  -> ADC probe status (open/convert bits)
+ *   alp companion diag loglevel 10 -> #142 quiet-rearm heal count (cc3501e_hw_
+ *                                     link_quiet_rearm_count()) -- next free
+ *                                     selector, no wire change
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1626,6 +1529,12 @@ uint32_t bridge_transport_spi_probe_read(void)
 		/* ADC probe status: bit31 tried, bit30 open-ok, bit29 convert-ok,
 		 * low 16 = successful converts.  Zero-initialised (.bss). */
 		return g_adc_probe_stat;
+	case 10u:
+		/* #142: quiet-rearm heals fired since boot (cc3501e_hw_ti.c's
+		 * g_quiet_rearm_heal_count) -- how many times the connect-body's
+		 * quiet-armed detector actually fired a reinit.  Zero on a build/boot
+		 * that never took this path at all. */
+		return cc3501e_hw_link_quiet_rearm_count();
 	default:
 		break;
 	}

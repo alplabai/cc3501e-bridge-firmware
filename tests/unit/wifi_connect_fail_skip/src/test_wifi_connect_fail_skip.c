@@ -4,11 +4,10 @@
  *
  * Unit tests for src/wifi_connect_fail_skip.c -- wifi_wait_host_frame(), the
  * pure poll/wait behind the WIFI_CONNECT_STA failure-exit drain-reinit skip.
- * The real Wlan_Connect body + g_valid_req_count plumbing (hal/ti/
- * transport_hw_ti_spi.c, hal/ti/cc3501e_hw_ti_wifi.c -- #142 item 5;
- * previously g_host_txn_count) needs the vendored TI SimpleLink SDK and is
- * built ONLY for CC3501E_HAL_BACKEND=ti, never linked into a host test
- * binary -- this is the host-testable half of that fix.
+ * The real Wlan_Connect body + g_host_txn_count plumbing (hal/ti/
+ * cc3501e_hw_ti.c, hal/ti/cc3501e_hw_ti_wifi.c) needs the vendored TI
+ * SimpleLink SDK and is built ONLY for CC3501E_HAL_BACKEND=ti, never linked
+ * into a host test binary -- this is the host-testable half of that fix.
  *
  * count_fn / sleep_ms_fn are injected fakes (no vendored SDK, no real
  * clock): g_fake_values[] scripts what successive count_fn() calls return
@@ -136,15 +135,11 @@ ZTEST(cc3501e_wifi_connect_fail_skip, test_advance_before_this_calls_own_baselin
 	              "must not be reported as a served frame");
 }
 
-/* #142 item 5: the real counter behind this call site is now
- * bridge_transport_spi_valid_req_count() (hal/ti/transport_hw_ti_spi.c's
- * g_valid_req_count), a plain `++` that WRAPS at UINT32_MAX rather than the
- * old g_host_txn_count's saturate-and-hold (cc3501e_hw_ti.c's
- * cc3501e_hw_notify_reply_sent()) -- but wifi_wait_host_frame() itself only
- * ever compares "changed vs baseline", never a magnitude, so the ceiling
- * value is exercised here purely as A steady value, not because the real
- * counter can dwell there: two samples at ANY fixed value, UINT32_MAX
- * included, must read as "unchanged". */
+/* Saturation, not wrap: g_host_txn_count SATURATES at UINT32_MAX rather than
+ * wrapping (cc3501e_hw_ti.c's cc3501e_hw_notify_reply_sent()), so the
+ * ceiling itself is a value the real counter can actually reach and hold at
+ * -- two samples at that ceiling must read as "unchanged", same as any other
+ * steady value. */
 ZTEST(cc3501e_wifi_connect_fail_skip, test_saturated_ceiling_steady_returns_false)
 {
 	fake_reset();

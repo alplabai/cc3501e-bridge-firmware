@@ -110,11 +110,8 @@
  *
  * @p count_fn and @p sleep_ms_fn are injected so this is testable without
  * the vendored TI SDK or a real clock -- the real caller (hal/ti/
- * cc3501e_hw_ti_wifi.c) passes bridge_transport_spi_valid_req_count() (#142
- * item 5 -- previously cc3501e_hw_host_txn_count(); see that call site's own
- * comment for why the narrower, earlier-bumped counter replaced it) and a
- * thin ClockP_usleep() wrapper; tests/unit/wifi_connect_fail_skip/ passes
- * fakes.
+ * cc3501e_hw_ti_wifi.c) passes cc3501e_hw_host_txn_count() and a thin
+ * ClockP_usleep() wrapper; tests/unit/wifi_connect_fail_skip/ passes fakes.
  * @p window_ms and @p step_ms are parameters (not baked in) for the same
  * testability reason -- the real call site's own constants
  * (CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS / _STEP_MS) live next to that

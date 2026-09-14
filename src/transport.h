@@ -159,38 +159,15 @@ uint8_t bridge_transport_spi_boot_mark(void);
 bool    bridge_transport_spi_poll_service(void);
 uint8_t bridge_transport_spi_phase(void);
 
-/* ---- #142 link-healer accessors (ti backend; see hal/ti/cc3501e_hw_ti.c's
- * cc3501e_hw_link_tick() and src/link_quiet_rearm.h for the callers) ------ */
-
-/* True while a reply/payload phase is currently armed -- the same flag
- * bridge_transport_spi_phase_stalled() watches for staleness, exposed raw
- * here so the quiet-armed detector can tell "idle and genuinely nothing
- * outstanding" (phase == PH_REQ_HEADER && !reply_armed) from "idle because
- * a reply just got armed a moment ago". */
-bool bridge_transport_spi_reply_armed(void);
-
-/* Milliseconds since the slave last heard ANYTHING from the host -- every
- * on_transfer() callback entry stamps this, whether it advanced the phase
- * machine, re-armed the header on a bad frame, or bounced a CANCELED/
- * failed-arm transfer.  See that stamp's own comment in
- * hal/ti/transport_hw_ti_spi.c for why this is the one signal the OTHER
- * self-heals do not compute. */
+/* #142: milliseconds since the slave last heard ANYTHING from the host, OR
+ * was itself last re-armed/torn down (spi_open_and_arm() and
+ * bridge_transport_spi_hw_release()/_hw_suspend() all stamp this too, not
+ * just the on_transfer() callback) -- see that stamp's own comment in
+ * hal/ti/transport_hw_ti_spi.c.  The sole reader is cc3501e_hw_link_heal()
+ * (hal/ti/cc3501e_hw_ti.c), and ONLY from cc3501e_hw_wifi_connect_sta()'s
+ * own wait points, never from the unconditional idle tick -- see that call
+ * path's own comments for the WHO/WHEN safety argument this relies on. */
 uint32_t bridge_transport_spi_quiet_ms(void);
-
-/* True while an OTA flush in NORMAL (non-polled) mode owns the slave
- * (cc3501e_hw_ota_pump() brackets its flash op with
- * bridge_transport_spi_hw_quiesce(true)/(false)) -- during that window
- * bridge_transport_spi_is_dead() legitimately reads true and no OTHER
- * caller may touch the slave.  bridge_transport_spi_polled() covers the
- * WHOLE-BOOT OTA update-mode case; this covers the narrower in-session one. */
-bool bridge_transport_spi_quiesced(void);
-
-/* Count of request headers that decoded as a VALID v1 frame (opcode <
- * ALP_CC3501E_CMD_RESERVED_VENDOR_BASE) -- see g_valid_req_count's own
- * comment in hal/ti/transport_hw_ti_spi.c.  Used as the CONNECT-failure
- * fail-skip witness (hal/ti/cc3501e_hw_ti_wifi.c, #142 item 5) in place of
- * cc3501e_hw_host_txn_count(). */
-uint32_t bridge_transport_spi_valid_req_count(void);
 
 /* Bridge READY/host-IRQ flow-control (the READY GPIO noted below).  Weak no-ops
  * in worker.c; the ti backend (cc3501e_hw_ti.c) drives a real GPIO -- CC35

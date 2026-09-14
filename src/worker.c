@@ -1263,27 +1263,16 @@ void worker_run_pending(void)
 		 * built-in falsifier is to keep reinitting in that case exactly as
 		 * before this fix.
 		 *
-		 * What the count proves (CORRECTED, #142 item 5): this skip group
-		 * used to read cc3501e_hw_host_txn_count() -- bumped
-		 * (cc3501e_hw_notify_reply_sent(), hal/ti/transport_hw_ti_spi.c
-		 * ~809) only once a WHOLE reply had clocked back out, which requires
-		 * dispatch_frame() to have already run and therefore ALREADY implies
-		 * the header decoded as a real opcode -- so in practice it never
-		 * actually admitted a "garbage cycle" a misaligned slave invented
-		 * from stale FIFO bytes UNLESS that misalignment happened to land on
-		 * a byte < ALP_CC3501E_CMD_RESERVED_VENDOR_BASE by coincidence and
-		 * the whole bogus reply then drained too -- a real but narrow gap.
-		 * cc3501e_hw_wifi_connect_sta_take_fail_skip() now samples
-		 * bridge_transport_spi_valid_req_count() instead, bumped earlier, at
-		 * on_transfer()'s own header-decode gate (the same opcode <
-		 * ALP_CC3501E_CMD_RESERVED_VENDOR_BASE check g_resync_count mirrors
-		 * on the reject side) -- so it proves "the slave decoded a
-		 * well-formed request" without also requiring that request's reply
-		 * to have finished clocking out, closing that gap.  Neither counter
-		 * depends on whether the HOST successfully decoded anything back; a
-		 * failed re-arm or a desynced slave still falls to cc3501e_hw_link_
-		 * tick()'s own g_arm_fail_count / g_resync_count self-heal, same as
-		 * it always has, not to this skip. */
+		 * What the count proves, same as every other skip group in this list
+		 * that reads it: the slave finished a request/reply cycle on ITS OWN
+		 * side -- it is bumped (cc3501e_hw_notify_reply_sent(), hal/ti/
+		 * transport_hw_ti_spi.c ~809) right after the whole reply clocked,
+		 * BEFORE that same call re-arms the next request header
+		 * (arm_request_header(), ~810) -- and it does NOT depend on whether
+		 * the HOST successfully decoded that reply.  A failed re-arm or a
+		 * desynced slave still reads as "live" by this count; recovery from
+		 * either then falls to cc3501e_hw_tick()'s own g_arm_fail_count /
+		 * g_resync_count self-heal, same as it always has, not to this skip. */
 		bool       skip_ok_by_connect_fail = false;
 		const bool connect_fail_reported_skip =
 		    (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) &&

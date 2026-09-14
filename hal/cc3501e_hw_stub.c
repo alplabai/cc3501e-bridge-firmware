@@ -28,9 +28,10 @@ void cc3501e_hw_tick(void)
 	/* no-op on the stub backend */
 }
 
-void cc3501e_hw_link_tick(void)
+void cc3501e_hw_link_heal(bool in_connect_wait)
 {
 	/* no-op on the stub backend -- no real SPI slave to heal (#142) */
+	(void)in_connect_wait;
 }
 
 uint32_t cc3501e_hw_link_quiet_rearm_count(void)

@@ -68,19 +68,25 @@ void cc3501e_hw_init(void);
  * this firmware rev; reserved for watchdog kick / deferred work. */
 void cc3501e_hw_tick(void);
 
-/* #142: SPI link self-heal checks ONLY, run every 10 ms from a dedicated
- * FreeRTOS task (cc3501e_link_task, src/main.c) instead of cc3501e_hw_tick()
- * -- cc3501e_hw_tick() itself can be frozen for up to ~70 s inside a
- * WIFI_CONNECT/Wlan_Start body on the bring-up task, which froze these same
- * checks along with it (root cause writeup: hal/ti/cc3501e_hw_ti.c's own
- * comment at cc3501e_hw_tick()'s old call site).  No-op on the stub backend
- * (no real SPI slave to heal); the ti backend (hal/ti/cc3501e_hw_ti.c) is
- * the only non-trivial implementation. */
-void cc3501e_hw_link_tick(void);
+/* #142: the SPI link self-heals (dead-handle reopen, resync-burst, arm-fail,
+ * reply-stall reinit, and the quiet-armed detector) as ONE function.  Called
+ * from cc3501e_hw_tick() with @p in_connect_wait = false (the idle-tick
+ * path: runs the first four, evidence-based heals; never evaluates the
+ * quiet-armed detector, so an ordinarily-idle host/console session can never
+ * trip it), and from INSIDE cc3501e_hw_wifi_connect_sta()'s own wait points
+ * with @p in_connect_wait = true (the only path that evaluates the
+ * quiet-armed detector too) -- see that function's own call sites (hal/ti/
+ * cc3501e_hw_ti_wifi.c) for exactly which windows and why each is safe.
+ *
+ * A background task calling this independently of both those call sites was
+ * tried and REJECTED (host review of b3dc1e2) -- see src/link_quiet_rearm.h's
+ * top comment for the full writeup of what that broke.  No-op on the stub
+ * backend (no real SPI slave to heal). */
+void cc3501e_hw_link_heal(bool in_connect_wait);
 
-/* Diagnostic counter: quiet-rearm heals fired by cc3501e_hw_link_tick() since
- * boot (#142 item 2).  0 on the stub backend.  See that counter's own
- * comment in hal/ti/cc3501e_hw_ti.c for why it is not (yet) on the wire. */
+/* Diagnostic counter: quiet-rearm heals fired by cc3501e_hw_link_heal() since
+ * boot (#142).  0 on the stub backend.  See that counter's own comment in
+ * hal/ti/cc3501e_hw_ti.c for why it is not (yet) on the wire. */
 uint32_t cc3501e_hw_link_quiet_rearm_count(void);
 
 /* Bring the radio up ONCE at boot (radio<->SPI coexistence fix).

@@ -371,34 +371,6 @@ grep -q 'bss[.]sock_ring' "$localCmd" || {
     exit 4
 }
 
-# 3b. .bss.link_stack -> TCM (#142).  Same DRAM-is-full reasoning as #3 just
-#     above, ported the same way (a SECOND GROUP inserted before the SAME
-#     catch-all anchor, so both land in TCM ahead of it) -- see src/main.c's
-#     link_stack for the full sizing story.  DRAM_NON_SECURE had only ~431 B
-#     spare (the comment on #3 above cites this from the SAME shortage); the
-#     link-healer task's stack alone needs several times that, and left in
-#     DRAM it starved EVERY stack size tried, from 512 words down to 80,
-#     before this patch existed.
-python3 - "$localCmd" <<'PYLINKSTACK'
-import io, sys
-p = sys.argv[1]
-anchor = ("/* Move entire BSS section (including COMMON symbols) to DRAM"
-          " to save TCM space */")
-block = ("    /* Alp #142: link-healer task stack in TCM (DRAM is full, same"
-         " as sock_ring above). */\n"
-         "    GROUP {\n"
-         "        .bss.link_stack: {} palign(8)\n"
-         "    } > TCM_DRAM_NON_SECURE\n\n")
-t = io.open(p, encoding="utf-8", newline="").read()
-if ".bss.link_stack" not in t and anchor in t:
-    io.open(p, "w", encoding="utf-8", newline="").write(t.replace(anchor, block + anchor, 1))
-PYLINKSTACK
-grep -q 'bss[.]link_stack' "$localCmd" || {
-    echo "build_ti.sh: link-healer stack TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
-    echo "  The stack would fall back to the FULL DRAM bank and the link would overflow (#142)."
-    exit 4
-}
-
 # 4. .TI.noinit -> DRAM_NON_SECURE.  Without a rule the TI linker assigns it by
 #    DEFAULT rules -- first fitting range, FLASH_INT_VEC (RWX) at 0x14000000 --
 #    so the update-mode boot flag (transport_hw_ti_spi.c's g_persist) lands in
