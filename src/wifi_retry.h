@@ -88,7 +88,7 @@ uint32_t wifi_retry_delay_ms(wifi_retry_event_t event,
  *     comeback-time IE (a real AP rejection, unconditionally re-deauthed);
  *     and (d) sme_event_disassoc() (sme.c:2322) calling
  *     wpa_drv_deauthenticate(..., WLAN_REASON_DEAUTH_LEAVING) directly on a
- *     stray disassociation.  (b)-(d) all reach ti_drv_deauthenticate()'s
+ *     stray disassociation.  (b)-(d) all reach ti_driver_deauthenticate()'s
  *     `pDrv->deauthReason = aReasonCode` (drv_ti_sta_specific.c:400) with
  *     WLAN_REASON_DEAUTH_LEAVING.  An auth/assoc timeout that instead lands
  *     via sme_event_auth_timed_out/sme_event_assoc_timed_out
@@ -134,7 +134,7 @@ bool wifi_retry_should_restore_first_pass(int16_t retry_pass_reason);
  * resolves (when the STA state machine is not already idle) through
  * CmeStationDisconnectKick() -> cmeWlanDisconnect(WLAN_REASON_DEAUTH_LEAVING)
  * (cc3501e-bridge-firmware vendor trace: cme_station_flow.c:525-548) into
- * ti_drv_deauthenticate()'s `pDrv->deauthReason = aReasonCode`
+ * ti_driver_deauthenticate()'s `pDrv->deauthReason = aReasonCode`
  * (drv_ti_sta_specific.c:400) -- unconditionally 3, with NO per-attempt
  * reset.  A SUBSEQUENT connect attempt that fails through a path which never
  * itself writes a fresh deauthReason then republishes that stale 3 as if it
