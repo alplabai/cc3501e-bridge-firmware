@@ -108,6 +108,7 @@ set(CC3501E_BRIDGE_SOURCES
     src/sock_recv_commit.c
     src/transport_spi.c
     src/transport_sdio.c
+    src/wifi_retry.c
 )
 
 if(CC3501E_HAL_BACKEND STREQUAL "stub")
