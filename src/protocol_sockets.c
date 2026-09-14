@@ -197,39 +197,66 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * execution produced is the correct, final answer for every later poll of
  * it.
  *
- * CAPPED WELL BELOW the worker's own reply buffer (job.result / worker.c's
- * local buf[], both ALP_CC3501E_MAX_PAYLOAD = 4096 B): a first attempt sized
- * this cache to match that 4096 B ceiling and LINK-FAILED the real
- * `--wifi --ble` production image ("program will not fit into available
- * memory" -- tiarmlnk, GROUP_4 needed 0x2487 B where only a 0x16cb B hole
- * remained) -- the WiFi+BLE stacks already consume most of DRAM_NON_SECURE,
- * so a second MAX_PAYLOAD-sized static buffer alongside worker.c's existing
- * one does not fit.  CC3501E_SOCK_RECV_WK_CACHE_CAP below (256 B) is the
- * chosen middle ground: it covers a typical UDP datagram or a brief
- * STREAM-accepted-but-unarmed read -- the actual traffic this FALLBACK path
- * serves; the ring fast path above is what carries bulk STREAM transfer
- * once a socket is armed for prefetch, and that path is unaffected by this
- * cap.  RAM COST: 256 B (g_sock_recv_wk_reply) + 6 B (seq/handle/status/len)
- * + 1 B (g_sock_recv_job_seq) = ~263 B static, still far larger than
- * SOCK_SEND's 2-byte cache because a recv reply carries the received DATA,
- * not a small fixed count, but small enough to fit alongside the WiFi+BLE
- * stacks.  Single most-recent entry only, the same tradeoff the SOCK_SEND
- * cache already makes (see its own block comment).
+ * SIZED TO THE WIRE'S OWN CEILING, NO EXEMPTION: the cap is
+ * CC3501E_REPLY_DATA_MAX (protocol.h's "Maximum reply DATA bytes a handler
+ * may emit" -- ALP_CC3501E_MAX_PAYLOAD - 1 - ALP_CC3501E_CRC_BYTES = 4093 B
+ * under the default CC3501E_WIRE_CRC=ON, 4095 B under =OFF), not
+ * ALP_CC3501E_MAX_PAYLOAD: that constant IS the actual bound
+ * protocol_build_reply() enforces on every handler's reply_cap, so it is what
+ * "the reply buffer size, whichever actually bounds it" resolves to here --
+ * ALP_CC3501E_MAX_PAYLOAD alone overstates it by 1 + ALP_CC3501E_CRC_BYTES,
+ * bytes no handler's DATA can ever actually occupy.  A first attempt capped
+ * this at 256 B and MISSED THE ACTUAL BUG: the exact run10 loss shape is an
+ * ACCEPTED TCP socket read at ~4071 B per cc3501e_sock_recv() call -- ABOVE
+ * that smaller cap -- so the 256 B version left the bulk case, the one the
+ * bug report is about, uncached and still losing a block on a CRC-rejected
+ * reply.  There is no "typical UDP datagram" traffic pattern narrow enough to
+ * justify a partial cap here; this path has to cover the same range of reply
+ * sizes the ring fast path does.
  *
- * A REPLY LARGER THAN THE CAP IS NOT CACHED -- mirrors protocol.c's generic
- * retry_latch_store()'s own "too big to cache, do not store" exemption
- * (s_retry_latch.data[32]) rather than truncating it (which would answer a
- * byte-identical retry with FEWER bytes than the original reply, corrupting
- * it) or growing the buffer to cover every case (the RAM budget above says
- * no).  RESIDUAL: a worker-fallback recv whose OWN reply exceeds the cap and
- * is then CRC-rejected on the wire has no cached copy to re-serve, so a
- * same-seq+handle retry falls through to a genuine re-recv -- the ORIGINAL
- * KNOWN FOLLOW-UP data-loss hole, narrowed to "replies over 256 B on this
- * fallback path" rather than closed for every size.  UDP datagrams over the
- * cap and STREAM sockets that stay unarmed long enough to receive a large
- * chunk through this path both keep the residual; the ring fast path (this
- * function's fast-path block above) is unaffected and remains fully fixed
- * at any size.
+ * PRE-EXISTING, SEPARATE, OUT OF SCOPE HERE: worker.c's own SOCK_RECV
+ * data_cap (ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1) predates the wire
+ * MAJOR 4 CRC-trailer tax (#2035) and was never adjusted for it, so under
+ * CC3501E_WIRE_CRC=ON it can compute a reply up to 2 B LARGER than
+ * CC3501E_REPLY_DATA_MAX actually allows (24 + 4071 = 4095 vs the 4093 B
+ * ceiling) -- worker_poll()'s existing out_cap clamp already silently
+ * truncates that 2 B overrun on an ordinary (non-cached) collect, so this is
+ * not a new hazard this change introduces.  This cache's own defensive guard
+ * below (`len > sizeof(g_sock_recv_wk_reply)`) means that one narrow
+ * boundary size -- a SOCK_RECV that fills worker.c's data_cap to its exact
+ * (already slightly oversized) limit -- is correctly NOT cached rather than
+ * stored at the wrong length, so a same-key retry of THAT one exact size
+ * falls back to a genuine re-recv (the pre-fix exposure, for that boundary
+ * size only).  Fixing worker.c's own data_cap arithmetic to account for the
+ * CRC tax is a separate change, not part of this replay-cache fix.
+ *
+ * RAM: a MAX_PAYLOAD-sized second buffer does not fit in DRAM_NON_SECURE
+ * alongside the WiFi+BLE stacks -- measured: the real `--wifi --ble`
+ * production image link-FAILS with it left in ordinary .bss ("program will
+ * not fit into available memory" -- tiarmlnk, GROUP_4 needed 0x2487 B where
+ * only a 0x16cb B hole remained).  hal/ti/cc3501e_hw_ti_sock.c's own 64 KB
+ * rx_ring solves the identical problem the identical way: g_sock_recv_wk_reply
+ * below carries the SAME `.bss.sock_ring` section attribute that ring uses,
+ * which ti/build_ti.sh's (and build_ti.ps1's) linker-script patch places into
+ * TCM_DRAM_NON_SECURE ahead of the generic `.bss` catch-all -- TCM is safe
+ * here for the identical reason it is safe for the ring: this buffer is
+ * CPU-only memory (the worker's memcpy in, this handler's memcpy out), no DMA
+ * engine ever addresses it.  The GROUP rule matches by INPUT SECTION NAME, not
+ * by source file, so this array's own `.bss.sock_ring` input section joins the
+ * ring's in the same output section with no script change needed -- verified
+ * in cc3501e-bridge.map (both symbols resolve at 0x200xxxxx, TCM_DRAM_NON_SECURE,
+ * not the 0x28xxxxxx DRAM_NON_SECURE bank the earlier 256 B version used).
+ * The three small scalars below (seq/handle/status/len) stay in ordinary
+ * static storage -- a few bytes, no different from any other file-scope
+ * static in this TU, nothing forces them into TCM too.
+ *
+ * RAM COST: 4093 B (g_sock_recv_wk_reply, in TCM; 4095 B under
+ * CC3501E_WIRE_CRC=OFF) + 6 B (seq/handle/status/len, ordinary .bss) + 1 B
+ * (g_sock_recv_job_seq, ordinary .bss) -- still far larger than SOCK_SEND's
+ * 2-byte cache because a recv reply carries the received DATA, not a small
+ * fixed count, but it lives where the ring already proved 15x that much fits.
+ * Single most-recent entry only, the same tradeoff the SOCK_SEND cache
+ * already makes (see its own block comment).
  *
  * INVALIDATED ON A DIFFERENT SEQ, A DIFFERENT HANDLE, OR EITHER
  * HANDLE-OWNING OPCODE: handle_sock_recv() below drops a mismatched entry
@@ -248,18 +275,22 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
  * sock_recv_commit.h's RESIDUAL 1/2 for the host-side fix (a dedicated
  * SOCK_RECV seq counter) that removes this by construction; this
  * firmware-side cache cannot close it alone, for the identical reason the
- * ring fast path cannot. */
-/* See the cache block comment above for why this is 256, not
- * ALP_CC3501E_MAX_PAYLOAD: a full-size cache measurably does not fit
- * alongside the WiFi+BLE stacks in the real `--wifi --ble` production link. */
-#define CC3501E_SOCK_RECV_WK_CACHE_CAP 256u
+ * ring fast path cannot.  Unlike the withdrawn 256 B attempt, there is no
+ * separate SIZE-based residual for any reply within the wire's own ceiling --
+ * only the pre-existing worker.c boundary case documented above, at exactly
+ * one size, 2 B past that ceiling. */
+#define CC3501E_SOCK_RECV_WK_CACHE_CAP CC3501E_REPLY_DATA_MAX
 
 static volatile bool               g_sock_recv_wk_cached;
 static volatile uint8_t            g_sock_recv_wk_seq;
 static volatile uint16_t           g_sock_recv_wk_handle;
 static volatile alp_cc3501e_resp_t g_sock_recv_wk_status;
 static volatile uint16_t           g_sock_recv_wk_reply_len;
-static volatile uint8_t            g_sock_recv_wk_reply[CC3501E_SOCK_RECV_WK_CACHE_CAP];
+/* .bss.sock_ring: TCM placement (see the block comment above) -- ONLY the
+ * byte buffer needs it, so only this one array carries the attribute; the
+ * scalars above stay in ordinary static storage. */
+static volatile uint8_t g_sock_recv_wk_reply[CC3501E_SOCK_RECV_WK_CACHE_CAP]
+    __attribute__((section(".bss.sock_ring")));
 
 /* WRITTEN ONLY from protocol.c's WORKER_IDLE submit edge (SPI-ISR/dispatch
  * context); READ from worker.c's worker_execute() at completion, which on
@@ -284,15 +315,15 @@ void protocol_sock_recv_on_worker_complete(uint16_t       handle,
                                            size_t         len)
 {
 	if (hw_rv == CC3501E_HW_OK && len > sizeof(g_sock_recv_wk_reply)) {
-		/* TOO BIG TO CACHE (see the cache block's own comment on this
-		 * exemption): invalidate rather than leave stale, so a later
-		 * same-key poll correctly MISSES and re-executes instead of being
-		 * served a PREVIOUS, unrelated cache entry that happens to still be
-		 * marked valid -- returning here without doing this left
-		 * g_sock_recv_wk_cached at whatever it was before (possibly true,
-		 * from an earlier, smaller cached recv), which a same-seq+handle
-		 * retry of THIS oversized recv would then have matched against that
-		 * stale, unrelated reply. */
+		/* Not a "typical size" exemption -- the cache block's own sizing
+		 * comment covers the one PRE-EXISTING boundary size this can actually
+		 * trigger for (CC3501E_WIRE_CRC=ON, worker.c's SOCK_RECV data_cap
+		 * filled to its own exact, 2-B-too-generous limit).  Invalidate
+		 * rather than memcpy out of bounds or leave a stale cache entry
+		 * marked valid for a reply that was never actually stored -- a
+		 * same-key retry of that one exact size falls back to a genuine
+		 * re-recv, same as before this fix, rather than being served garbage
+		 * or a wrong-length answer. */
 		g_sock_recv_wk_cached = false;
 		return;
 	}

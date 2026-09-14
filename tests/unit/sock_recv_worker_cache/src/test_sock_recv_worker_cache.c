@@ -33,7 +33,14 @@
  *   - a DIFFERENT handle (same seq) submits a new recv instead of replaying;
  *   - seq 0 never replays, even against its own immediately-preceding call;
  *   - SOCK_CLOSE on the cached handle invalidates the cache, so the next
- *     recv on that same handle number submits fresh.
+ *     recv on that same handle number submits fresh;
+ *   - a MAX-SIZE reply (the ACTUAL bug shape: an accepted TCP socket read
+ *     reporting the full worker.c data_cap, ~4071 B -- the exact run10 loss
+ *     size, well above a withdrawn 256 B cap that shipped in an earlier,
+ *     incorrect version of this fix and left this exact case uncached) is
+ *     retained and re-served byte-for-byte identical, proving the cache is
+ *     sized for the largest reply this path can ever produce, not a
+ *     "typical small" case.
  *
  * Every assertion below compares g_wrap_calls against a BASELINE captured at
  * the START of the test (not an absolute count) -- reset_worker() (the
@@ -43,6 +50,7 @@
  * no other test in this file reuses, so a leftover cache entry from a
  * previous test can never coincidentally match. */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <zephyr/ztest.h>
@@ -56,12 +64,34 @@
 
 /* Redirects every cc3501e_hw_sock_recv() call the firmware makes (worker.c's
  * ALP_CC3501E_CMD_SOCK_RECV case) to here (`-Wl,--wrap=cc3501e_hw_sock_recv`,
- * tests/unit/CMakeLists.txt) -- a real socket stack's ordinary success:
- * one fixed, recognisable byte is always "received".  The original stub
- * definition (hal/cc3501e_hw_stub.c) is still linked, renamed to
- * __real_cc3501e_hw_sock_recv by the same wrap, but nothing here calls it --
- * this suite exists specifically to NOT get NOTIMPL. */
+ * tests/unit/CMakeLists.txt) -- a real socket stack's ordinary success.  The
+ * original stub definition (hal/cc3501e_hw_stub.c) is still linked, renamed
+ * to __real_cc3501e_hw_sock_recv by the same wrap, but nothing here calls it
+ * -- this suite exists specifically to NOT get NOTIMPL.
+ *
+ * Two modes, selected by g_wrap_large_mode:
+ *   - default (false): one fixed, recognisable byte (0x42) -- what every
+ *     small-reply case below needs.
+ *   - true: fills up to BIG_RECV_DATA_LEN bytes (below) of an incrementing
+ *     0..255 pattern and reports that many received.  BIG_RECV_DATA_LEN is
+ *     the wire's own true ceiling (protocol.h's CC3501E_REPLY_DATA_MAX) minus
+ *     the recv-resp header -- the actual largest reply
+ *     protocol_build_reply()'s reply_cap can ever carry for THIS opcode, not
+ *     worker.c's own internal data_cap constant (which -- see
+ *     protocol_sockets.c's cache block comment -- is 2 B more generous than
+ *     that ceiling under CC3501E_WIRE_CRC=ON, a separate, pre-existing gap
+ *     this suite does not exercise).  This is still the actual run10 bug
+ *     shape: an ACCEPTED TCP socket read reporting a reply at the wire's real
+ *     maximum, far above the withdrawn 256 B cap. */
 static uint32_t g_wrap_calls;
+static bool     g_wrap_large_mode;
+static uint16_t g_wrap_large_n; /* bytes reported by the last large-mode call */
+
+/* protocol.h's CC3501E_REPLY_DATA_MAX is the wire's own documented ceiling on
+ * a handler's total reply DATA (status byte's payload); the recv-resp header
+ * always precedes the received bytes, so this is the most data a worker-
+ * fallback SOCK_RECV reply can actually carry on the wire. */
+#define BIG_RECV_DATA_LEN (CC3501E_REPLY_DATA_MAX - (uint16_t)sizeof(alp_cc3501e_sock_recv_resp_t))
 
 int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
                                 uint16_t  max_len,
@@ -74,8 +104,17 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
 	(void)handle;
 	(void)max_len;
 	g_wrap_calls++;
-	if (cap > 0u && buf != NULL) buf[0] = 0x42u;
-	if (recv_len_out != NULL) *recv_len_out = (cap > 0u) ? 1u : 0u;
+	if (g_wrap_large_mode) {
+		const uint16_t n = (cap < (uint16_t)BIG_RECV_DATA_LEN) ? cap : (uint16_t)BIG_RECV_DATA_LEN;
+		for (uint16_t i = 0u; i < n; i++) {
+			buf[i] = (uint8_t)(i & 0xFFu);
+		}
+		if (recv_len_out != NULL) *recv_len_out = n;
+		g_wrap_large_n = n;
+	} else {
+		if (cap > 0u && buf != NULL) buf[0] = 0x42u;
+		if (recv_len_out != NULL) *recv_len_out = (cap > 0u) ? 1u : 0u;
+	}
 	if (from_addr != NULL) memset(from_addr, 0, 4u);
 	if (from_port_out != NULL) *from_port_out = 0u;
 	return CC3501E_HW_OK;
@@ -333,9 +372,61 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_sock_close_invalidates_the_cache)
 	              "post-close: the same seq+handle submits fresh, not cached");
 }
 
+/* THE ACTUAL BUG SHAPE (host review of a5881d1): an ACCEPTED TCP socket read
+ * -- STREAM, accepted but not yet armed for prefetch, exactly the fallback
+ * this cache exists for -- reports up to worker.c's own data_cap
+ * (ALP_CC3501E_MAX_PAYLOAD - WK_SOCK_RECV_HDR - 1, ~4071 B), the exact run10
+ * loss size.  A withdrawn version of this fix capped the cache at 256 B and
+ * left exactly this case uncached -- it "fixed" only small UDP-sized
+ * replies, missing the bug's own reproduction shape entirely.  This proves
+ * the cache now covers the FULL range worker.c can ever report, not a
+ * partial one. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_max_size_reply_replayed_byte_identical)
+{
+	static uint8_t reply[CC3501E_FRAME_MAX_BYTES];
+	uint8_t        req[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req, 8u, 700u);
+
+	g_wrap_large_mode = true;
+
+	transaction(req, sizeof req);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls, calls_before + 1u, "the submit ran the HW body once");
+	const uint16_t n = g_wrap_large_n;
+	/* Sanity: this run must actually exceed the withdrawn 256 B cap, or it
+	 * would not have caught that regression. */
+	zassert_true(n > 256u, "the reply must exceed the withdrawn 256 B cap to prove the fix");
+
+	/* Same seq+handle: a cache hit, served byte-identically at FULL size, no
+	 * new HW recv. */
+	transaction(req, sizeof req);
+	size_t got = drain(reply, sizeof reply);
+	zassert_equal(got,
+	              reply_wire(sizeof(alp_cc3501e_sock_recv_resp_t) + (size_t)n),
+	              "cached reply = header + status + resp header + the FULL data_cap bytes");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "same-seq+handle retry served from the cache");
+
+	bool bytes_match = true;
+	for (uint16_t i = 0u; i < n; i++) {
+		const uint8_t got_byte =
+		    reply[5u + (uint32_t)sizeof(alp_cc3501e_sock_recv_resp_t) + (uint32_t)i];
+		if (got_byte != (uint8_t)(i & 0xFFu)) {
+			bytes_match = false;
+			break;
+		}
+	}
+	zassert_true(bytes_match, "every cached data byte matches the original 0..255 pattern exactly");
+	zassert_equal(
+	    g_wrap_calls, calls_before + 1u, "the cache hit did not call cc3501e_hw_sock_recv() again");
+
+	g_wrap_large_mode = false; /* restore the default for every test after this one */
+}
+
 static void reset_worker(void *fixture)
 {
 	(void)fixture;
+	g_wrap_large_mode = false;
 	worker_init();
 }
 
