@@ -69,9 +69,117 @@ appControlBlock app_CB;
 
 #include "../cc3501e_hw.h"
 #include "cc3501e_hw_ti_internal.h" /* cc3501e_hw_wifi_lazy_start (shared with cc3501e_hw_ti_ble.c) */
-#include "transport.h" /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
+#include "transport.h"  /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
+#include "wifi_retry.h" /* wifi_retry_delay_ms / wifi_retry_should_restore_first_pass -- the
+                          * silicon-free retry decisions the reason-30 retry site (further
+                          * down) calls into.  #include'd unconditionally, like
+                          * wifi_last_reason_tag just below: wifi_retry_event_t has no TI-SDK
+                          * dependency, so this compiles in both ti sub-builds. */
+
+/* RUN12 MECHANISM (referenced by name from every other site in this file that
+ * touches a reason/event pair -- this is the one place it is explained in
+ * full).
+ *
+ * Last 802.11 reason/status code the cb actually saw, PAIRED with WHICH
+ * vendor event recorded it -- see the accessor cc3501e_hw_wifi_last_reason()
+ * (both build variants, further down) for the reason half's external
+ * contract, and wifi_retry.h's own comment on wifi_retry_event_t for the
+ * event half's.  The two used to be separate statics (wifi_last_reason +
+ * wifi_last_reason_event), each written and read independently -- RUN12
+ * replaces them with ONE `volatile uint32_t`, bits[31:16] the event tag,
+ * bits[15:0] the reason's raw bit pattern, because separate statics are not
+ * actually a matched pair under concurrent access: wifi_event_cb() runs on
+ * the vendor event-callback thread, which SDK config sets to PRIORITY 8
+ * (control_cmd_fw.h:52), strictly above the worker thread's PRIORITY 6 that
+ * runs cc3501e_hw_wifi_connect_sta() -- the higher-priority cb thread can
+ * preempt the worker BETWEEN two separate loads (or two separate stores),
+ * so a reader that loads the reason and the event as two instructions could
+ * observe the reason from one vendor event paired with the event tag from a
+ * DIFFERENT, later one.  A single 32-bit store/load is naturally atomic on
+ * this Cortex-M33 (no tearing, aligned word access), so every write below
+ * packs BOTH halves into one store, and every read that needs the pair loads
+ * this word ONCE into a local before decoding either half -- the tag moves
+ * only together with the reason, never one without the other.
+ *
+ * 0 = none recorded (reason 0, event NONE): the boot default, the value on
+ * the stub / silicon-free build (which never sees a real WLAN event), and
+ * what a fresh attempt reads until it records one of its own.
+ *
+ * Declared UNCONDITIONALLY (unlike wifi_sta_role_up and friends, which stay
+ * inside the #ifdef CC3501E_WIFI branch below): the connect-status latch's
+ * cc3501e_hw_wifi_mark_connecting() (itself unconditional, further down, so
+ * both ti sub-builds link) clears it directly, so it must be visible in the
+ * non-Wi-Fi ti build too, not just the real one that writes it from
+ * wifi_event_cb().  wifi_conn_set(), the other reader, stays CC3501E_WIFI-only
+ * -- unlike mark_connecting(), it has no reason to run (or even exist)
+ * without a real connect body to call it, and every one of its call sites is
+ * itself inside that same #ifdef.  wifi_retry_event_t itself has no TI-SDK
+ * dependency either, so none of this costs the non-Wi-Fi build anything. */
+static volatile uint32_t wifi_last_reason_tag;
+
+/* Pack/unpack helpers, guarded (unlike wifi_last_reason_tag itself, just
+ * above): every CALLER of these three -- wifi_event_cb()'s write sites and
+ * cc3501e_hw_wifi_connect_sta()'s retry site -- is itself CC3501E_WIFI-only.
+ * mark_connecting() (unconditional) clears the tag with a bare `= 0` literal
+ * rather than wifi_reason_tag_pack(WIFI_RETRY_EVENT_NONE, 0), so it needs
+ * none of these; leaving them unguarded would just warn as unused in the
+ * non-Wi-Fi ti build.
+ *
+ * Pack (event, reason) into the single word wifi_last_reason_tag holds.  The
+ * (uint16_t) cast on `reason` is the round-trip step: C requires int-to-
+ * unsigned conversion to preserve the bit pattern (mod 2^16), and the
+ * matching (int16_t) cast in wifi_reason_tag_reason() below reverses it --
+ * implementation-defined by the standard, but the identity on every
+ * two's-complement toolchain this firmware targets (ticlang, arm-none-eabi-gcc). */
+#ifdef CC3501E_WIFI
+static inline uint32_t wifi_reason_tag_pack(wifi_retry_event_t event, int16_t reason)
+{
+	return ((uint32_t)(uint16_t)event << 16) | (uint32_t)(uint16_t)reason;
+}
+
+/* Decode the reason half of a tag word already loaded into a local -- callers
+ * must load wifi_last_reason_tag ONCE and pass that local here, not read the
+ * volatile again, or they reintroduce the exact two-separate-loads race
+ * RUN12 exists to close. */
+static inline int16_t wifi_reason_tag_reason(uint32_t tag)
+{
+	return (int16_t)(tag & 0xFFFFu);
+}
+
+/* Decode the event half -- same one-load-then-decode contract as
+ * wifi_reason_tag_reason() above. */
+static inline wifi_retry_event_t wifi_reason_tag_event(uint32_t tag)
+{
+	return (wifi_retry_event_t)(tag >> 16);
+}
+#endif /* CC3501E_WIFI */
+
+/* Is a connect attempt currently OPEN -- mark_connecting() has run and the
+ * terminal wifi_conn_set() has not (yet) published CONNECTED/CONN_FAILED/
+ * DISCONNECTED?  Forward-declared here so wifi_event_cb() (right below, well
+ * before g_wifi_conn's own declaration further down) can call it; defined
+ * next to g_wifi_conn, which it reads.
+ *
+ * SAFE TO READ FROM wifi_event_cb()'S CONTEXT (the host-driver thread, a third
+ * context alongside the SPI-ISR/protocol context that calls mark_connecting()
+ * and the worker/task context that calls wifi_conn_set()): g_wifi_conn.state
+ * is a single `volatile uint8_t` -- a one-byte load the compiler always
+ * re-reads from memory (no cached/stale value across the call) and that the
+ * CPU cannot tear, so a concurrent write from either other context can only
+ * make this return the OLD state or the NEW one, never a corrupt in-between
+ * value.  A single stale read (seeing the old state for one more event) is
+ * exactly the race this admits, and is what the "RESIDUAL" note on the
+ * DISCONNECT case below and on g_wifi_conn's own comment describes -- nothing
+ * worse.
+ *
+ * Declared inside the #ifdef CC3501E_WIFI block right below, not here: an
+ * unguarded declaration with no matching call in the non-Wi-Fi ti build warns
+ * as unused there too, not just an unguarded definition, and wifi_event_cb()
+ * (its only caller) is itself inside that same block. */
 
 #ifdef CC3501E_WIFI
+static bool wifi_conn_is_connecting(void);
+
 /* --------------------------------------------------------------- *
  * Lazy Wi-Fi bring-up (P0-6) -- the CC35xx host stack is started ONCE,    *
  * on first use, from the async worker's drain (NOT the SPI ISR).  Per     *
@@ -140,6 +248,64 @@ static WlanNetworkEntry_t wifi_scan_cache[WIFI_SCAN_CACHE_MAX];
 static volatile uint32_t wifi_cb_event_count;
 static volatile uint32_t wifi_cb_last_id;
 
+/* RUN10/RUN11 OBSERVABILITY (why there is no first-pass-wake-event static
+ * here): a bench operator has no direct way to read back, after the fact,
+ * whether cc3501e_hw_wifi_connect_sta()'s bounded retry fired for a given
+ * connect call.  wifi_cb_last_id above cannot serve that purpose -- by the
+ * time a connect call returns, the retry's own #1437 cleanup (if it ran) has
+ * already overwritten it with that cleanup's own DISCONNECT, the SAME
+ * contamination that made Run9's "last event id 2" reading inconclusive
+ * (see the ASSOCIATION_REJECTED case's own comment).  A prior version of
+ * this fix added two module-static "SWD-readable" mirrors for this, but on
+ * an ACTIVATED CC3501E there is no SWD path to read them from: issue #21
+ * records OpenOCD reporting "Could not find MEM-AP to control the core" and
+ * AP 1 returning a constant 0x00080025 at every address -- unlike
+ * wifi_cb_last_id, which IS observable, but only because it goes out over
+ * the wire in GET_DIAG_INFO, not via SWD.  Removed as write-only dead state
+ * rather than kept as statics nothing can read.
+ *
+ * The retry IS observable today, just indirectly, through connect timing:
+ * since RUN12 (see wifi_last_reason_tag's own declaration comment, top of
+ * file, and wifi_retry_delay_ms()'s comment) a retried connect attempt no
+ * longer pays the SAME delay for every shape (RUN11's compromise; see
+ * CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS's own comment for why that compromise
+ * existed and what closes it here).  For a comeback-IE shape the total is
+ * roughly 8-12 s end to end: the first pass's ~4-5 s (bench-measured, see
+ * RUN9/RUN10's own timing notes) plus up to CC3501E_WIFI_RETRY_DISCONNECT_
+ * WAIT_MS(2 s) plus CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS(1 s) plus the
+ * retry's own association -- NOT the 1-2 s an earlier version of this
+ * comment claimed, which counted only the fixed delays and left out the
+ * two association attempts themselves.  For a deny-list (auth, or any
+ * other) shape, run11's bench (the always-11 s-delay predecessor of this
+ * mechanism) measured 19.6-34.5 s for its 12 successes -- RUN12 changes
+ * WHICH events get which delay, not the deny-list delay itself, so that
+ * shape's total is expected to land in the same range, not yet re-measured
+ * under RUN12 specifically.  Those 19.6-34.5 s totals are END-TO-END
+ * connect-call time, NOT the association phase alone: they also include
+ * role-up (bounded 10 s, CC3501E_WIFI_ROLE_TIMEOUT_MS) and the DHCP lease
+ * poll (bounded 20 s, CC3501E_STA_DHCP_TRIES * CC3501E_STA_DHCP_POLL_US)
+ * that follow a successful association.  What IS capped at 30 s from the
+ * first Wlan_Connect is the association phase itself (first attempt + this
+ * retry's own overhead + its own wait), enforced directly by the retry's
+ * own deadline-arithmetic check -- not the whole connect call, which these
+ * bench totals measure. A
+ * wire field carrying the first-pass wake event id directly (GET_DIAG_INFO's
+ * 18-byte reply and CMD_WIFI_STATUS's alp_cc3501e_wifi_status_t are BOTH
+ * already fully packed, protocol_diag.c / protocol_wifi.c) stays a
+ * documented follow-up, not done here since it needs an actual wire-format
+ * change (a new opcode field or a version bump), out of scope for this fix. */
+
+/* IEEE 802.11 status code wifi_event_cb() acts on below (ASSOCIATION_REJECTED
+ * temporary-reject handling -- see that case; status 17,
+ * AP_UNABLE_TO_HANDLE_NEW_STA, gets no vendor retry and stays terminal, so it
+ * is discussed there by numeric value only, not given its own define here).
+ * Named locally rather than #include'd: the canonical definition is hostap's
+ * ieee802_11_defs.h (source/third_party/hostap/src/common/ieee802_11_defs.h:135),
+ * but hostap ships this SDK as a PREBUILT archive (hostap.a, see
+ * ti/build_ti.sh's link list) with no -I for its src/common, so that header is
+ * not on this TU's include path. */
+#define CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY 30u /* ieee802_11_defs.h:135 */
+
 static void wifi_event_cb(WlanEvent_t *event)
 {
 	if (event == NULL) {
@@ -190,15 +356,302 @@ static void wifi_event_cb(WlanEvent_t *event)
 		break;
 	}
 	case WLAN_EVENT_CONNECT:
+		/* WlanEventConnect_t::Status is NOT a general result code with a
+		 * negative-on-failure convention: this SDK's only two writers
+		 * (cme_connection_mng.c ~8025/~8454) set it to
+		 * SL_WLAN_CONNECT_EVENT_STATUS_SUCCESS or _ALREADY_CONNECTED, both
+		 * non-negative -- a failed connect arrives as one of the three events
+		 * below instead, never as a negative CONNECT.Status.  An earlier
+		 * version of this cb stashed Status when negative; that branch never
+		 * fired on this SDK and a truncated int32 would not have decoded to
+		 * anything meaningful anyway, so it was removed rather than kept as
+		 * dead code. */
 		wifi_last_status = (int)event->Data.Connect.Status;
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	case WLAN_EVENT_DISCONNECT:
-	case WLAN_EVENT_ASSOCIATION_REJECTED:
-	case WLAN_EVENT_AUTHENTICATION_REJECTED:
-		/* A connect attempt that the FW rejects arrives as one of these
-		 * rather than CONNECT(Status<0); surface it as a failure. */
+		/* A connect attempt that the FW rejects arrives as one of these three
+		 * rather than a negative CONNECT.Status; surface it as a failure. */
 		wifi_last_status = -1;
+		/* Record the reason ONLY while an attempt is OPEN (mark_connecting()
+		 * ran, wifi_conn_set() has not yet published a terminal state -- see
+		 * wifi_conn_is_connecting()'s own comment for the exact contract and
+		 * why reading it here is safe) -- and NEVER record 200
+		 * (WLAN_DISCONNECT_USER_INITIATED): the vendor hardcodes that value
+		 * whenever a disconnect is issued while its OWN station state machine
+		 * happens to be idle (cme.c ~3298/~3335), and it was never a real
+		 * 802.11 reason regardless of who caused it.
+		 *
+		 * This replaces an earlier firmware-owned "we asked for this
+		 * disconnect" flag (wifi_own_disconnect_pending) that tried to track
+		 * our own Wlan_Disconnect() calls directly.  That flag had real gaps:
+		 * cc3501e_hw_wifi_disconnect() could return an error WITHOUT clearing
+		 * it (the vendor returns an error and emits NO event with no STA/P2P
+		 * role up, cme.c ~1645-1654, or when its pending-op check rejects the
+		 * call, wlan_if.c ~191-200/~1324-1329; a role switch can also return
+		 * OK with NO event, cme.c ~1667-1672) -- any of those left the flag
+		 * armed to wrongly swallow a LATER, unrelated event's reason.  A
+		 * vendor-generated event unrelated to our own disconnect (e.g.
+		 * AUTHENTICATION_REJECTED's underlying WPA_SUPP_DISCONNECTED,
+		 * drv_ti_mlme.c ~1177) could also consume it.  Gating on OUR OWN
+		 * connecting-state latch instead needs no bookkeeping that a vendor
+		 * error path can leave stuck.
+		 *
+		 * RESIDUAL, stated plainly (this is an observability byte, not a
+		 * safety one): mark_connecting() clears wifi_last_reason_tag at SUBMIT
+		 * (SPI-ISR/protocol context), and cc3501e_hw_wifi_connect_sta() clears
+		 * it AGAIN right before Wlan_Connect (see there) -- but that second
+		 * reset is still not the same instant the vendor actually begins
+		 * processing the new connect.  A late event from the PREVIOUS attempt
+		 * (still in flight on this host-driver thread -- e.g. a disconnect WE
+		 * issued while actually connected or mid-association, host
+		 * WIFI_DISCONNECT or the #1437 cleanup, whose vendor DISCONNECT
+		 * carries REASON 3 / WLAN_REASON_DEAUTH_LEAVING, a REAL 802.11 code,
+		 * not 200) landing in that tiny remaining window can still be recorded
+		 * against the NEW attempt.  Not scoped to reason 3 specifically any
+		 * more (that was the wider pre-second-reset window's shape) -- ANY
+		 * late event from the prior attempt that lands there is recorded as
+		 * if it belonged to the new one.  See hal/cc3501e_hw.h's
+		 * cc3501e_hw_wifi_last_reason() contract, which states this plainly
+		 * for the host too.
+		 *
+		 * FIRST REAL CODE WINS: only write when the tag's reason half is still
+		 * 0 (nothing recorded for this attempt).  Needed because
+		 * ASSOCIATION_REJECTED's non-terminal handling (see that case) lets a
+		 * genuine rejection -- status 30 -- sit recorded while the vendor's own
+		 * comeback retry runs; a retry sequence that ultimately fails ends in
+		 * exactly THIS event, with a generic, self-inflicted reason (3,
+		 * WLAN_REASON_DEAUTH_LEAVING, from hostap's own give-up path,
+		 * sme_deauth() at sme.c ~2228-2245) that carries far less information
+		 * than the 30 already recorded.  Without this guard, that generic 3
+		 * would silently replace the real rejection reason right as the
+		 * attempt goes terminal, which is the one moment a host is guaranteed
+		 * to actually read this byte.  Does NOT change the residual above:
+		 * that scenario also starts from a freshly-reset tag (a fresh
+		 * attempt's own reset), so it still writes exactly as documented.
+		 * Does NOT apply to ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED
+		 * themselves -- each of those is always itself a specific, real status
+		 * worth recording, so a second one differing from a first (however
+		 * that happened) is not the same "generic close-out overwrites a real
+		 * reason" problem this guard exists for. */
+		if (wifi_conn_is_connecting() && wifi_reason_tag_reason(wifi_last_reason_tag) == 0 &&
+		    event->Data.Disconnect.ReasonCode != (int16_t)WLAN_DISCONNECT_USER_INITIATED) {
+			wifi_last_reason_tag = wifi_reason_tag_pack(WIFI_RETRY_EVENT_DISCONNECT,
+			                                            event->Data.Disconnect.ReasonCode);
+		}
+		osi_SyncObjSignal(&wifi_event_sync);
+		break;
+	case WLAN_EVENT_ASSOCIATION_REJECTED: {
+		/* AssocStatusCode is a real 802.11 status code (driver/drv_ti/
+		 * drv_ti_mlme.c ~1287, wlanDispatcherSendEvent(..., sizeof(uint16_t))
+		 * off apMngPack->u.assoc_resp.status_code) -- worth the same low-byte
+		 * publication a DISCONNECT's ReasonCode gets.  Same CONNECTING-only
+		 * gate as DISCONNECT above. */
+		const uint16_t status = event->Data.AssocStatusCode;
+
+		/* BENCH (Run8, e1m-aen-evk-01, GPE 0.254.8.0, alp-console connect-first
+		 * WPA3, cold power cycle ~1.5 min apart): the connect result strictly
+		 * ALTERNATED pass/fail across consecutive boots (P1: A R A R A R T A R
+		 * A R A; P3 scan-first: A R A R).  Every rejection printed
+		 * `fail: 2` (REJECTED) with WIFI_STATUS last_reason 30
+		 * (CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY) after ~4-6 s, last
+		 * vendor event WLAN_EVENT_DISCONNECT.  INFERENCE (not proven by the
+		 * SDK source, only by the alternating pattern): WPA3 requires PMF, and
+		 * a cold power cycle with no deauth leaves the AP still holding the
+		 * PREVIOUS boot's security association, so it rejects temporarily
+		 * with an Association Comeback Time; the NEXT boot then finds that SA
+		 * expired and succeeds -- hence the strict alternation.
+		 *
+		 * THE ACTUAL BUG this fix closes does not depend on that inference:
+		 * on status 30 WITH a comeback-time IE (WLAN_TIMEOUT_ASSOC_COMEBACK),
+		 * the vendor driver ITSELF already retries the association --
+		 * ti_drv_rxAssocRespPacket() (drv_ti_mlme.c ~1291-1345) registers
+		 * ti_drv_AssocTimeout via eloop_register_timeout(), armed for the AP's
+		 * own comeback duration -- and, on firing, ti_drv_AssocTimeout()
+		 * (drv_ti_sta_specific.c ~708-733) re-sends the association request
+		 * (ti_drv_txAssocReqPacket()) for up to ASSOC_MAX_TRIES(3) attempts
+		 * total (the initial try2associate() plus 2 internal driver resends)
+		 * before giving up and reporting EVENT_ASSOC_TIMED_OUT to the
+		 * supplicant.  Before this fix, THIS cb treated the FIRST rejection
+		 * as terminal -- set wifi_last_status=-1 and signalled -- so
+		 * cc3501e_hw_wifi_connect_sta() published FAILED/REJECTED immediately
+		 * and ran wifi_clear_stale_assoc() -> Wlan_Disconnect(), aborting the
+		 * vendor's own in-flight comeback retry out from under it -- exactly
+		 * the alternating pass/fail pattern the bench recorded, independent
+		 * of whether the PMF/stale-SA inference above is the right
+		 * explanation for WHY the AP rejects.
+		 *
+		 * STATUS 17 (AP_UNABLE_TO_HANDLE_NEW_STA) IS NOT THE SAME SHAPE AND
+		 * STAYS TERMINAL, per drv_ti_mlme.c:71,1325-1343: it cancels any
+		 * pending ti_drv_AssocTimeout, then registers a NEW one only
+		 * `if (ASSOC_TIMEOUT_MSECS < msecs)` with ASSOC_TIMEOUT_MSECS==200 and
+		 * msecs==200 hardcoded right above it -- `200 < 200` is never true, so
+		 * NO retry timer is ever actually armed for 17.  It still returns
+		 * RX_MGMT_NONE (the frame never reaches the supplicant), so treating
+		 * it as non-terminal here would only DELAY the eventual failure by
+		 * however long this cb's caller waits, buying nothing.  Status 30
+		 * WITHOUT the comeback-time IE is the same story by a different route
+		 * (drv_ti_mlme.c ~1293-1295's `if` requires the IE; skipping it falls
+		 * through to destroyAssocData() and a real RX_MGMT_ASSOC return) --
+		 * ends terminally via the supplicant, no driver-level retry at all.
+		 *
+		 * THE REAL RETRY BOUND, traced beyond the driver: this SDK sets
+		 * WPA_DRIVER_FLAGS_SME (driver_ti_wifi.c:3926), so hostap's SME layer
+		 * (not the driver) owns the overall association clock. Starting an
+		 * association arms SME_ASSOC_TIMEOUT (5, i.e. 5 s -- sme.c:35,
+		 * eloop_register_timeout() at sme.c:2192) ONCE, for the FIRST
+		 * association request.  The driver's own comeback retries above
+		 * return RX_MGMT_NONE, so the frame never reaches wpa_supplicant and
+		 * NOTHING re-arms or cancels that 5 s SME timer on the comeback path
+		 * -- sme_assoc_timer() -> sme_deauth() (sme.c:2338-2345) fires 5 s
+		 * after the FIRST association request if nothing terminal happened by
+		 * then, regardless of how many driver-level retries are still
+		 * in-flight.  So the vendor's own retry sequence for a genuine
+		 * comeback (status 30 + IE) runs for AT MOST 5 s total, not up to the
+		 * full ASSOC_MAX_TRIES(3)/comeback-interval math in isolation --
+		 * hostapd's own default comeback time caps at 1000 TU (~1.024 s), so
+		 * in practice retries land at roughly the 1 s and 2 s marks inside
+		 * that 5 s window, comfortably inside it.
+		 *
+		 * FIX: 30 alone is NOT terminal here (17 is excluded -- see above).
+		 * Record the status into the live tag (still gated on
+		 * wifi_conn_is_connecting(), same rule as every other case) so THIS
+		 * pass's reason survives to be read at the retry-eligibility check --
+		 * NOT so a host can observe it mid-retry: CMD_WIFI_STATUS reads
+		 * g_wifi_conn.reason, the FROZEN copy wifi_conn_set() writes only at
+		 * the terminal transition, and that stays whatever it was before this
+		 * attempt (typically 0) for the whole CONNECTING window -- a polling
+		 * host sees nothing new until this attempt actually ends.  Do NOT set
+		 * wifi_last_status or signal here -- the connect body simply keeps waiting
+		 * on its EXISTING osi_SyncObjWait(&wifi_event_sync, 30s) in
+		 * cc3501e_hw_wifi_connect_sta(), for the vendor's own retry to either
+		 * succeed (WLAN_EVENT_CONNECT) or -- within its own ~5 s SME ceiling,
+		 * well inside our 30 s wait -- report a REAL terminal event (a
+		 * DISCONNECT with reason 3, WLAN_REASON_DEAUTH_LEAVING, from
+		 * sme_deauth(); see that case's own comment for how this cb keeps the
+		 * more informative 30 instead of letting that generic 3 overwrite
+		 * it).  Any other rejected status is unaffected and stays terminal.
+		 *
+		 * TIMEOUT BUDGET: unaffected, and now doubly so given the ~5 s real
+		 * ceiling just traced (comfortably inside the pre-existing 30 s
+		 * association wait either way).  This does not add a wait; it only
+		 * stops short-circuiting the association wait BEFORE the vendor's own
+		 * retry (which was already going to run regardless, and was
+		 * previously being aborted mid-flight by our own Wlan_Disconnect())
+		 * gets to finish.  Role-up (bounded 10 s, CC3501E_WIFI_ROLE_TIMEOUT_MS)
+		 * + this 30 s association wait + the DHCP poll's 20 s budget
+		 * (CC3501E_STA_DHCP_TRIES(100) * CC3501E_STA_DHCP_POLL_US(200 ms), see
+		 * below) sums to the SAME 60 s deepest path against the host apps'
+		 * 75000 ms CONNECT timeout budget as before -- no new headroom is
+		 * spent, and 15 s of that budget was already unused margin.
+		 *
+		 * RUN9 UPDATE: this branch is CORRECT per the vendor code traced
+		 * above and stays -- but Run9's bench (GPE 0.254.9.0, e1m-aen-evk-01)
+		 * still showed the SAME alternating pattern with this fix applied,
+		 * every rejection recording reason 30, landing at 3.9-4.2 s -- so
+		 * SOMETHING about this bench's shape of the 30 is not what this `if`
+		 * was written for.  NOT ESTABLISHED which: the bench's own "last
+		 * vendor event id 2" (WLAN_EVENT_DISCONNECT) does NOT prove the
+		 * reject itself arrived as a DISCONNECT -- the failed attempt's own
+		 * #1437 cleanup (wifi_clear_stale_assoc() -> Wlan_Disconnect())
+		 * always fires right after ANY REJECTED outcome and generates its
+		 * own trailing DISCONNECT event, so "last event id 2" reads that way
+		 * regardless of what actually ended the attempt.  Two CANDIDATE
+		 * explanations, both consistent with the bench data, neither
+		 * confirmed: (a) this cb's own comeback-IE branch never fired
+		 * because the AP's rejection frame did not carry
+		 * WLAN_TIMEOUT_ASSOC_COMEBACK -- ASSOCIATION_REJECTED(30) WITHOUT
+		 * the IE skips the `if` above and falls through to
+		 * destroyAssocData() (drv_ti_mlme.c ~1366-1372), ending via a real
+		 * RX_MGMT_ASSOC the supplicant then disassociates on -- landing
+		 * inside 5 s easily; or (b) the reject was actually
+		 * AUTHENTICATION_REJECTED(30) the whole time (see that case below --
+		 * it uses the SAME status constant on a different event, and the
+		 * DISCONNECT case only records a reason when none is recorded yet,
+		 * so either candidate is equally capable of being "the" 30 a host
+		 * reads).  cc3501e_hw_wifi_connect_sta()'s own bounded retry (see
+		 * the "RUN9 BOUNDED RETRY" comment there) is deliberately keyed on
+		 * the RECORDED REASON CODE (30), not on which event carried it, so
+		 * it covers both candidates without needing to prove which one is
+		 * real -- and now (see wifi_retry_delay_ms()'s own comment) it picks
+		 * the delay from the event half of wifi_last_reason_tag, recorded
+		 * right here and in the AUTHENTICATION_REJECTED case below (RUN12
+		 * mechanism, see wifi_last_reason_tag's own declaration comment, top
+		 * of file) -- candidate (a) gets the short comeback delay this case
+		 * records, candidate (b) the long deny-list one that case records
+		 * (see RUN10 UPDATE there for why (b) is the one this bench actually
+		 * hits).
+		 *
+		 * AUTHENTICATION_REJECTED with the SAME statuses is deliberately left
+		 * terminal below, NOT given this treatment: traced in the SDK
+		 * (destroyAuthData(), drv_ti_sta_specific.c ~1112-1124) that the
+		 * driver CANCELS ti_drv_AuthTimeout (eloop_cancel_timeout()) for
+		 * exactly this rejection path (drv_ti_mlme.c ~1183-1191, the
+		 * DENY_LIST_EN branch for 17/30/DENIED_INSUFFICIENT_BANDWIDTH/
+		 * REQUEST_DECLINED) and returns RX_MGMT_NONE -- no retry timer is
+		 * registered (contrast the ASSOC-comeback path's
+		 * eloop_register_timeout() above), and RX_MGMT_NONE means
+		 * wpa_supplicant's own SME layer never even sees the frame, so it has
+		 * no basis to retry either.  Nothing in this SDK resumes an auth
+		 * rejected with 17/30 once the deny-list timer is armed; the
+		 * ASSOC-comeback retry is genuinely a different, unique mechanism, not
+		 * one that also covers AUTH. */
+		if (status == CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY) {
+			if (wifi_conn_is_connecting()) {
+				wifi_last_reason_tag =
+				    wifi_reason_tag_pack(WIFI_RETRY_EVENT_ASSOCIATION_REJECTED, (int16_t)status);
+			}
+			break; /* deliberately NO wifi_last_status write, NO signal --
+			        * this is not terminal; see the comment above.  Status 17
+			        * is NOT included here -- it gets no vendor retry either,
+			        * so treating it as non-terminal would only delay the
+			        * failure; it falls through to the terminal path below. */
+		}
+
+		wifi_last_status = -1;
+		if (wifi_conn_is_connecting()) {
+			wifi_last_reason_tag =
+			    wifi_reason_tag_pack(WIFI_RETRY_EVENT_ASSOCIATION_REJECTED, (int16_t)status);
+		}
+		osi_SyncObjSignal(&wifi_event_sync);
+		break;
+	}
+	case WLAN_EVENT_AUTHENTICATION_REJECTED:
+		wifi_last_status = -1;
+		/* Same as ASSOCIATION_REJECTED above: AuthStatusCode is a real 802.11
+		 * status code (drv_ti_mlme.c ~1177, off apMngPack->u.auth.status_code).
+		 * Kept fully terminal, including for status 17/30 -- see the
+		 * ASSOCIATION_REJECTED case's comment for why nothing in the vendor
+		 * SDK retries an auth rejection the way it retries an association
+		 * rejection.
+		 *
+		 * RUN9/RUN10/RUN11: this is also why cc3501e_hw_wifi_connect_sta()'s
+		 * bounded retry needs a delay MUCH longer than Run9's original ~1.5 s
+		 * one when a reason-30 rejection could be THIS shape -- traced in
+		 * drv_ti_mlme.c:1177 (event dispatch) then :1187 (deny-list add),
+		 * an auth rejection adds the AP's BSSID to OUR OWN station-side
+		 * driver's local deny list for DENY_LIST_DEFAULT_EXPIRY_TIME (10*1000,
+		 * i.e. 10 s, drv_ti_internal.h:370) -- NOT something the AP itself
+		 * does -- and that SAME local list is what filters a still-denied
+		 * BSSID OUT of scan results (driver_osprey_mx_scan.c:734), so
+		 * re-issuing Wlan_Connect before that local entry expires cannot
+		 * find the AP at all, regardless of what the AP itself would have
+		 * done.  RUN10 picked a per-event delay by reading the MOST RECENT
+		 * vendor event back at wake, which was unsound (see
+		 * CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS's own RUN11 comment); RUN11
+		 * then papered over that by making EVERY reason-30 retry pay this
+		 * longer delay regardless of shape.  RUN12 removes that compromise
+		 * instead of keeping it: this records
+		 * WIFI_RETRY_EVENT_AUTHENTICATION_REJECTED right here, packed into
+		 * the same word as the reason two lines down (RUN12 mechanism, see
+		 * wifi_last_reason_tag's own declaration comment, top of file) --
+		 * the retry site (wifi_retry_delay_ms()) can once again pick the
+		 * short comeback delay for the OTHER shape without risking picking
+		 * it for THIS one. */
+		if (wifi_conn_is_connecting()) {
+			wifi_last_reason_tag = wifi_reason_tag_pack(WIFI_RETRY_EVENT_AUTHENTICATION_REJECTED,
+			                                            (int16_t)event->Data.AuthStatusCode);
+		}
 		osi_SyncObjSignal(&wifi_event_sync);
 		break;
 	default:
@@ -271,6 +724,13 @@ uint8_t cc3501e_hw_radio_role(void)
 	if (wifi_ap_role_up) return (uint8_t)ALP_CC3501E_ROLE_WIFI_AP;
 	if (wifi_sta_role_up) return (uint8_t)ALP_CC3501E_ROLE_WIFI_STA;
 	return (uint8_t)ALP_CC3501E_ROLE_OFF;
+}
+
+/* See the contract on the declaration in cc3501e_hw_ti_internal.h -- the direct
+ * STA-specific answer cc3501e_hw_radio_role() cannot give once AP is also up. */
+bool cc3501e_hw_wifi_sta_role_up(void)
+{
+	return wifi_sta_role_up;
 }
 
 /* Defined below; boot_start pre-caches the STA role through it. */
@@ -452,6 +912,13 @@ uint8_t cc3501e_hw_radio_role(void)
 	 * unconditionally, so the non-Wi-Fi ti build must define it too. */
 	return (uint8_t)ALP_CC3501E_ROLE_OFF;
 }
+bool cc3501e_hw_wifi_sta_role_up(void)
+{
+	/* No radio linked in this build -- no STA role can be up.  cc3501e_hw_ti_power.c
+	 * calls this unconditionally (it links against both ti sub-builds), so the
+	 * non-Wi-Fi ti build must define it too. */
+	return false;
+}
 uint32_t cc3501e_hw_wifi_last_event_id(void)
 {
 	/* No radio linked in this build -- no Wi-Fi events to report.  protocol.c's
@@ -524,12 +991,60 @@ int cc3501e_hw_get_mac(uint8_t mac[6])
  * always sets it to 0 because this NWP cannot be asked for a beacon measurement
  * on the connect path (see the hazard note in cc3501e_hw_wifi_connect_sta), so
  * the field has only ever held 0.  The host must NOT treat it as a signal level
- * -- WIFI_GET_RSSI is the real read (issue #1387). */
+ * -- WIFI_GET_RSSI is the real read (issue #1387).
+ *
+ * reason is a FROZEN COPY of the reason half of wifi_last_reason_tag (top of
+ * file), NOT a live mirror.  As of RUN12, wifi_conn_set()'s caller resolves
+ * and passes this value explicitly as its own `reason` argument rather than
+ * wifi_conn_set() re-reading the live tag itself -- see that function's own
+ * comment for why a late vendor event landing between the caller's decision
+ * and the call would otherwise be able to publish an unintended value.
+ * Freezing matters even so: wifi_event_cb() also gates writes to the tag on
+ * wifi_conn_is_connecting(), which protects the tag from being overwritten
+ * AFTER this attempt's terminal transition, right up until the NEXT
+ * mark_connecting() reopens it (and clears the live tag back to 0 -- see
+ * mark_connecting()'s own comment).  Freezing here is what lets a host still
+ * read THIS attempt's reason correctly even after that next
+ * mark_connecting() has already cleared the live tag for the new attempt.
+ *
+ * SCOPE: this byte covers the CONNECT ATTEMPT only -- the reason or status
+ * that ENDED or REJECTED that attempt (a DISCONNECT/REJECTED event that
+ * TERMINATES it, i.e. arrives while state is still CONNECTING).  Once a
+ * connect reaches CONNECTED, wifi_conn_set() has already frozen this field for
+ * that attempt and nothing calls it again for THAT association.  CORRECTED
+ * (this used to claim a post-CONNECTED deauth "updates the LIVE
+ * wifi_last_reason" -- it does not): every wifi_event_cb() case that writes
+ * the tag gates that write on wifi_conn_is_connecting() first, and state is
+ * no longer CONNECTING once a connect has reached CONNECTED, so a
+ * spontaneous, AP-initiated deauth arriving AFTER that point is simply
+ * DROPPED by this cb -- neither the live tag nor
+ * g_wifi_conn.reason/state moves.  This firmware has no background watcher
+ * for a post-connect deauth today: g_wifi_conn.state stays CONNECTED until
+ * something else changes it (a host WIFI_DISCONNECT, or the next
+ * mark_connecting() reopening the gate for a fresh attempt).  That absence of
+ * a watcher is a pre-existing gap in THIS firmware's async-latch design
+ * generally, not specific to this byte, and post-connect tracking is
+ * deliberately out of scope here. */
 static volatile struct {
 	uint8_t state;       /* alp_cc3501e_wifi_conn_state_t   */
 	uint8_t fail_reason; /* alp_cc3501e_wifi_fail_t          */
 	int8_t  rssi;        /* NEVER POPULATED -- always 0      */
-} g_wifi_conn = { (uint8_t)ALP_CC3501E_WIFI_DISCONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0 };
+	int16_t reason;      /* frozen copy of the reason half of wifi_last_reason_tag        */
+} g_wifi_conn = { (uint8_t)ALP_CC3501E_WIFI_DISCONNECTED,
+	              (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE,
+	              0,
+	              0 };
+
+#ifdef CC3501E_WIFI
+/* See the forward declaration + full contract comment above (before
+ * wifi_event_cb()).  Guarded, unlike g_wifi_conn itself: wifi_event_cb(), the
+ * only caller, is CC3501E_WIFI-only too, so an unguarded definition here is
+ * simply unused (and warns as such) in the non-Wi-Fi ti build. */
+static bool wifi_conn_is_connecting(void)
+{
+	return g_wifi_conn.state == (uint8_t)ALP_CC3501E_WIFI_CONNECTING;
+}
+#endif /* CC3501E_WIFI */
 
 /* Handoff to src/worker.c's drain (issue #106, connect flavour): whether THIS
  * run's SUCCESS exit already re-armed the slave itself, and whether that
@@ -580,7 +1095,20 @@ void cc3501e_hw_wifi_mark_connecting(void)
 {
 	g_wifi_conn.fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
 	g_wifi_conn.rssi        = 0;
-	g_wifi_conn.state       = (uint8_t)ALP_CC3501E_WIFI_CONNECTING; /* publish state last */
+	/* Clear the LIVE reason/event tag too, not just the frozen copy below: this
+	 * new attempt's own wifi_event_cb() writes gate on the tag's reason half
+	 * being 0 ("first real code wins", see the DISCONNECT case) and the retry
+	 * site's eligibility check reads it fresh -- both need a clean 0 baseline
+	 * for THIS attempt, not whatever the previous one left behind.  (The
+	 * FROZEN copy, g_wifi_conn.reason below, is a separate concern: every
+	 * terminal caller of wifi_conn_set() now passes its own resolved reason
+	 * explicitly -- RUN12, see that function's own comment -- rather than
+	 * having it re-read the live tag, so clearing the tag here no longer
+	 * protects that freeze the way an earlier version of this comment said;
+	 * it protects the NEXT attempt's own recording instead.) */
+	wifi_last_reason_tag = 0;
+	g_wifi_conn.reason   = 0;
+	g_wifi_conn.state    = (uint8_t)ALP_CC3501E_WIFI_CONNECTING; /* publish state last */
 }
 
 int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rssi_dbm)
@@ -589,6 +1117,20 @@ int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rs
 	if (fail_reason != 0) *fail_reason = g_wifi_conn.fail_reason;
 	if (rssi_dbm != 0) *rssi_dbm = g_wifi_conn.rssi;
 	return CC3501E_HW_OK;
+}
+
+/* See the contract on the declaration in hal/cc3501e_hw.h.  ONE unconditional
+ * definition (unlike cc3501e_hw_wifi_last_event_id()'s two, which mirror
+ * wifi_started/wifi_sta_role_up's own #ifdef split): g_wifi_conn.reason is
+ * itself unconditional storage (this struct, above), and the only function
+ * that ever writes it -- wifi_conn_set(), from the caller-resolved reason
+ * described on g_wifi_conn's comment -- is CC3501E_WIFI-only.
+ * The non-Wi-Fi ti build has no wifi_conn_set() at all to write a nonzero
+ * value, so this naturally reads its zero-init 0 there without a separate
+ * hardcoded stub. */
+int16_t cc3501e_hw_wifi_last_reason(void)
+{
+	return g_wifi_conn.reason;
 }
 
 /* --------------------------------------------------------------- */
@@ -650,10 +1192,69 @@ static int cc3501e_hw_wifi_ensure_sta_role(void)
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_sta_role_up = true;
-	/* The radio only accepts a power-save configuration once a role is up, so a
-	 * POWER_POLICY the host set earlier was dropped on the floor.  Re-apply the
-	 * latched policy here -- see pp_apply_radio() in cc3501e_hw_ti_power.c. */
-	cc3501e_hw_power_reapply_radio();
+	/* Apply the radio power policy SYNCHRONOUSLY, right here, before returning --
+	 * NOT just latched for cc3501e_hw_tick()'s later drain.  That used to be the
+	 * whole story (cc3501e_hw_power_reapply_radio() used to run here too, only
+	 * setting a dirty flag for the tick to consume), and it is an ordering bug
+	 * on the CONNECT-FIRST path:
+	 *
+	 * cc3501e_hw_wifi_connect_sta() calls THIS function and then, in the SAME
+	 * worker-job body -- no return to main()'s bringup loop in between -- goes
+	 * straight into Wlan_Connect and its association/EAPOL-SAE handshake and the
+	 * bounded DHCP-lease poll.  cc3501e_hw_tick() (which drains the service that
+	 * used to apply this) only runs AFTER worker_run_pending() returns, i.e. AFTER
+	 * that whole body already ran under whatever power-save mode the radio
+	 * actually held at that point.
+	 *
+	 * HYPOTHESIS, NOT RE-VERIFIED SINCE THIS FIX: `wifi scan` first (same
+	 * ensure_sta_role(), but the scan job's tick has a chance to apply ACTIVE
+	 * before a LATER connect job runs) associated 16/16 pre-fix; a bare
+	 * connect-first `wifi connect` failed roughly half the time -- `fail: 2`
+	 * (REJECTED) after WLAN_EVENT_DISCONNECT, or a DHCP timeout.  That was
+	 * attributed to Wlan_Start leaving the radio in AUTO_PS (vendor
+	 * wlan_if.c:867's devicePowerSaveMode default) through the connect body.
+	 * The vendor source does not actually support that specific mechanism: on
+	 * SDK 10.10.01.08, Wlan_RoleUp's own PS-mode push to firmware is commented
+	 * out at both STA and AP role-up (driver_cc35xx.c ~1026 and ~1314:
+	 * `//cc3xxx_cmd_set_ps_mode(...)`), so role-up itself never sends
+	 * anything -- wlan_if.c:867 only sets the HOST-SIDE cached default, and the
+	 * ONLY path that ever reaches firmware is an explicit Wlan_Set(POWER_SAVE)
+	 * with a STA role already up, via CME_MESSAGE_ID_PS_SET (cme.c
+	 * ~3020-3037).  So what the radio actually ran under, pre-fix, was
+	 * whatever the LAST successful Wlan_Set(POWER_SAVE) sent -- cold-boot
+	 * default or a previous attempt's leftover -- not specifically "AUTO_PS
+	 * from Wlan_Start".  The fix below is still correct regardless (it is the
+	 * first Wlan_Set(POWER_SAVE) that can reach firmware once THIS role is up,
+	 * landing before Wlan_Connect instead of after), but the fail-mode
+	 * attribution above is bench observation, not a mechanism proven from the
+	 * SDK, and has not been re-run since this fix landed.
+	 *
+	 * cc3501e_hw_power_apply_radio_now() (cc3501e_hw_ti_power.c) shares the exact
+	 * effective-policy rule cc3501e_hw_power_service() uses -- one function, not a
+	 * second copy of the rule -- and is TASK CONTEXT ONLY, same constraint as
+	 * pp_apply_core (#1683): Wlan_Set() blocks and must never run off the SPI-
+	 * dispatch ISR.  Safe here: every caller of THIS function --
+	 * cc3501e_hw_wifi_scan_run() (WIFI_SCAN_START), cc3501e_hw_wifi_connect_sta()
+	 * (WIFI_CONNECT_STA), and the currently-uncalled cc3501e_hw_wifi_boot_start()
+	 * -- is worker-routed off the ISR: src/worker.c's header comment states the
+	 * ISR only SUBMITS a job and POLLS its cached result, while the blocking HAL
+	 * body (this function included) runs in worker_run_pending(), invoked from
+	 * main()'s bringup-task loop, not from SPI dispatch.
+	 *
+	 * Deliberately NOT also calling cc3501e_hw_power_reapply_radio() here any
+	 * more: it is redundant with the synchronous apply just above (any host
+	 * CMD_POWER_POLICY already sets pp_radio_dirty itself, in
+	 * cc3501e_hw_set_power_policy(), cc3501e_hw_ti_power.c) and it used to be
+	 * actively HARMFUL on the failed-connect path.  A failed connect's cleanup
+	 * (wifi_clear_stale_assoc(), #1437) issues its own Wlan_Disconnect(), which
+	 * leaves WLAN_IF_DISCONNECT_IN_PROGRESS set (vendor wlan_if.c ~2334) until
+	 * that disconnect's own event dispatches.  A stray reapply here re-arms
+	 * pp_radio_dirty, and if cc3501e_hw_tick()'s drain then lands inside that
+	 * window, WLAN_SET_POWER_MANAGEMENT can come back WLAN_RET_OPER_IN_PROGRESS
+	 * (wlan_if.c ~586-608's set_cond_in_process_wlan_set() gate) -- a real
+	 * Wlan_Set() failure this HAL then reported as pp_radio_ok = false for a
+	 * policy nothing was actually wrong with. */
+	cc3501e_hw_power_apply_radio_now();
 	return CC3501E_HW_OK;
 }
 
@@ -792,6 +1393,24 @@ int cc3501e_hw_wifi_scan_stop(void)
  * must not report the latched byte as a signal level; WIFI_GET_RSSI is the only
  * real read.
  *
+ * `reason` (RUN12): the caller resolves this value BEFORE calling in, rather
+ * than this function reading the live wifi_last_reason_tag itself.  An
+ * earlier version did the latter, and every FAILED-path caller runs
+ * wifi_clear_stale_assoc() (#1437) right after this returns, which issues
+ * its own Wlan_Disconnect() -- if a caller had already decided to RESTORE
+ * the first pass's reason (see cc3501e_hw_wifi_connect_sta()'s KICK/TIMEOUT/
+ * terminal-REJECTED sites) by writing that value back into the live tag, a
+ * late vendor event landing in the narrow window between that write and
+ * this function's own read of it could silently replace the restored value
+ * before it was ever frozen -- wifi_event_cb()'s ASSOCIATION_REJECTED /
+ * AUTHENTICATION_REJECTED cases write unconditionally whenever
+ * wifi_conn_is_connecting() is true (no "first real code wins" gate the way
+ * DISCONNECT has), and state is STILL CONNECTING in that window, since this
+ * function has not yet published the terminal state.  Passing the resolved
+ * value as a parameter removes that window entirely: nothing this function
+ * does can be raced by a concurrent tag write, because it never reads the
+ * tag.
+ *
  * ALSO enqueue the matching async EVT_* so a host that registered an event
  * callback (via CMD_GET_PENDING_EVENTS polling) is notified: CONNECTED ->
  * EVT_WIFI_CONNECTED, a terminal FAILED/DISCONNECTED -> EVT_WIFI_DISCONNECTED.
@@ -799,11 +1418,39 @@ int cc3501e_hw_wifi_scan_stop(void)
  * CMD_WIFI_STATUS.  wifi_conn_set is the single terminal-transition chokepoint
  * (mark_connecting writes the CONNECTING latch directly and is NOT terminal), so
  * exactly one event is queued per terminal outcome. */
-static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
+static void wifi_conn_set(uint8_t state, uint8_t fail_reason, int16_t reason)
 {
 	g_wifi_conn.fail_reason = fail_reason;
 	g_wifi_conn.rssi        = 0;
-	g_wifi_conn.state       = state;
+	/* CONNECTED is the one state that ALWAYS freezes 0, ignoring `reason`
+	 * entirely -- every CONNECTED caller already passes 0 (see below), but
+	 * enforcing it here too keeps the invariant true regardless of the
+	 * caller: hal/cc3501e_hw.h's contract for this byte is "the reason or
+	 * status that ENDED or REJECTED that attempt", and a CONNECTED attempt
+	 * was neither, so publishing a stale rejection alongside a successful
+	 * CONNECTED would contradict that contract and mislead a host into
+	 * reading a live association as somehow still carrying a past reject.
+	 *
+	 * CONNECTED also clears the LIVE wifi_last_reason_tag itself, not just
+	 * the frozen g_wifi_conn.reason above, purely as hygiene for the NEXT
+	 * connect attempt -- NOT because anything downstream of THIS attempt
+	 * still reads the live tag: cc3501e_hw_wifi_disconnect() passes
+	 * g_wifi_conn.reason itself, not the live tag (see that function's own
+	 * comment), specifically so a later WIFI_DISCONNECT republishes
+	 * whatever this call just froze (0, right here) regardless of what the
+	 * live tag does or does not hold by then.  mark_connecting() clears the
+	 * tag again anyway at the START of the next attempt, so this clear is
+	 * redundant with that one in practice -- kept for the same reason
+	 * mark_connecting()'s own comment gives: a live tag that reads 0
+	 * whenever no attempt is in flight is a simpler invariant to reason
+	 * about than one that is sometimes stale between attempts. */
+	if (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) {
+		wifi_last_reason_tag = 0;
+		g_wifi_conn.reason   = 0;
+	} else {
+		g_wifi_conn.reason = reason;
+	}
+	g_wifi_conn.state = state;
 
 	if (state == (uint8_t)ALP_CC3501E_WIFI_CONNECTED) {
 		(void)event_ring_push((uint8_t)ALP_CC3501E_EVT_WIFI_CONNECTED, NULL, 0u);
@@ -883,6 +1530,18 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason)
 static void wifi_clear_stale_assoc(void)
 {
 	if (wifi_started) {
+		/* No "we asked for this" flag to arm here any more -- see
+		 * wifi_event_cb()'s DISCONNECT case for why that approach was
+		 * dropped.  This call always runs AFTER the caller's own
+		 * wifi_conn_set(FAILED, ...), so the connecting-state gate that
+		 * replaced the flag is already closed by the time this fires: see
+		 * that case's RESIDUAL note for the one narrow situation (this call's
+		 * own delayed DISCONNECT event landing in the tiny window between a
+		 * NEW attempt's second wifi_last_reason_tag reset -- in
+		 * cc3501e_hw_wifi_connect_sta(), right before its own Wlan_Connect --
+		 * and the vendor actually starting to process that new connect) where
+		 * that gate can still record THIS disconnect's reason against the
+		 * wrong attempt. */
 		(void)Wlan_Disconnect(WLAN_ROLE_STA, NULL);
 	}
 }
@@ -1032,6 +1691,168 @@ static void wifi_clear_stale_assoc(void)
 
 #define CC3501E_STA_DHCP_POLL_US 200000u
 
+/* The 30 s association wait itself, named so the retry budget below can do
+ * arithmetic against it instead of restating the literal.  Matches the
+ * `30u * OSI_WAIT_FOR_SECOND` this function already waited with (OSI_WAIT_FOR_SECOND
+ * == 1000, osi_kernel.h:357, so this is already in the same units,
+ * milliseconds). */
+#define CC3501E_WIFI_ASSOC_WAIT_MS 30000u
+
+/* RUN9 BOUNDED RETRY (bench evidence + mechanism below; see the long comment
+ * on the retry site in cc3501e_hw_wifi_connect_sta() for the full story).
+ *
+ * RUN11 (bench c872b94's review): RUN9 used a ~1.5 s PMF/stale-SA delay;
+ * RUN10 (bench 16af840) found that too short for a second candidate shape
+ * and added a SECOND, longer delay, picked by reading which vendor event
+ * ended the pass (event_id_this_pass) at the moment the body woke.  That
+ * pick was itself unsound: the read happened AFTER wake, so it returned the
+ * MOST RECENT event, not necessarily the one that RECORDED the reason-30
+ * this retry keys on -- a further event landing in the gap between the two
+ * could select the SHORTER delay while our own driver still had the AP's
+ * BSSID deny-listed (see below), making the retry re-issue Wlan_Connect too
+ * early and end in an uninformative TIMEOUT/0 instead of ever finding the
+ * AP.  RUN11's fix was to always wait out the LONGER of the two delays
+ * regardless of which event ended the pass -- provably safe (never too
+ * short for any of the three rejection shapes below), but it gave up the
+ * whole point of RUN10's per-event pick: a comeback-IE retry that could have
+ * re-issued Wlan_Connect in ~1 s now always pays the full ~11 s instead.
+ *
+ * RUN12 removes that compromise rather than keeping it, by fixing what was
+ * actually unsound about RUN10's pick -- not WHERE the value came from
+ * (which event), but WHEN it was read.  wifi_event_cb() now packs the event
+ * into the SAME word as the reason (wifi_last_reason_tag, declared above) in
+ * one store, so the tag moves only together with the reason -- not read back
+ * piecemeal after this function's own wait wakes, which is what let a later
+ * event pair a stale event with a fresh reason (or vice versa) before.
+ * wifi_retry_delay_ms() (src/wifi_retry.h) then picks the delay from that
+ * single loaded pair: the short comeback delay for
+ * WIFI_RETRY_EVENT_ASSOCIATION_REJECTED, the long deny-list delay for every
+ * other value (AUTHENTICATION_REJECTED, DISCONNECT, or NONE) -- see that
+ * function's own comment for why the conservative default is right for the
+ * shapes RUN11's data could not distinguish.
+ *
+ * Checked directly against the SDK for all three rejection shapes this `if`
+ * and its neighbours discuss: the comeback-IE path (ASSOCIATION_REJECTED
+ * WITH the IE) deny-lists only for its own comeback duration (typically
+ * ~1 s -- `msecs = tu * 1024 / 1000` off the AP's own IE,
+ * drv_ti_mlme.c:1293-1327; the driver itself resends up to ASSOC_MAX_TRIES(3)
+ * meanwhile, drv_ti_sta_specific.c:710-738); the no-IE path deny-lists
+ * nothing at all (falls straight to destroyAssocData(), drv_ti_mlme.c
+ * ~1366-1372, no DenyList_addElement call on that path); and
+ * AUTHENTICATION_REJECTED deny-lists for the full
+ * CC3501E_WIFI_RETRY_DENYLIST_EXPIRY_MS below.  NOT YET RE-RUN ON THE BENCH:
+ * this closes the mechanism gap RUN11 knowingly left open, but no run number
+ * is claimed for it -- see the CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS comment
+ * for what a future bench run would need to show. */
+
+/* CC3501E_WIFI_RETRY_DENYLIST_EXPIRY_MS: DENY_LIST_DEFAULT_EXPIRY_TIME
+ * itself, read verbatim from the SDK, not guessed -- `#define
+ * DENY_LIST_DEFAULT_EXPIRY_TIME 10*1000 // 10 seconds in milliseconds`
+ * (drv_ti_internal.h:370), already milliseconds.
+ *
+ * WHOSE list, precisely (corrected -- an earlier version of this comment
+ * called it "the AP's deny list", which is backwards): both call sites,
+ * `DenyList_addElement(&(apDrv->denyList), ..., DENY_LIST_DEFAULT_EXPIRY_TIME
+ * + osi_GetTimeMS())` (drv_ti_mlme.c:1187) and the comeback-IE one
+ * (drv_ti_mlme.c:1315), add to `apDrv->denyList` -- apDrv is THIS
+ * station's OWN driver state, so this is OUR OWN local list, entered
+ * against the AP's BSSID as the key.  DenyList_elementExists()
+ * (drv_ti_sta_specific.c ~1804-1850) consults that SAME local list to
+ * filter scan/connect candidates (driver_osprey_mx_scan.c:734) -- it is OUR
+ * OWN driver refusing to re-offer a BSSID it locally deny-listed, never
+ * something the AP itself does, knows about, or enforces.
+ *
+ * Event order matters for the margin below: wlanDispatcherSendEvent
+ * (WLAN_EVENT_AUTHENTICATION_REJECTED, ...) (drv_ti_mlme.c:1177) runs
+ * BEFORE DenyList_addElement(..., DENY_LIST_DEFAULT_EXPIRY_TIME +
+ * osi_GetTimeMS()) (drv_ti_mlme.c:1187) -- a few instructions apart, not a
+ * meaningful span of wall-clock time -- so the local entry's expiry lands
+ * for practical purposes DENY_LIST_DEFAULT_EXPIRY_TIME AFTER wake, meaning
+ * the margin below is real margin, not slack already eaten by event
+ * ordering. */
+#define CC3501E_WIFI_RETRY_DENYLIST_EXPIRY_MS 10000u /* drv_ti_internal.h:370 */
+
+/* +1 s margin for scheduling/RTT slop on top of the ~10 s expiry above --
+ * not a vendor number.  Used for the AUTHENTICATION_REJECTED shape (and, per
+ * wifi_retry_delay_ms()'s conservative default, every shape other than the
+ * comeback-IE one below). */
+#define CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS (CC3501E_WIFI_RETRY_DENYLIST_EXPIRY_MS + 1000u)
+
+/* Delay a retry waits when the FIRST pass's reason-30 was recorded by
+ * ASSOCIATION_REJECTED (WIFI_RETRY_EVENT_ASSOCIATION_REJECTED) -- the
+ * comeback-IE shape, whose local deny-list entry (if the IE even added one)
+ * expires on the AP's OWN comeback interval, not our driver's fixed ~10 s
+ * one: `msecs = tu * 1024 / 1000` off the AP's Timeout-Interval IE
+ * (drv_ti_mlme.c:1293-1327), typically ~1 s for hostapd's own default
+ * comeback time (1000 TU); the driver itself resends the association up to
+ * ASSOC_MAX_TRIES(3) meanwhile (drv_ti_sta_specific.c:710-738), so by the
+ * time THIS cb sees a terminal ASSOCIATION_REJECTED(30) recorded at all, that
+ * comeback window has already been running.  1000u (1 s) is a round number
+ * at least as long as the typical 1000 TU (~1.024 s) case -- not a vendor
+ * constant, a chosen margin the same way CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS's
+ * own +1 s is.  UNVERIFIED ON THE BENCH as of this fix (see the RUN9 BOUNDED
+ * RETRY comment's own note): a comeback IE advertising a longer interval than
+ * this would make the retry re-issue Wlan_Connect while our own driver's
+ * internal comeback timer (or the AP's SA) is still live, most likely
+ * degrading to an uninformative TIMEOUT/0 rather than corrupting anything --
+ * the next bench run against a real WPA3-SAE AP is what would confirm this
+ * margin is generous enough in practice. */
+#define CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS 1000u
+
+/* CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS: bounded wait for wifi_clear_stale_assoc()'s
+ * own Wlan_Disconnect() to actually DISPATCH its WLAN_EVENT_DISCONNECT before
+ * re-issuing Wlan_Connect.  Needed because the vendor SDK refuses a new
+ * Wlan_Connect while WLAN_IF_DISCONNECT_IN_PROGRESS is set in its internal
+ * oper-bitmap, and that bit clears ONLY when the disconnect event dispatches
+ * (wlan_if.c ~2334) -- re-issuing too early is the SAME sticky-bit trap
+ * cc3501e_hw_wifi_connect_sta()'s existing FAIL_KICK handling exists for
+ * elsewhere in this file.  Generous relative to how fast a dispatch of an
+ * already-completed operation should be; best-effort -- if it times out this
+ * function still proceeds to re-issue Wlan_Connect, which then either
+ * succeeds or reports FAIL_KICK exactly as any other oper-bitmap collision
+ * would. */
+#define CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS 2000u
+
+/* Upper bound on the time this function spends BEFORE it can even re-issue
+ * Wlan_Connect for the retry, used ONLY by the retry-eligibility budget check
+ * below (elapsed + this + CC3501E_WIFI_RETRY_MIN_WAIT_MS <=
+ * CC3501E_WIFI_ASSOC_WAIT_MS) -- NOT the actual per-retry sleep any more (that
+ * is wifi_retry_delay_ms()'s per-event pick, which can be the shorter
+ * CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS).  Deliberately still built from
+ * CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS, the LONGER of the two per-event
+ * delays, not a per-event value: the event IS already known by the time
+ * the eligibility check runs (it was packed into wifi_last_reason_tag when
+ * the reason was recorded, before this check ever reads it) -- but pinning
+ * the budget check to a SINGLE, per-event-independent value is simpler
+ * than branching this arithmetic on which delay wifi_retry_delay_ms() will
+ * end up returning, and choosing the WORST-CASE value keeps that
+ * simplification conservative -- eligibility can only under-promise the
+ * time available, never over-promise it, regardless of which delay this
+ * retry ends up sleeping. */
+#define CC3501E_WIFI_RETRY_OVERHEAD_MS \
+	(CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS + CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS)
+
+/* Floor on what must remain of the association budget AFTER paying that
+ * overhead for the retry to be worth attempting at all -- a retry whose own
+ * Wlan_Connect+wait would have only a sliver of the budget left is not worth
+ * running (WPA3-SAE alone can take real time; see this function's own wait
+ * comment).  Not tied to any specific vendor number -- a simple, generous
+ * floor chosen so the retry only fires when there is genuinely enough of the
+ * 30 s window left for it to have a fair shot.
+ *
+ * THE REAL BOUND on the whole association phase (first attempt + delay +
+ * retry) is, and remains, CC3501E_WIFI_ASSOC_WAIT_MS (30 s) -- the
+ * retry-eligibility check below enforces that DIRECTLY (elapsed +
+ * CC3501E_WIFI_RETRY_OVERHEAD_MS + this floor <= CC3501E_WIFI_ASSOC_WAIT_MS),
+ * not via a derived constant.  For CONTEXT, not as the actual limit: Run10's
+ * typical numbers (rejects landing at ~3.9-5.2 s) put elapsed at ~4.2 s,
+ * which is Run10's typical case, not the bound -- the check itself only
+ * lets the retry fire while elapsed <= ~14000 ms (30000 - 13000 - 3000), and
+ * its worst case is 14000 + 13000 = 27000 ms of wall-clock time before the
+ * retry's OWN Wlan_Connect is even re-issued, still inside the 30 s window
+ * with this 3 s floor left for that re-issued connect's own wait. */
+#define CC3501E_WIFI_RETRY_MIN_WAIT_MS 3000u
+
 int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
                                 uint8_t        ssid_len,
                                 const uint8_t *psk,
@@ -1042,7 +1863,8 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		/* The latch was armed CONNECTING at submit (mark_connecting); a bad arg must
 		 * still publish a TERMINAL outcome, else the latch stays stuck CONNECTING and
 		 * the host's status poll never resolves (spins to a misleading timeout). */
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
+		wifi_conn_set(
+		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK, 0);
 		return CC3501E_HW_ERR_INVAL;
 	}
 	/* Did THIS call actually perform the role-up?  ensure_sta_role() returns at its
@@ -1104,57 +1926,330 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	}
 
 	if (wifi_rv != CC3501E_HW_OK) {
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
+		wifi_conn_set(
+		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK, 0);
 		return wifi_rv;
 	}
-	osi_SyncObjClear(&wifi_event_sync);
-	wifi_last_status = 0;
-	/* Wlan_Connect(ssid,len,bssid=NULL,secType,pass,passlen,flags=0).  Open
-	 * networks pass a NULL/zero-length password. */
-	if (Wlan_Connect((const signed char *)ssid,
-	                 (int)ssid_len,
-	                 NULL,
-	                 cc3501e_wifi_sec(security),
-	                 (const char *)psk,
-	                 (char)psk_len,
-	                 0) != 0) {
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK);
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
-		return CC3501E_HW_ERR_IO;
-	}
-	/* BOUNDED wait for the connect event.  This op is WORKER-ROUTED (see protocol.c
-	 * wifi_join -> worker), so the wait pends off the SPI ISR.
+	/* RUN9 BOUNDED RETRY -- outer state shared across the (at most 2) passes of
+	 * the loop below.  Bench evidence (Run9, GPE 0.254.9.0, e1m-aen-evk-01,
+	 * alp-console connect-first): the earlier ASSOCIATION_REJECTED(30)
+	 * non-terminal fix (812649d/074079e) did NOT fix the observed pattern --
+	 * connect-first still alternated pass/fail 8 of 16, EVERY rejection
+	 * `fail 2 / reason 30`, last vendor event id 2 (WLAN_EVENT_DISCONNECT).
+	 * NOT PROOF the reject itself arrived as a DISCONNECT, though: the
+	 * failed attempt's own #1437 cleanup issues a Wlan_Disconnect() right
+	 * after, which generates a trailing DISCONNECT event that would make
+	 * "last event id 2" true regardless of what actually ended the
+	 * attempt -- see the ASSOCIATION_REJECTED case's own "RUN9 UPDATE" for
+	 * the two candidate explanations this data cannot distinguish between.
+	 * CONTROL (this part IS a direct observation, not an inference):
+	 * running a clean `wifi disconnect` on the boot BEFORE a power-off made
+	 * the NEXT boot associate first try, 2 of 2, then 4 boots in a row
+	 * associated -- isolating an UNCLEAN power-off (no deauth sent) as the
+	 * trigger.  INFERENCE, not proven from the SDK: the AP still holds this
+	 * STA's stale security association from before the power-off and runs a
+	 * PMF SA-Query against it, rejecting new associations with status 30
+	 * until that check times out -- independent of exactly which vendor
+	 * event this cb observed the 30 on.
 	 *
-	 * NOTE this comment used to add "the READY/host-IRQ line is held BUSY for the
-	 * duration ... so the host never clocks into the dead SPI-slave DMA".  That is no
-	 * longer true on the first-op-is-CONNECT path: the gated reinit above re-arms the
-	 * slave and raises READY before this wait, on purpose, so the host CAN clock
-	 * WIFI_STATUS in and read the radio's verdict.  It is also not true on this bench
-	 * regardless -- READY (CC35 GPIO17 -> Alif P2_6) is an open connection on the
-	 * E1M-AEN801 unit, 0 edges in 20000 samples, so it holds nobody off.  The SPI
-	 * framing itself is hardware SS0.  The L2 association completes on
-	 * silicon.  WPA2 associates ~15s in, but WPA3-SAE is SLOWER (the extra SAE
-	 * commit/confirm exchange + PMF), so a 15s wait raced the WLAN_EVENT_CONNECT and
-	 * timed out on a WPA3 AP even though the association was in progress -- bench-seen
-	 * on "Alp Electronix" (wpa3), 2026-07-05.  30s covers WPA2 and WPA3-SAE with margin
-	 * (the bridge is BUSY for the wait, but a connect is a deliberate, infrequent op).
-	 * The OUTCOME is mirrored into the status latch below; the host collects it
-	 * NON-blocking via CMD_WIFI_STATUS.  DHCP/IP is brought up right after (L3). */
-	if (osi_SyncObjWait(&wifi_event_sync, 30u * OSI_WAIT_FOR_SECOND) != OSI_OK) {
-		/* No connect event within the wait -- TERMINAL timeout (was masked as a
-		 * retryable IO that looped the host's poll-by-repeat -> -4). */
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
-		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT);
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
-		return CC3501E_HW_ERR_IO;
-	}
-	if (wifi_last_status < 0) {
+	 * So the retry lives HERE, in the connect body, keyed only on "did THIS
+	 * attempt's recorded reason end up being 30", rather than in
+	 * wifi_event_cb() keyed on a specific event type -- it fires the same way
+	 * whichever candidate explanation is the real one, and (see
+	 * wifi_retry_delay_ms()'s own comment) picks its wait from
+	 * first_pass_reason_event below, snapshotted at the SAME instant as
+	 * first_pass_reason_code, so it can wait the shorter comeback delay for
+	 * the ASSOCIATION_REJECTED shape without needing to pick one per event
+	 * from a stale, already-woken read.
+	 *
+	 * RUN10 UPDATE: bench 16af840 (GPE 0.254.10.0) showed the FIRST version
+	 * of this retry (which excluded AUTHENTICATION_REJECTED entirely,
+	 * treating it as a dead end rather than a delay problem) made NO
+	 * difference -- same 8-of-16 alternation, rejects still landing at
+	 * 3.9-5.2 s, meaning the retry never actually fired.  INFERENCE, from
+	 * that timing (unchanged from before the retry existed) plus the code
+	 * path (the AUTHENTICATION_REJECTED exclusion was the ONLY thing standing
+	 * between "eligible" and "skipped" for a reason-30 rejection): THIS
+	 * bench's reject is the AUTHENTICATION_REJECTED(30) candidate, not the
+	 * ASSOCIATION_REJECTED-without-the-IE one -- still not a captured trace,
+	 * but narrower than Run9's "two candidates, can't tell" state.  The retry
+	 * now covers AUTHENTICATION_REJECTED too, waiting out its deny-list
+	 * instead of skipping it.
+	 *
+	 * RUN11 UPDATE: RUN10's fix picked which delay to wait by reading the
+	 * MOST RECENT vendor event at wake, which is not necessarily the one
+	 * that RECORDED the reason-30 this retry keys on -- see the RUN9 BOUNDED
+	 * RETRY comment (above CC3501E_WIFI_RETRY_DENYLIST_EXPIRY_MS) for the
+	 * unsound case that opened.  RUN11 closed it by always waiting the ONE,
+	 * longer, provably-safe delay instead of picking per event at all.
+	 *
+	 * RUN12 replaces event_id_this_pass with wifi_last_reason_tag (declared top
+	 * of file, see its own comment for the full mechanism): the event is
+	 * packed into the SAME word as the reason it accompanies, one store, so
+	 * the tag moves only together with the reason -- rather than read back
+	 * piecemeal here after the wait wakes.  first_pass_reason_event below
+	 * freezes that pair's event half the same way first_pass_reason_code
+	 * freezes its reason half (both decoded from ONE load, see the retry
+	 * site's own comment further down), so the delay pick is correct again
+	 * without giving up the shorter comeback wait RUN11 sacrificed.
+	 *
+	 * `retried`: this function retries AT MOST ONCE.  `assoc_wait_start_ms`:
+	 * uptime at the FIRST Wlan_Connect, the deadline base for EVERY wait this
+	 * loop does (including the retry's own), so retrying can never push the
+	 * total association phase past CC3501E_WIFI_ASSOC_WAIT_MS -- see the
+	 * retry-eligibility check below for exactly how. */
+	bool           retried             = false;
+	const uint32_t assoc_wait_start_ms = cc3501e_hw_uptime_ms();
+	/* Outcome of the loop, published once after it exits (see below) --
+	 * consolidates what used to be three separate wifi_conn_set() +
+	 * wifi_clear_stale_assoc() call sites (KICK / TIMEOUT / REJECTED) into
+	 * one, since every failure exit needs the exact same pair of calls.
+	 * connect_reason_code (RUN12) is the value that same call passes as
+	 * wifi_conn_set()'s explicit `reason` argument -- resolved into this
+	 * local at EACH break site below, never left for wifi_conn_set() to
+	 * re-read off the live wifi_last_reason_tag itself (see that function's
+	 * own comment for why). */
+	uint8_t connect_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
+	int16_t connect_reason_code = 0;
+	int     connect_rv          = CC3501E_HW_OK;
+	/* First pass's outcome, saved ONLY if the retry actually fires -- so a
+	 * refused retry (its own Wlan_Connect rejected, see the KICK site below)
+	 * can restore and publish THIS instead of manufacturing a fresh KICK/0
+	 * that would erase the only real diagnostic the attempt produced. */
+	uint8_t first_pass_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
+	int16_t first_pass_reason_code = 0;
+	/* WHICH event recorded first_pass_reason_code, snapshotted alongside it
+	 * (see the retry-eligibility check below) so wifi_retry_delay_ms() can
+	 * pick the correct wait -- see that function's own comment. */
+	wifi_retry_event_t first_pass_reason_event = WIFI_RETRY_EVENT_NONE;
+
+	for (;;) {
+		osi_SyncObjClear(&wifi_event_sync);
+		wifi_last_status = 0;
+		/* mark_connecting() (SPI-ISR/protocol context, at submit) already cleared
+		 * wifi_last_reason_tag once for this attempt, but that was BEFORE the
+		 * worker body reached this point -- everything from ensure_sta_role()
+		 * through the reinit above runs in between, and a late event from the
+		 * PREVIOUS attempt (still in flight on the host-driver thread) can land
+		 * in that gap and get recorded there.  Two real shapes, not just one: a
+		 * supplicant DISCONNECT carrying any real reason arriving after an
+		 * AUTHENTICATION_REJECTED already closed out the old attempt, or a late
+		 * ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED arriving after the old
+		 * attempt was already declared a TIMEOUT.  Clear it again HERE too,
+		 * right next to wifi_last_status's own reset and for the same reason --
+		 * immediately before Wlan_Connect, as close to the new attempt's real
+		 * start as this body gets.  On the RUN9 RETRY pass this is also step 3
+		 * of "clean state before retrying": the recorded reason/event pair
+		 * starts this pass at exactly what a fresh, non-retried attempt would
+		 * see. */
+		wifi_last_reason_tag = 0;
+		/* Wlan_Connect(ssid,len,bssid=NULL,secType,pass,passlen,flags=0).  Open
+		 * networks pass a NULL/zero-length password. */
+		if (Wlan_Connect((const signed char *)ssid,
+		                 (int)ssid_len,
+		                 NULL,
+		                 cc3501e_wifi_sec(security),
+		                 (const char *)psk,
+		                 (char)psk_len,
+		                 0) != 0) {
+			/* On the RETRY pass (retried already true here -- it is only ever
+			 * set right before the `continue` that starts that pass) this is
+			 * almost certainly the SDK's oper-bitmap refusing a new
+			 * Wlan_Connect because WLAN_IF_DISCONNECT_IN_PROGRESS was still
+			 * set -- CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS's own wait for the
+			 * cleanup's DISCONNECT is best-effort and can time out first
+			 * (wlan_if.c ~2334: the bit clears only when that event
+			 * dispatches).  That is OPER_IN_PROGRESS, not a fresh KICK, and
+			 * publishing FAILED/KICK/0 here would DESTROY the first pass's
+			 * real outcome (REJECTED/30) with a less informative one for no
+			 * reason -- restore and publish that instead. */
+			if (retried) {
+				connect_fail_reason = first_pass_fail_reason;
+				connect_reason_code = first_pass_reason_code;
+			} else {
+				connect_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK;
+				connect_reason_code = 0;
+			}
+			connect_rv = CC3501E_HW_ERR_IO;
+			break;
+		}
+		/* BOUNDED wait for the connect event, against the DEADLINE this whole
+		 * association phase (first attempt AND retry) shares -- see
+		 * assoc_wait_start_ms above.  This op is WORKER-ROUTED (see protocol.c
+		 * wifi_join -> worker), so the wait pends off the SPI ISR.
+		 *
+		 * NOTE this comment used to add "the READY/host-IRQ line is held BUSY for the
+		 * duration ... so the host never clocks into the dead SPI-slave DMA".  That is no
+		 * longer true on the first-op-is-CONNECT path: the gated reinit above re-arms the
+		 * slave and raises READY before this wait, on purpose, so the host CAN clock
+		 * WIFI_STATUS in and read the radio's verdict.  It is also not true on this bench
+		 * regardless -- READY (CC35 GPIO17 -> Alif P2_6) is an open connection on the
+		 * E1M-AEN801 unit, 0 edges in 20000 samples, so it holds nobody off.  The SPI
+		 * framing itself is hardware SS0.  The L2 association completes on
+		 * silicon.  WPA2 associates ~15s in, but WPA3-SAE is SLOWER (the extra SAE
+		 * commit/confirm exchange + PMF), so a 15s wait raced the WLAN_EVENT_CONNECT and
+		 * timed out on a WPA3 AP even though the association was in progress -- bench-seen
+		 * on "Alp Electronix" (wpa3), 2026-07-05.  30s covers WPA2 and WPA3-SAE with margin
+		 * (the bridge is BUSY for the wait, but a connect is a deliberate, infrequent op).
+		 * The OUTCOME is mirrored into the status latch below; the host collects it
+		 * NON-blocking via CMD_WIFI_STATUS.  DHCP/IP is brought up right after (L3).
+		 *
+		 * DEADLINE MATH: elapsed_ms is time-since-first-Wlan_Connect (unsigned
+		 * subtraction, matching this file's existing cc3501e_hw_uptime_ms()
+		 * deltas elsewhere -- e.g. transport_hw_ti_spi.c -- correct as long as
+		 * the actual elapsed time is far under the ~49-day wrap).  On the first
+		 * pass this is ~0, so wait_ms is the full budget, unchanged from
+		 * before.  On the retry pass it is whatever the first reject + the
+		 * retry's own overhead already spent, so the retry's wait can only be
+		 * SHORTER, never longer, than what remains of the ORIGINAL 30 s --
+		 * this is what makes "the deadline is computed at the first
+		 * Wlan_Connect" true in code, not just in the comment. */
+		{
+			const uint32_t elapsed_ms = cc3501e_hw_uptime_ms() - assoc_wait_start_ms;
+			const uint32_t wait_ms    = (elapsed_ms < CC3501E_WIFI_ASSOC_WAIT_MS)
+			                                ? (CC3501E_WIFI_ASSOC_WAIT_MS - elapsed_ms)
+			                                : 0u;
+			if (wait_ms == 0u || osi_SyncObjWait(&wifi_event_sync, wait_ms) != OSI_OK) {
+				/* No connect event within what was left of the budget.  On the
+				 * FIRST pass this is a genuine TERMINAL timeout (was masked as a
+				 * retryable IO that looped the host's poll-by-repeat -> -4).  On
+				 * the RETRY pass (retried already true here) a timeout is a LESS
+				 * informative outcome than the first pass's real REJECTED/30 --
+				 * same reasoning, and same restore, as the Wlan_Connect-refused
+				 * KICK site above: publish the first pass's result instead of a
+				 * fresh TIMEOUT/0 that would erase it. */
+				if (retried) {
+					connect_fail_reason = first_pass_fail_reason;
+					connect_reason_code = first_pass_reason_code;
+				} else {
+					connect_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT;
+					/* NOT forced to 0 (e92d626 read the live value here too): a
+					 * timed-out wait means no event satisfied THIS wait, but the tag
+					 * can still hold whatever the cb last wrote under the
+					 * connecting-state gate (a late REJECTED/DISCONNECT that missed
+					 * the signal, or a spurious write outside the wait window) --
+					 * a single load, decoded once. */
+					connect_reason_code = wifi_reason_tag_reason(wifi_last_reason_tag);
+				}
+				connect_rv = CC3501E_HW_ERR_IO;
+				break;
+			}
+		}
+		if (wifi_last_status >= 0) {
+			break; /* L2 ASSOCIATED -- fall through to L3/DHCP below. */
+		}
 		/* FW rejected the association/auth (WLAN_EVENT_CONNECT Status<0, or a
-		 * DISCONNECT/ASSOCIATION_REJECTED/AUTHENTICATION_REJECTED event) -- TERMINAL. */
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
-		              (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED);
-		wifi_clear_stale_assoc(); /* #1437: leave the NWP ready for the next connect */
-		return CC3501E_HW_ERR_IO;
+		 * DISCONNECT/ASSOCIATION_REJECTED/AUTHENTICATION_REJECTED event).
+		 *
+		 * RUN12: load the (reason, event) pair ONCE here, into `reason_tag`,
+		 * before either the eligibility check or the terminal-restore decision
+		 * further down use it -- see wifi_last_reason_tag's own declaration
+		 * comment (top of file) for why decoding both halves from a single
+		 * already-loaded local, rather than reading the volatile multiple
+		 * times across this whole section, is what keeps them a matched pair
+		 * even though the event-cb thread runs at a higher priority and can
+		 * preempt between what would otherwise be separate reads. */
+		const uint32_t reason_tag = wifi_last_reason_tag;
+
+		/* RUN9/RUN10/RUN11 RETRY-ELIGIBILITY CHECK: for a recorded reason of
+		 * exactly 30 (WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY -- "first real
+		 * code wins" in wifi_event_cb() already ensured the tag's reason half
+		 * holds the FIRST real code THIS attempt saw, not whatever
+		 * terminated it), only once per connect call.  The BUDGET check
+		 * below still uses CC3501E_WIFI_RETRY_OVERHEAD_MS's worst case
+		 * regardless of shape -- see that macro's own comment for why a
+		 * SINGLE conservative bound, not a per-event one, is the simpler and
+		 * still-correct choice; only the ACTUAL sleep two steps down is
+		 * per-event. */
+		if (!retried && wifi_reason_tag_reason(reason_tag) ==
+		                    (int16_t)CC3501E_WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY) {
+			const uint32_t elapsed_ms = cc3501e_hw_uptime_ms() - assoc_wait_start_ms;
+			const uint32_t budget_needed_ms =
+			    CC3501E_WIFI_RETRY_OVERHEAD_MS + CC3501E_WIFI_RETRY_MIN_WAIT_MS;
+			if (elapsed_ms + budget_needed_ms <= CC3501E_WIFI_ASSOC_WAIT_MS) {
+				retried                 = true;
+				first_pass_fail_reason  = (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED;
+				first_pass_reason_code  = wifi_reason_tag_reason(reason_tag);
+				first_pass_reason_event = wifi_reason_tag_event(reason_tag);
+				/* Step 3, "account for the oper-bitmap and disconnect-in-progress
+				 * rules": run the SAME #1437 cleanup every OTHER failure exit
+				 * uses, then wait (bounded, best-effort) for ITS OWN
+				 * WLAN_EVENT_DISCONNECT to dispatch -- see
+				 * CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS's comment for why that is
+				 * the SDK's own precondition for a new Wlan_Connect to be
+				 * accepted at all, not merely tidiness. */
+				osi_SyncObjClear(&wifi_event_sync);
+				wifi_clear_stale_assoc();
+				(void)osi_SyncObjWait(&wifi_event_sync, CC3501E_WIFI_RETRY_DISCONNECT_WAIT_MS);
+				/* Step 2's comeback delay -- picked from the pair already loaded
+				 * into `reason_tag` above (RUN12): the short AP-comeback delay
+				 * for WIFI_RETRY_EVENT_ASSOCIATION_REJECTED, the long local
+				 * deny-list expiry for every other shape (see
+				 * wifi_retry_delay_ms()'s own comment for why that is the safe
+				 * default) -- long enough for OUR OWN driver's deny-list entry
+				 * against this BSSID (if any was even added) to have expired,
+				 * so the next Wlan_Connect's scan can consider this BSSID
+				 * again. */
+				const uint32_t retry_delay_ms =
+				    wifi_retry_delay_ms(first_pass_reason_event,
+				                        CC3501E_WIFI_RETRY_COMEBACK_DELAY_MS,
+				                        CC3501E_WIFI_RETRY_DENYLIST_DELAY_MS);
+				ClockP_usleep(retry_delay_ms * 1000u);
+				continue; /* re-issue Wlan_Connect; loop top clears state again. */
+			}
+		}
+		/* Terminal REJECTED -- either not the retry shape, already retried
+		 * once, or too little budget left.  Step 4: if this WAS the retry
+		 * pass, the tag/wifi_last_status were freshly reset at this pass's
+		 * own top and wifi_event_cb()'s existing "first real code wins" rule
+		 * applied to THIS pass's own events -- so in the COMMON case this
+		 * publishes the RETRY's own outcome, exactly as if it were a fresh
+		 * attempt (because from wifi_event_cb()'s perspective, gated only on
+		 * wifi_conn_is_connecting() and the tag's reason half being 0, it
+		 * was).
+		 *
+		 * BUT one specific retry-pass outcome is NOT published as-is: see
+		 * wifi_retry_should_restore_first_pass()'s own comment (src/
+		 * wifi_retry.h) for the full mechanism AND its stated residual -- in
+		 * short, reason 3 (WLAN_REASON_DEAUTH_LEAVING) on a retry pass is
+		 * USUALLY either OUR OWN pre-retry wifi_clear_stale_assoc()'s
+		 * Wlan_Disconnect() echoing back through pDrv->deauthReason (which
+		 * has no per-attempt reset, driver_ti_wifi.c:1592-1603 off
+		 * cme.c:4159-4164) or hostap's SME give-up timers reaching
+		 * sme_deauth() -> deauthenticate (drv_ti_sta_specific.c:400 writes a
+		 * fresh 3) after an auth/assoc timeout with nothing else having ended
+		 * the attempt first -- either way less informative than the FIRST
+		 * pass's real, AP-issued 30, so restore it instead, same pattern as
+		 * the refused-retry (KICK) and timed-out-retry sites above.  Reason 0
+		 * (nothing recorded this pass at all) restores for the same reason.
+		 * NOT ALWAYS CORRECT, though (see wifi_retry.h's RESIDUAL): an AP's
+		 * OWN deauth/disassoc can legitimately carry ReasonCode 3
+		 * (drv_ti_mlme.c:1476/1521), and a retry pass whose OWN passphrase
+		 * the first pass's AUTH-level 30 never actually checked could
+		 * genuinely re-fail with a real reason this restore would still
+		 * overwrite.  Any OTHER retry-pass reason is a real AP reject code
+		 * and is published as-is -- no second retry follows either way. */
+		if (retried && wifi_retry_should_restore_first_pass(wifi_reason_tag_reason(reason_tag))) {
+			connect_fail_reason = first_pass_fail_reason;
+			connect_reason_code = first_pass_reason_code;
+		} else {
+			connect_fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_REJECTED;
+			connect_reason_code = wifi_reason_tag_reason(reason_tag);
+		}
+		connect_rv = CC3501E_HW_ERR_IO;
+		break;
+	}
+
+	if (connect_rv != CC3501E_HW_OK) {
+		wifi_conn_set(
+		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, connect_fail_reason, connect_reason_code);
+		/* #1437: leave the NWP ready for the next connect.  Harmless best-effort
+		 * double-call on the retry-then-fail path (the retry branch above
+		 * already ran this once for the SAME reason it always does): Wlan_Disconnect()
+		 * on an already-clear association is exactly the no-op wifi_clear_stale_assoc()'s
+		 * own comment already documents. */
+		wifi_clear_stale_assoc();
+		return connect_rv;
 	}
 	/* L2 ASSOCIATED.  Bring the STA netif UP at L3 + start DHCP, MIRRORING the AP path
 	 * (cc3501e_hw_wifi_ap_start -> network_set_up(network_get_ap_if())).  Without this
@@ -1224,9 +2319,18 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	if (ip == 0u) {
 		/* Associated at L2 but no DHCP lease within the budget -- TERMINAL (there is no
 		 * usable IP, so a "connected" report would mislead the host into failing socket
-		 * ops).  The host reads this as CONN_FAILED/TIMEOUT via CMD_WIFI_STATUS. */
+		 * ops).  The host reads this as CONN_FAILED/TIMEOUT via CMD_WIFI_STATUS.
+		 *
+		 * reason is NOT hardcoded 0 here: state is STILL CONNECTING throughout this
+		 * whole DHCP poll (nothing has published a terminal state or CONNECTED yet),
+		 * so wifi_event_cb() can still record a real reason into the live tag during
+		 * it -- a spontaneous AP deauth/disassoc arriving mid-poll, or a leftover
+		 * ASSOCIATION_REJECTED(30) from a comeback the vendor's own retry ultimately
+		 * WON (see that case's non-terminal handling) that this L2-success path never
+		 * cleared.  Freeze whatever is actually there with a single load. */
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
-		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT);
+		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT,
+		              wifi_reason_tag_reason(wifi_last_reason_tag));
 		return CC3501E_HW_ERR_IO;
 	}
 
@@ -1315,7 +2419,7 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	g_connect_reinit_armed   = bridge_transport_spi_hw_reinit();
 	g_connect_reinit_pending = true;
 
-	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE);
+	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0);
 	return CC3501E_HW_OK;
 }
 
@@ -1324,12 +2428,28 @@ int cc3501e_hw_wifi_disconnect(void)
 	if (!wifi_started) {
 		return CC3501E_HW_OK; /* nothing to disconnect */
 	}
+	/* No "we asked for this" flag to arm here any more -- see
+	 * wifi_event_cb()'s DISCONNECT case for why.  Nothing here actually ENFORCES
+	 * that a host only calls this from CONNECTED (protocol_wifi.c:87-104 /
+	 * worker.c:307-314 dispatch WIFI_DISCONNECT unconditionally) -- passing
+	 * g_wifi_conn.reason below, rather than a hardcoded 0, is what makes this
+	 * correct regardless: that field is 0 whenever state is CONNECTED (wifi_conn_set()
+	 * clears it there) and the last FROZEN reason otherwise, so a WIFI_DISCONNECT
+	 * republishes exactly what was already true, no matter which state it is
+	 * actually called from. */
 	if (Wlan_Disconnect(WLAN_ROLE_STA, NULL) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	/* Host-requested teardown succeeded: mirror the state into the latch and
-	 * queue an async EVT_WIFI_DISCONNECTED (wifi_conn_set does both). */
-	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_DISCONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE);
+	 * queue an async EVT_WIFI_DISCONNECTED (wifi_conn_set does both).  reason is
+	 * g_wifi_conn.reason itself (the FROZEN value from whatever terminal
+	 * wifi_conn_set() call last ran), NOT the live tag and NOT a hardcoded 0 --
+	 * see this function's own top comment for why, and hal/cc3501e_hw.h's
+	 * cc3501e_hw_wifi_last_reason() contract for what a host is meant to read
+	 * out of this republish. */
+	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_DISCONNECTED,
+	              (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE,
+	              g_wifi_conn.reason);
 	return CC3501E_HW_OK;
 }
 
@@ -1376,7 +2496,41 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	 *
 	 * Best-effort by design (return ignored, as in the BLE path): if the NWP
 	 * rejects the set, the AP should still come up -- just possibly with the
-	 * #1562 lifetime. A hard failure here would turn a degraded AP into no AP. */
+	 * #1562 lifetime. A hard failure here would turn a degraded AP into no AP.
+	 *
+	 * AUDITED for the STA path's connect-first ordering bug (this file's
+	 * cc3501e_hw_wifi_ensure_sta_role()): AP does NOT have it.  Unlike STA, the
+	 * AP role-up path never went through the latch/drain
+	 * (cc3501e_hw_power_service()) to reach a safe default in the first place --
+	 * this Wlan_Set() call already runs SYNCHRONOUSLY, inline, BEFORE
+	 * Wlan_RoleUp(AP) below, so there is no window where beaconing could start
+	 * under a stale ELP/AUTO_PS setting.
+	 *
+	 * Two related bugs WERE found here, one level up, in cc3501e_hw_ti_power.c:
+	 *   1. Its effective-policy rule used to exclude AP from the
+	 *      unconfigured-default override by testing cc3501e_hw_radio_role() !=
+	 *      WIFI_AP -- and that role getter reports AP over STA whenever BOTH
+	 *      are up.  So a scan/connect that brought STA up WHILE this AP was
+	 *      already running read as "AP" there, took the pp_policy_latched
+	 *      (BALANCED) branch instead of the unconfigured default.  Fixed by
+	 *      gating on the STA role being up directly
+	 *      (cc3501e_hw_wifi_sta_role_up()) instead of reading
+	 *      cc3501e_hw_radio_role().
+	 *   2. Even with (1) fixed, an EXPLICIT host CMD_POWER_POLICY of BALANCED /
+	 *      LOW_POWER / DEEP_SLEEP still applied verbatim -- pm is device-wide
+	 *      (ctrlCmdFw_SetSleepAuth has no per-role scoping), so that pulled
+	 *      THIS role's forced ALWAYS_ACTIVE back to ELP the next time
+	 *      cc3501e_hw_tick() drained it.  pp_apply_radio() now forces pm back
+	 *      to ALWAYS_ACTIVE unconditionally whenever AP is up, regardless of
+	 *      which policy (or who chose it) is otherwise being applied -- see
+	 *      its header comment.  ps (the STA-specific half) is unaffected and
+	 *      still follows the host's policy.
+	 * With AP up and STA never coming up, cc3501e_hw_tick()'s drain never runs
+	 * at all either way (pp_apply_radio_effective() requires an STA role up
+	 * before calling pp_apply_radio()), so a host CMD_POWER_POLICY sent while
+	 * only this AP is running does not reach the radio until a STA role also
+	 * exists -- this Wlan_Set() call is what keeps an AP-only bridge on
+	 * ALWAYS_ACTIVE in that window regardless. */
 	WlanPowerManagement_e pm = POWER_MANAGEMENT_ALWAYS_ACTIVE_MODE; /* = 0 */
 	(void)Wlan_Set(WLAN_SET_POWER_MANAGEMENT, (void *)&pm);
 
@@ -1454,6 +2608,26 @@ int cc3501e_hw_wifi_ap_stop(void)
 		return CC3501E_HW_ERR_IO;
 	}
 	wifi_ap_role_up = false;
+	/* The AP role-up path forces device-wide pm to ALWAYS_ACTIVE, both inline
+	 * (cc3501e_hw_wifi_ap_start()'s own Wlan_Set() before RoleUp) and via
+	 * pp_apply_radio()'s AP-up override on every later apply.  Neither is
+	 * self-undoing, so re-apply now to re-derive the host's actual latched
+	 * policy with the AP no longer forcing anything.
+	 *
+	 * THIS ONLY ACTUALLY FIXES IT WHEN A STA ROLE IS ALSO UP.  Safe to call
+	 * unconditionally either way -- cc3501e_hw_power_apply_radio_now() ->
+	 * pp_apply_radio_effective() no-ops cleanly with no STA role up (#5's
+	 * guard) -- but that guard means an AP-ONLY bridge (no STA role ever
+	 * brought up) is NOT fixed by this call: it stays ALWAYS_ACTIVE
+	 * regardless, until a STA role comes up or the next POWER_POLICY lands
+	 * with one already up.  That residual costs idle power only, not
+	 * correctness -- ALWAYS_ACTIVE is always a safe (if wasteful) state,
+	 * never a wrong one.  TASK CONTEXT ONLY, and safe here because
+	 * WIFI_AP_STOP is worker-routed (src/worker.c, src/protocol_wifi.c's
+	 * handle_wifi_ap_stop() -> handle_worker_routed()), so this body -- like
+	 * cc3501e_hw_wifi_ensure_sta_role() -- always runs in worker_run_pending()
+	 * on the bringup task, never the SPI-dispatch ISR. */
+	cc3501e_hw_power_apply_radio_now();
 	return CC3501E_HW_OK;
 }
 

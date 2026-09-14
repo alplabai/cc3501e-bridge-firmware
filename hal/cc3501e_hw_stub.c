@@ -272,9 +272,23 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
+/* No radio on the host stub, so no real WLAN event ever fires -- default 0
+ * ("none recorded", see the contract in hal/cc3501e_hw.h).  Settable ONLY by
+ * cc3501e_hw_wifi_test_set_last_reason() below, which exists purely so the host
+ * suite (tests/unit) can exercise CMD_WIFI_STATUS's last_reason-byte plumbing
+ * (formerly named `reserved`; protocol_wifi.c) without a silicon-only vendor
+ * event -- not part of the cc3501e_hw.h contract and not declared there.  Cleared by
+ * cc3501e_hw_wifi_mark_connecting() below, mirroring the real TI backend's
+ * contract (hal/cc3501e_hw.h): the published byte must read 0 for a fresh
+ * attempt unless THAT attempt records a reason of its own. */
+static int16_t stub_wifi_last_reason;
+
 void cc3501e_hw_wifi_mark_connecting(void)
 {
-	/* No radio on the host stub -- the connect-status latch stays DISCONNECTED. */
+	/* No radio on the host stub -- the connect-status latch stays DISCONNECTED.
+	 * The reason latch IS real state, though (see stub_wifi_last_reason's
+	 * comment above), so clear it here the same as the TI backend does. */
+	stub_wifi_last_reason = 0;
 }
 
 int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rssi_dbm)
@@ -283,6 +297,17 @@ int cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *rs
 	if (fail_reason != 0) *fail_reason = (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE;
 	if (rssi_dbm != 0) *rssi_dbm = 0;
 	return CC3501E_HW_OK;
+}
+
+int16_t cc3501e_hw_wifi_last_reason(void)
+{
+	return stub_wifi_last_reason;
+}
+
+/* TEST-ONLY.  See stub_wifi_last_reason's comment above. */
+void cc3501e_hw_wifi_test_set_last_reason(int16_t reason)
+{
+	stub_wifi_last_reason = reason;
 }
 
 /* --------------------------------------------------------------- */

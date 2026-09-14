@@ -197,3 +197,24 @@ target_compile_options(test_sock_send_done PRIVATE ${TEST_FLAGS})
 target_link_options(test_sock_send_done PRIVATE -Wl,--wrap=cc3501e_hw_sock_send)
 target_link_libraries(test_sock_send_done PRIVATE ztest_shim)
 add_test(NAME sock_send_done COMMAND test_sock_send_done)
+
+# wifi_retry: the pure retry-delay + reason-restore decisions behind the
+# reason-30 bounded retry (hal/ti/cc3501e_hw_ti_wifi.c).  Deliberately NOT
+# built from FW_SOURCES here: src/wifi_retry.c has no dependency on the rest of
+# the firmware (no protocol.c, no worker.c, no HAL) by design -- see its own
+# header for why -- and the real Wlan_Connect/event plumbing it was pulled out
+# of needs the vendored TI SimpleLink SDK and is never linked into a host
+# build at all, so this is the only piece of that fix host-testable full stop.
+# (It IS added to the top-level CMakeLists.txt's CC3501E_BRIDGE_SOURCES, so the
+# stub -Werror builds still compile it -- just not via this suite's FW_SOURCES
+# above, which mirrors the STUB build's own CC3501E_BRIDGE_SOURCES list.)
+add_executable(test_wifi_retry
+    wifi_retry/src/test_wifi_retry.c
+    ${FW}/src/wifi_retry.c
+)
+target_include_directories(test_wifi_retry PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_wifi_retry PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_wifi_retry PRIVATE ztest_shim)
+add_test(NAME wifi_retry COMMAND test_wifi_retry)
