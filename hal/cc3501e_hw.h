@@ -548,13 +548,21 @@ int cc3501e_hw_sock_close(uint16_t handle);
  * one bridge transaction per frame instead of a submit/collect pair. */
 void cc3501e_hw_sock_pump(void); /* task ctx: does the lwIP read */
 void cc3501e_hw_sock_prefetch(uint16_t handle, bool on);
-/* dispatch ctx: memcpy only, never lwIP.  Three distinct answers:
+/* dispatch ctx: memcpy only, never lwIP.  Four distinct answers:
  *
- *   >= 0  bytes taken from the ring.
+ *   >= 0  bytes taken from the ring (0 legitimately means "peer closed,
+ *         ring drained" -- EOF, not an error).
  *   -1    NOT the prefetched handle.  The worker path is the only reader of that
  *         fd, so the caller SHOULD fall through to it.
- *   -2    armed for this handle but the ring is momentarily empty.  The caller
- *         MUST NOT fall through: answer BUSY and let the host re-poll.
+ *   -2    armed for this handle but the ring is momentarily empty and the peer
+ *         is still connected.  The caller MUST NOT fall through: answer BUSY
+ *         and let the host re-poll.
+ *   -3    armed for this handle, ring drained, and cc3501e_hw_sock_pump()
+ *         recorded a real lwIP failure on this fd (RST etc, not EAGAIN) --
+ *         terminal, not "more may arrive later" the way -2 is.  The caller
+ *         MUST NOT fall through (same reader-exclusivity reason as -2) and
+ *         MUST NOT answer BUSY (nothing is ever coming): answer the same
+ *         status a genuine worker-path socket failure gets.
  *
  * EXCLUSIVITY RULE (#7): exactly one code path may call lwip_* on a prefetched
  * fd, and for an armed handle that path is cc3501e_hw_sock_pump().  Falling

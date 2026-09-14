@@ -265,6 +265,42 @@ target_compile_options(test_sock_prefetch_arm PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_sock_prefetch_arm PRIVATE ztest_shim)
 add_test(NAME sock_prefetch_arm COMMAND test_sock_prefetch_arm)
 
+# sock_recv_ring_status: the pure drained-status decision (EOF / terminal
+# error / empty-for-now) behind the bug 2 fix (ring path never reports a
+# reset) in hal/ti/cc3501e_hw_ti_sock.c's cc3501e_hw_sock_recv_ring() --
+# cc3501e_hw_sock_pump() used to ignore a real lwip_recv() failure entirely,
+# so a drained ring with a dead peer answered BUSY forever.  Header-only
+# (sock_recv_ring_status.h is a single `static inline` two-branch decision,
+# no state to split into a .c like sock_recv_commit's tail/uncommitted
+# arithmetic needed), same reason as sock_prefetch_arm above: the real ring
+# is TI-SDK-only (lwIP, CC3501E_WIFI) and never linked on the host.
+add_executable(test_sock_recv_ring_status
+    sock_recv_ring_status/src/test_sock_recv_ring_status.c
+)
+target_include_directories(test_sock_recv_ring_status PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_sock_recv_ring_status PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_recv_ring_status PRIVATE ztest_shim)
+add_test(NAME sock_recv_ring_status COMMAND test_sock_recv_ring_status)
+
+# sock_worker_recv_eof: the pure worker-path sticky-EOF latch decision
+# (n/want/is_stream) and the bounded table get/set behind
+# hal/ti/cc3501e_hw_ti_sock.c's cc3501e_hw_sock_recv() fix (host review of
+# bfb5f08) -- including the want == 0 BLOCKER (a want == 0 recv must never
+# latch a false EOF on a live socket).  Header-only, same reason as
+# sock_prefetch_arm/sock_recv_ring_status above: the real call site is
+# TI-SDK-only (lwIP, CC3501E_WIFI) and never linked on the host.
+add_executable(test_sock_worker_recv_eof
+    sock_worker_recv_eof/src/test_sock_worker_recv_eof.c
+)
+target_include_directories(test_sock_worker_recv_eof PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_sock_worker_recv_eof PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_worker_recv_eof PRIVATE ztest_shim)
+add_test(NAME sock_worker_recv_eof COMMAND test_sock_worker_recv_eof)
+
 # sock_recv_worker_cache: the WORKER-FALLBACK reply cache in
 # protocol_sockets.c's handle_sock_recv() (g_sock_recv_wk_cached et al.) --
 # closes the KNOWN FOLLOW-UP the ring fast path's own fix (sock_recv_replay,

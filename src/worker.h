@@ -328,20 +328,30 @@ void protocol_sock_recv_note_submit(uint8_t seq);
  *      and this cache would resurrect a closed handle's entry the next time
  *      the closed handle NUMBER is reused.
  *
- * @p handle is read out of job.req (SOCK_RECV's own worker_execute() case
- * already computes it at offset 0) -- unlike SOCK_SEND's seq, the handle
- * DOES ride in the wire payload, so it needs no separate capture.  @p hw_rv /
- * @p data / @p len follow the same contract as the SOCK_SEND hook: the raw
- * HAL return code (mapped to an ALP_CC3501E_RESP_* by protocol_sockets.c, not
- * here) and the reply bytes, valid on CC3501E_HW_OK only.  BOTH OUTCOMES ARE
- * CACHED for the same reason: a same seq+handle poll is a retry of the SAME
- * logical recv, GIVEN a host with a dedicated SOCK_RECV counter
- * (alp-sdk#2108) -- a pre-#2108 host sharing one counter across every opcode
- * can alias two DIFFERENT logical recvs onto the same (seq, handle) pair;
- * see protocol_sockets.c's own RESIDUAL comment above g_sock_recv_wk_cached. */
+ * @p handle and @p max_len are both read out of job.req (SOCK_RECV's own
+ * worker_execute() case already computes them at offsets 0 and 2) -- unlike
+ * SOCK_SEND's seq, neither rides anywhere else, so neither needs a separate
+ * submit-time capture.  @p hw_rv / @p data / @p len follow the same contract
+ * as the SOCK_SEND hook: the raw HAL return code (mapped to an
+ * ALP_CC3501E_RESP_* by protocol_sockets.c, not here) and the reply bytes,
+ * valid on CC3501E_HW_OK only.  BOTH OUTCOMES ARE CACHED for the same
+ * reason: a same seq+handle+max_len poll is a retry of the SAME logical
+ * recv, GIVEN a host with a dedicated SOCK_RECV counter (alp-sdk#2108) -- a
+ * pre-#2108 host sharing one counter across every opcode can alias two
+ * DIFFERENT logical recvs onto the same (seq, handle) pair; see
+ * protocol_sockets.c's own RESIDUAL comment above g_sock_recv_wk_cached.
+ *
+ * @p max_len JOINS THE KEY (host review of 9c989dc, MINOR): a same-seq,
+ * same-handle retry whose max_len DIFFERS from the original is not the
+ * same logical recv -- the SDK host always resends byte-identical
+ * payloads, so this is a defensive, not a reachable-today, fix.  Without it
+ * a same-seq+handle poll carrying a SMALLER max_len than the cached entry's
+ * own (e.g. 0, where the original was nonzero) would still be served the
+ * cached entry sized for the ORIGINAL, larger max_len -- firmware
+ * correctness must not depend on what a caller happens to do. */
 void protocol_sock_recv_worker_invalidate(void);
 void protocol_sock_recv_worker_copy(const uint8_t *data, size_t len);
-void protocol_sock_recv_worker_publish(uint16_t handle, int hw_rv, size_t len);
+void protocol_sock_recv_worker_publish(uint16_t handle, uint16_t max_len, int hw_rv, size_t len);
 
 /*
  * worker_run_pending -- THE DRAIN.  Runs OUTSIDE the ISR, from main()'s

@@ -99,6 +99,20 @@ static bool     g_wrap_large_mode;
 static uint16_t g_wrap_large_n;      /* bytes reported by the last large-mode call */
 static uint16_t g_wrap_last_cap;     /* @p cap worker.c passed on the last call */
 static uint16_t g_wrap_last_max_len; /* @p max_len worker.c passed on the last call */
+/* cc3501e-bridge-firmware bug 1 (worker-path recv after EOF answers
+ * RESP_ERR_RADIO): models what the REAL TI HAL now does after the
+ * hal/ti/cc3501e_hw_ti_sock.c sticky-EOF fix -- every recv on an fd that has
+ * already seen EOF reports CC3501E_HW_OK with 0 bytes, not just the first.
+ * The fix itself lives in that TI-SDK-only file and cannot link on the host
+ * (see the block comment above cc3501e_hw_sock_recv()'s sock_eof table for
+ * the full argument, and this suite's own top comment for why --wrap is
+ * this file's way of reaching a real RESP_OK on the host at all) -- this
+ * mode instead proves the PLUMBING this fix depends on: that
+ * protocol_sockets.c threads a HAL-reported OK/0-bytes through to the wire
+ * as RESP_OK on EVERY worker-routed poll, not just the first, so the fixed
+ * HAL's repeated OK/0 answers actually reach the host as EOF rather than
+ * falling into some other latent short-circuit. */
+static bool g_wrap_eof_mode;
 
 /* protocol.h's CC3501E_REPLY_DATA_MAX is the wire's own documented ceiling on
  * a handler's total reply DATA (status byte's payload); the recv-resp header
@@ -118,6 +132,12 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
 	g_wrap_calls++;
 	g_wrap_last_cap     = cap;
 	g_wrap_last_max_len = max_len;
+	if (g_wrap_eof_mode) {
+		if (recv_len_out != NULL) *recv_len_out = 0u;
+		if (from_addr != NULL) memset(from_addr, 0, 4u);
+		if (from_port_out != NULL) *from_port_out = 0u;
+		return CC3501E_HW_OK;
+	}
 	if (g_wrap_large_mode) {
 		/* Simulates a peer with AT LEAST this many bytes queued -- i.e. a
 		 * full read that consumes exactly what worker.c's own data_cap (the
@@ -138,13 +158,31 @@ int __wrap_cc3501e_hw_sock_recv(uint16_t  handle,
 	return CC3501E_HW_OK;
 }
 
+/* Captures the @p cap this suite's ring wrap was last called with -- the
+ * ONLY way a host test can observe protocol_sockets.c's own room
+ * computation (item 8, host review of bfb5f08): the wrap itself never
+ * consulted @p cap before this, so nothing else in this file's behaviour
+ * depends on it changing meaning here. */
+static uint16_t g_wrap_ring_last_cap;
+
 /* Redirects every cc3501e_hw_sock_recv_ring() call to here
- * (`-Wl,--wrap=cc3501e_hw_sock_recv_ring`, tests/unit/CMakeLists.txt) --
- * ONLY for the BLOCKER 1 test below (test_ring_recv_does_not_age_out_the_
- * worker_fallback_cache): reports "ring-owned, OK" for handle 777 and
- * "not mine, fall through" (-1) for everything else, so every OTHER test in
- * this file (none of which uses handle 777) sees the SAME rc == -1 the
- * plain stub's own cc3501e_hw_sock_recv_ring() always returns, unaffected. */
+ * (`-Wl,--wrap=cc3501e_hw_sock_recv_ring`, tests/unit/CMakeLists.txt).
+ * Four fixed handles, so every OTHER test in this file (none of which uses
+ * any of them) still sees the SAME rc == -1 the plain stub's own
+ * cc3501e_hw_sock_recv_ring() always returns, unaffected:
+ *
+ *   777 -- "ring-owned, OK", 1 byte -- BLOCKER 1 test below
+ *          (test_ring_recv_does_not_age_out_the_worker_fallback_cache).
+ *   778 -- rc == -3, "ring-owned, drained and errored" (bug 2 fix, host
+ *          review of bfb5f08's own MAJOR 3: protocol_sockets.c's
+ *          handle_sock_recv() rc == -3 branch had no test) --
+ *          test_ring_error_answers_radio_not_busy_or_worker below.
+ *   779 -- rc == -2, "ring-owned, armed but momentarily empty, peer still
+ *          connected" -- item 8's max_len == 0 room fix
+ *          (test_ring_max_len_zero_* below): the ONLY way to reach
+ *          handle_sock_recv()'s rc == -2 branch from this suite, since 777
+ *          and 778 never return it.
+ *   everything else -- "not mine, fall through" (-1). */
 int __wrap_cc3501e_hw_sock_recv_ring(uint16_t  handle,
                                      uint8_t  *buf,
                                      uint16_t  cap,
@@ -152,15 +190,22 @@ int __wrap_cc3501e_hw_sock_recv_ring(uint16_t  handle,
                                      uint16_t *out_len)
 {
 	(void)replay;
-	(void)cap;
-	const bool mine = (handle == 777u);
-	if (!mine) {
-		if (out_len != NULL) *out_len = 0u;
-		return -1;
+	g_wrap_ring_last_cap = cap;
+	if (handle == 777u) {
+		buf[0] = 0x77u;
+		if (out_len != NULL) *out_len = 1u;
+		return 1;
 	}
-	buf[0] = 0x77u;
-	if (out_len != NULL) *out_len = 1u;
-	return 1;
+	if (handle == 778u) {
+		if (out_len != NULL) *out_len = 0u;
+		return -3;
+	}
+	if (handle == 779u) {
+		if (out_len != NULL) *out_len = 0u;
+		return -2;
+	}
+	if (out_len != NULL) *out_len = 0u;
+	return -1;
 }
 
 /* ---- Wire harness -- deliberately duplicated from test_transport_spi.c ----
@@ -224,8 +269,17 @@ static size_t drain(uint8_t *out, size_t cap)
 
 /* alp_cc3501e_sock_recv_t = handle(2) max_len(2) = 4 B.  Builds a SOCK_RECV
  * request frame with the given header seq (flags bits 3..7,
- * ALP_CC3501E_FLAG_REQ_SEQ_SHIFT) and handle; max_len 0 = "no cap beyond the
- * reply buffer", same as the ring fast-path suite's build_recv(). */
+ * ALP_CC3501E_FLAG_REQ_SEQ_SHIFT) and handle, max_len LE16 = 0.
+ *
+ * max_len == 0 no longer means "no cap" on the wire (item 8, host review of
+ * bfb5f08 -- see protocol_sockets.c's handle_sock_recv() room computation);
+ * it is harmless here regardless because every WORKER-FALLBACK test in this
+ * file drives __wrap_cc3501e_hw_sock_recv(), which never reads @p max_len at
+ * all (only worker.c's own @p cap, which max_len == 0 leaves at the wire
+ * ceiling) -- so those tests are unaffected by this room fix.  Only the
+ * RING-owned handles (777/778/779, __wrap_cc3501e_hw_sock_recv_ring above)
+ * are, and the tests that need a NONZERO max_len to prove that use
+ * build_recv_ml() below instead. */
 static void build_recv(uint8_t *out, uint8_t seq, uint16_t handle)
 {
 	out[0] = ALP_CC3501E_CMD_SOCK_RECV;
@@ -236,6 +290,17 @@ static void build_recv(uint8_t *out, uint8_t seq, uint16_t handle)
 	out[5] = (uint8_t)((handle >> 8) & 0xFFu);
 	out[6] = 0u; /* max_len LE16 = 0 */
 	out[7] = 0u;
+}
+
+/* Same as build_recv(), with an explicit, possibly-nonzero max_len -- for
+ * the item 8 room-computation tests below, which need to drive BOTH the
+ * max_len == 0 and the max_len != 0 arms of handle_sock_recv()'s room
+ * clamp against the SAME ring-owned handle. */
+static void build_recv_ml(uint8_t *out, uint8_t seq, uint16_t handle, uint16_t max_len)
+{
+	build_recv(out, seq, handle);
+	out[6] = (uint8_t)(max_len & 0xFFu);
+	out[7] = (uint8_t)((max_len >> 8) & 0xFFu);
 }
 
 /* alp_cc3501e_sock_close_t = handle(2) reserved(2) = 4 B. */
@@ -368,6 +433,42 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_different_handle_submits_new)
 	zassert_equal(g_wrap_calls,
 	              calls_before + 2u,
 	              "same seq, different handle (301 vs 300) submits a NEW hw recv");
+
+	transaction(req_b, sizeof req_b);
+	size_t n = drain(reply, sizeof reply);
+	zassert_equal(n, reply_wire(RECV_REPLY_LEN), "req_b's own cache hit");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "req_b collects its own DONE");
+	zassert_equal(g_wrap_calls, calls_before + 2u, "req_b's own cache hit ran no further hw recv");
+}
+
+/* MINOR residual (host review of 9c989dc): same seq, same handle, but a
+ * DIFFERENT max_len -- the invalidation check and the cache fill both used
+ * to key on (seq, handle) alone, so this used to be served req_a's cached
+ * reply (sized/consumed for req_a's OWN max_len) as if it were a
+ * byte-identical retry of it.  The SDK host never actually varies max_len
+ * on a retry (poll_by_repeat() always resends an identical frame), so this
+ * is a defensive fix, not a reachable-today one -- but firmware correctness
+ * must not depend on what a caller happens to do. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_same_seq_same_handle_different_max_len_submits_new)
+{
+	uint8_t        reply[64];
+	uint8_t        req_a[8];
+	uint8_t        req_b[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv_ml(req_a, 17u, 310u, 64u);
+	build_recv_ml(req_b, 17u, 310u, 0u); /* same seq + handle, DIFFERENT max_len */
+
+	transaction(req_a, sizeof req_a);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls, calls_before + 1u, "req_a's submit ran the HW body once");
+
+	/* Same seq (17), same handle (310), but max_len differs (0 vs 64) --
+	 * must NOT be served req_a's cached reply. */
+	transaction(req_b, sizeof req_b);
+	(void)drain(reply, sizeof reply);
+	zassert_equal(g_wrap_calls,
+	              calls_before + 2u,
+	              "same seq+handle, different max_len (0 vs 64) submits a NEW hw recv");
 
 	transaction(req_b, sizeof req_b);
 	size_t n = drain(reply, sizeof reply);
@@ -789,10 +890,147 @@ ZTEST(cc3501e_sock_recv_worker_cache, test_probe_shared_counter_wrap_via_other_o
 	zassert_equal(st, ALP_CC3501E_RESP_OK, "KNOWN RESIDUAL: served the stale recv as OK");
 }
 
+/* PLUMBING CHECK, NOT A TEST OF THE FIX (host review of bfb5f08, MINOR):
+ * this passes against UNFIXED firmware too -- it does not exercise
+ * hal/ti/cc3501e_hw_ti_sock.c's sticky-EOF table at all (that TI-SDK-only
+ * file never links into a host test, see this suite's own top comment), it
+ * only proves that protocol_sockets.c's plumbing already threads a
+ * HAL-reported OK/0 through to the wire as RESP_OK on repeated polls, not
+ * just the first -- a precondition the real fix depends on, not the fix
+ * itself.  g_wrap_eof_mode here stands in for what the sticky-EOF table
+ * makes the REAL HAL do on silicon; the table's own latch decision (n,
+ * want, is_stream) and the want == 0 BLOCKER fix are covered on the host
+ * instead by tests/unit/sock_worker_recv_eof/ (sock_worker_recv_eof.h),
+ * which sock_worker_recv_eof_should_latch()'s own comment cross-references.
+ * Uses two DIFFERENT seqs on the same handle (not a same-seq retry) so
+ * each poll reaches the wrapped HAL body fresh, not a cache replay. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_worker_plumbing_repeats_hal_ok_zero_as_wire_ok_zero)
+{
+	uint8_t        reply[64];
+	uint8_t        req_a[8];
+	uint8_t        req_b[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req_a, 10u, 900u);
+	build_recv(req_b, 11u, 900u); /* same handle, different seq -- a later, new recv */
+
+	g_wrap_eof_mode = true;
+
+	int sub_a = poll_status(req_a, reply, sizeof reply);
+	zassert_equal(sub_a, ALP_CC3501E_RESP_ERR_BUSY, "first EOF recv submits");
+	int got_a = poll_status(req_a, reply, sizeof reply);
+	zassert_equal(got_a, ALP_CC3501E_RESP_OK, "first EOF recv answers OK, not RESP_ERR_RADIO");
+	/* data_len (alp_cc3501e_sock_recv_resp_t, DATA-relative bytes 20..21,
+	 * LE16) must actually be 0, not just the status byte -- a handler that
+	 * answered OK with a stale/garbage byte count would pass the status
+	 * check above and still be wrong. */
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len)],
+	              0u,
+	              "data_len low byte is 0");
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len) + 1u],
+	              0u,
+	              "data_len high byte is 0");
+
+	int sub_b = poll_status(req_b, reply, sizeof reply);
+	zassert_equal(sub_b, ALP_CC3501E_RESP_ERR_BUSY, "second, later EOF recv submits fresh");
+	int got_b = poll_status(req_b, reply, sizeof reply);
+	zassert_equal(
+	    got_b, ALP_CC3501E_RESP_OK, "second EOF recv ALSO answers OK, not RESP_ERR_RADIO");
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len)],
+	              0u,
+	              "second recv's data_len low byte is also 0");
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len) + 1u],
+	              0u,
+	              "second recv's data_len high byte is also 0");
+
+	zassert_equal(g_wrap_calls,
+	              calls_before + 2u,
+	              "both recvs actually reached the HAL body, not a cache replay");
+
+	g_wrap_eof_mode = false;
+}
+
+/* MAJOR 3 (host review of bfb5f08): the ring path's rc == -3 branch
+ * (protocol_sockets.c's handle_sock_recv(), src/sock_recv_ring_status.h's
+ * "drained and errored" answer) had no test at all.  handle 778 is wrapped
+ * to return -3 from cc3501e_hw_sock_recv_ring() (see the wrap's own doc
+ * comment above) -- this must answer RESP_ERR_RADIO, the SAME status a
+ * genuine worker-path socket failure gets, NEVER RESP_ERR_BUSY (that would
+ * spin the host to its poll_by_repeat timeout waiting for bytes that are
+ * never coming -- M3b) and NEVER fall through to the worker-routed path
+ * (that would make cc3501e_hw_sock_recv() a SECOND reader of an
+ * already-failed fd -- the exact #7 hazard -2/BUSY's own comment
+ * describes, and the M3c mutation the host review named: -3 misread as
+ * "not my handle" and forwarded to the worker). */
+ZTEST(cc3501e_sock_recv_worker_cache, test_ring_error_answers_radio_not_busy_or_worker)
+{
+	uint8_t        reply[64];
+	uint8_t        req[8];
+	const uint32_t calls_before = g_wrap_calls;
+	build_recv(req, 14u, 778u); /* rc == -3, per __wrap_cc3501e_hw_sock_recv_ring above */
+
+	int st = poll_status(req, reply, sizeof reply);
+	zassert_equal(st,
+	              ALP_CC3501E_RESP_ERR_RADIO,
+	              "a drained, errored ring answers RESP_ERR_RADIO -- never BUSY (M3b), "
+	              "never falls through to the worker (M3c)");
+	zassert_equal(g_wrap_calls,
+	              calls_before,
+	              "the worker-routed cc3501e_hw_sock_recv() was never called -- the ring "
+	              "stays the sole reader of this fd (#7)");
+}
+
+/* ITEM 8 (host review of bfb5f08): the ring path's room computation used to
+ * treat max_len == 0 as "no cap" -- see the block comment above this room
+ * clamp in protocol_sockets.c's handle_sock_recv() for why that is wrong
+ * (alp-sdk's cc3501e_sock_recv() never sends wire max_len 0 for a nonzero
+ * cap) and the silent-data-loss shape it caused.  handle 779 is wrapped to
+ * return rc == -2 ("armed but empty, peer still connected") REGARDLESS of
+ * what @p cap it is called with (see the wrap's own doc comment) -- so the
+ * ONLY thing distinguishing these two tests is what room
+ * handle_sock_recv() itself computed and passed in, captured into
+ * g_wrap_ring_last_cap. */
+ZTEST(cc3501e_sock_recv_worker_cache, test_ring_max_len_zero_computes_zero_room_and_answers_ok)
+{
+	uint8_t reply[64];
+	uint8_t req[8];
+	build_recv(req, 15u, 779u); /* max_len 0 */
+
+	int st = poll_status(req, reply, sizeof reply);
+	zassert_equal(g_wrap_ring_last_cap, 0u, "max_len == 0 clamps room to 0, not the buffer size");
+	zassert_equal(st,
+	              ALP_CC3501E_RESP_OK,
+	              "max_len == 0 answers OK immediately, never BUSY -- consistent with the "
+	              "worker path's want == 0 short-circuit (sock_worker_recv_eof.h)");
+	/* data_len (DATA-relative bytes 20..21) must be 0: this reply carries a
+	 * well-formed, zeroed header, not a bare/short status. */
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len)],
+	              0u,
+	              "data_len low byte is 0");
+	zassert_equal(reply[5u + (uint32_t)offsetof(alp_cc3501e_sock_recv_resp_t, data_len) + 1u],
+	              0u,
+	              "data_len high byte is 0");
+}
+
+ZTEST(cc3501e_sock_recv_worker_cache, test_ring_nonzero_max_len_still_clamps_room_and_stays_busy)
+{
+	uint8_t reply[64];
+	uint8_t req[8];
+	build_recv_ml(req, 16u, 779u, 64u); /* SAME handle as above, max_len 64 this time */
+
+	int st = poll_status(req, reply, sizeof reply);
+	zassert_equal(g_wrap_ring_last_cap,
+	              64u,
+	              "a genuinely nonzero max_len is still clamped to itself, unaffected by the "
+	              "max_len == 0 fix");
+	zassert_equal(
+	    st, ALP_CC3501E_RESP_ERR_BUSY, "max_len != 0 on an armed-but-empty ring is still BUSY");
+}
+
 static void reset_worker(void *fixture)
 {
 	(void)fixture;
 	g_wrap_large_mode = false;
+	g_wrap_eof_mode   = false;
 	worker_init();
 }
 

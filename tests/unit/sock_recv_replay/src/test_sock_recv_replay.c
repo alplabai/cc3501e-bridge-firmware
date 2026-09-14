@@ -158,6 +158,34 @@ static bool recv_replay(uint8_t seq, uint16_t handle)
 	return g_last_replay;
 }
 
+/* Same shape as build_recv() / recv_replay(), with an explicit max_len --
+ * for the max_len-joins-the-key test below (host review of 9c989dc). */
+static void build_recv_ml(uint8_t *out, uint8_t seq, uint16_t handle, uint16_t max_len)
+{
+	build_recv(out, seq, handle);
+	out[6] = (uint8_t)(max_len & 0xFFu);
+	out[7] = (uint8_t)((max_len >> 8) & 0xFFu);
+}
+
+static bool recv_replay_ml(uint8_t seq, uint16_t handle, uint16_t max_len)
+{
+	uint8_t req[8];
+	uint8_t reply[64];
+
+	build_recv_ml(req, seq, handle, max_len);
+	const uint32_t calls_before = g_wrap_calls;
+	transaction(req, sizeof req);
+	size_t n = drain(reply, sizeof reply);
+
+	zassert_equal(g_wrap_calls, calls_before + 1u, "the fast path engaged the wrapped ring");
+	zassert_equal(n,
+	              reply_wire(sizeof(alp_cc3501e_sock_recv_resp_t)),
+	              "OK reply = header + status + the recv-resp header (0 bytes of data)");
+	zassert_equal(reply[4], ALP_CC3501E_RESP_OK, "the wrap's rc=0 answers OK");
+
+	return g_last_replay;
+}
+
 ZTEST_SUITE(cc3501e_sock_recv_replay, NULL, NULL, NULL, NULL, NULL);
 
 /* A same-seq, same-handle re-issue is exactly poll_by_repeat()'s retry of a
@@ -192,4 +220,19 @@ ZTEST(cc3501e_sock_recv_replay, test_different_handle_is_not_replay)
 	zassert_false(recv_replay(5u, 400u), "priming call, handle 400");
 	zassert_false(recv_replay(5u, 401u),
 	              "same seq (5), different handle (401 vs 400) -> not a replay");
+}
+
+/* MINOR residual (host review of 9c989dc): same seq, same handle, but a
+ * DIFFERENT max_len -- not a byte-identical re-issue of the original call,
+ * so it must NOT read as a replay even though seq and handle both match.
+ * The SDK host always resends an identical frame (poll_by_repeat() never
+ * varies max_len on a retry), so this is not reachable against it today --
+ * but sock_recv_commit()'s replay contract is "re-serve exactly what the
+ * LAST call for this identity served", and a call asking for a DIFFERENT
+ * max_len is asking a different question, not repeating the last one. */
+ZTEST(cc3501e_sock_recv_replay, test_same_seq_same_handle_different_max_len_is_not_replay)
+{
+	zassert_false(recv_replay_ml(6u, 500u, 64u), "priming call, max_len 64");
+	zassert_false(recv_replay_ml(6u, 500u, 0u),
+	              "same seq (6) + same handle (500), DIFFERENT max_len (0 vs 64) -> not a replay");
 }
