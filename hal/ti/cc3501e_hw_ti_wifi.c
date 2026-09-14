@@ -2419,7 +2419,7 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	g_connect_reinit_armed   = bridge_transport_spi_hw_reinit();
 	g_connect_reinit_pending = true;
 
-		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0);
+	wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONNECTED, (uint8_t)ALP_CC3501E_WIFI_FAIL_NONE, 0);
 	return CC3501E_HW_OK;
 }
 
