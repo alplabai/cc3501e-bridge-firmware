@@ -320,36 +320,50 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * by the time that late event shows up, so the gate is already closed
  * against it too.
  *
- * RESIDUAL (read this before trusting an exact match): wifi_last_reason is
- * cleared twice for a new attempt -- once by cc3501e_hw_wifi_mark_connecting()
- * at submit, and again by cc3501e_hw_wifi_connect_sta() immediately before its
- * own Wlan_Connect (hal/ti/cc3501e_hw_ti_wifi.c) -- but neither reset is the
- * exact instant the vendor begins processing that new connect.  A THIRD such
- * reset happens for the SAME attempt if cc3501e_hw_wifi_connect_sta()'s RUN9
- * bounded retry fires (reason 30, see that function's own comment): the retry
- * re-issues Wlan_Connect once, and clears this value again immediately
- * before doing so, so a caller observing this byte mid-attempt cannot tell
- * a first try from a retried one -- only the FINAL value, once the attempt
- * reaches a terminal state or CONNECTED, is meaningful.  That FINAL value is
- * NOT simply whatever the retry pass's own events happen to produce: if the
- * retry pass itself ends in reason 3 (WLAN_REASON_DEAUTH_LEAVING -- either
- * our own pre-retry cleanup's Wlan_Disconnect() echoing back, or hostap's
- * generic SME give-up timer) or reason 0 (nothing recorded on the retry pass
- * at all), cc3501e_hw_wifi_connect_sta() restores the FIRST pass's real,
- * AP-issued reason (the 30 that made this eligible for a retry in the first
- * place) instead of publishing that less-informative retry-pass outcome --
- * see wifi_retry_should_restore_first_pass() (src/wifi_retry.h) for the
+ * RESIDUAL (read this before trusting an exact match): the underlying
+ * wifi_last_reason_tag (hal/ti/cc3501e_hw_ti_wifi.c) is cleared twice for a
+ * new attempt -- once by cc3501e_hw_wifi_mark_connecting() at submit, and
+ * again by cc3501e_hw_wifi_connect_sta() immediately before its own
+ * Wlan_Connect -- but neither reset is the exact instant the vendor begins
+ * processing that new connect.  A THIRD such reset happens for the SAME
+ * attempt if cc3501e_hw_wifi_connect_sta()'s RUN9 bounded retry fires
+ * (reason 30, see that function's own comment): the retry re-issues
+ * Wlan_Connect once, and clears this value again immediately before doing
+ * so, so a caller observing this byte mid-attempt cannot tell a first try
+ * from a retried one -- only the FINAL value, once the attempt reaches a
+ * terminal state or CONNECTED, is meaningful.  That FINAL value is NOT
+ * simply whatever the retry pass's own events happen to produce: if the
+ * retry pass itself ends in reason 3 (WLAN_REASON_DEAUTH_LEAVING -- USUALLY
+ * either our own pre-retry cleanup's Wlan_Disconnect() echoing back, or
+ * hostap's SME give-up timers reaching sme_deauth(), sme.c:2325-2345) or
+ * reason 0 (nothing recorded on the retry pass at all),
+ * cc3501e_hw_wifi_connect_sta() restores the FIRST pass's real, AP-issued
+ * reason (the 30 that made this eligible for a retry in the first place)
+ * instead of publishing that retry-pass outcome -- see
+ * wifi_retry_should_restore_first_pass() (src/wifi_retry.h) for the
  * mechanism.  Any OTHER retry-pass reason (a real, different AP reject code)
- * still publishes as the retry's own outcome.  A late event
- * from the PREVIOUS attempt (still in flight on the host-driver thread) that
- * lands in the tiny window between that second reset and the vendor actually
- * processing the new connect can still be recorded against the new one.  Not
- * limited to a disconnect-then-connect's reason 3 (WLAN_REASON_DEAUTH_LEAVING)
- * -- any late event the prior attempt produces, including a supplicant
- * DISCONNECT with a different real reason after an AUTHENTICATION_REJECTED,
- * or a late ASSOCIATION_REJECTED / AUTHENTICATION_REJECTED after a TIMEOUT,
- * can land there too. A reader should treat an unexpected value as POSSIBLY
- * belonging to the prior attempt, not necessarily the current one.
+ * still publishes as the retry's own outcome.
+ *
+ * THAT RESTORE ITSELF IS A HEURISTIC, NOT A PROOF, and can misfire: an AP's
+ * OWN deauth or disassoc frame can legitimately carry ReasonCode 3 too
+ * (drv_ti_mlme.c:1476/1521 copy the frame's own reason_code verbatim), and
+ * a retry pass that ends in a genuine reason-3 AP deauth -- or one whose
+ * own passphrase is wrong, which a first-pass AUTH-level 30 never actually
+ * checked, and which happens to surface via a reason-3 DISCONNECT rather
+ * than a fresh AUTHENTICATION_REJECTED -- would be wrongly relabeled as the
+ * first pass's stale 30.  See wifi_retry.h's own RESIDUAL note for the full
+ * discussion; this is accepted as the better default, not eliminated.
+ *
+ * A late event from the PREVIOUS attempt (still in flight on the
+ * host-driver thread) that lands in the tiny window between that second
+ * reset and the vendor actually processing the new connect can still be
+ * recorded against the new one.  Not limited to a disconnect-then-connect's
+ * reason 3 (WLAN_REASON_DEAUTH_LEAVING) -- any late event the prior attempt
+ * produces, including a supplicant DISCONNECT with a different real reason
+ * after an AUTHENTICATION_REJECTED, or a late ASSOCIATION_REJECTED /
+ * AUTHENTICATION_REJECTED after a TIMEOUT, can land there too. A reader
+ * should treat an unexpected value as POSSIBLY belonging to the prior
+ * attempt, not necessarily the current one.
  *
  * SCOPE: covers the CONNECT ATTEMPT only -- the reason or status that ENDED
  * or REJECTED that attempt.  CONNECTED ALWAYS publishes 0, unconditionally --

@@ -55,9 +55,11 @@ ZTEST(cc3501e_wifi_retry, test_delay_none_event_uses_denylist_delay)
 	zassert_equal(delay, 11000u, "NONE must default to the conservative denylist delay");
 }
 
-/* Reason 3 (WLAN_REASON_DEAUTH_LEAVING) on a retry pass is our own pre-retry
- * disconnect cleanup or hostap's generic SME give-up timer replaying itself --
- * never a fresh, informative AP verdict -- so it must be restored. */
+/* Reason 3 (WLAN_REASON_DEAUTH_LEAVING) on a retry pass is USUALLY our own
+ * pre-retry disconnect cleanup or hostap's SME give-up timer replaying
+ * itself, so it is restored -- see wifi_retry.h's own RESIDUAL note for why
+ * this is a heuristic (an AP's own deauth/disassoc can legitimately carry
+ * reason 3 too), not a proof that the retry pass carried no real verdict. */
 ZTEST(cc3501e_wifi_retry, test_restore_true_for_reason_3)
 {
 	zassert_true(wifi_retry_should_restore_first_pass(3),
@@ -78,4 +80,37 @@ ZTEST(cc3501e_wifi_retry, test_restore_false_for_other_reason)
 {
 	zassert_false(wifi_retry_should_restore_first_pass(17),
 	              "a real AP reject code on the retry pass must be published as-is");
+}
+
+/* The four cases below pin the BOUNDARY of the {0, 3} rule directly, rather
+ * than relying on 17 alone to prove "not every other value restores" --
+ * 17 alone left two off-by-one-style mutants passing: `retry_pass_reason !=
+ * 17` (true for every value except 17, including these four) and
+ * `retry_pass_reason <= 3` (true for every value from 0 through 3, including
+ * 1 and 2).  1 and 2 sit strictly between the two true cases and expose the
+ * second; 30 and 200 (a real AP reject and the vendor's own
+ * WLAN_DISCONNECT_USER_INITIATED placeholder, neither ever 3) sit well past
+ * the boundary and expose the first alongside 17. */
+ZTEST(cc3501e_wifi_retry, test_restore_false_for_reason_1)
+{
+	zassert_false(wifi_retry_should_restore_first_pass(1),
+	              "reason 1 sits between 0 and 3 but is not one of them: must not restore");
+}
+
+ZTEST(cc3501e_wifi_retry, test_restore_false_for_reason_2)
+{
+	zassert_false(wifi_retry_should_restore_first_pass(2),
+	              "reason 2 sits between 0 and 3 but is not one of them: must not restore");
+}
+
+ZTEST(cc3501e_wifi_retry, test_restore_false_for_reason_30)
+{
+	zassert_false(wifi_retry_should_restore_first_pass(30),
+	              "a real reason-30 retry-pass outcome must not restore");
+}
+
+ZTEST(cc3501e_wifi_retry, test_restore_false_for_reason_200)
+{
+	zassert_false(wifi_retry_should_restore_first_pass(200),
+	              "reason 200 (WLAN_DISCONNECT_USER_INITIATED) must not restore either");
 }

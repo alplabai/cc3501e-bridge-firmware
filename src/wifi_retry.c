@@ -4,8 +4,8 @@
  *
  * See wifi_retry.h for the contract on both functions -- this file has no
  * dependency on the rest of the firmware (no protocol.c, no worker.c, no HAL,
- * no TI SDK) by design, matching src/sock_recv_commit.c's precedent for a
- * fully host-testable decision pulled out of hal/ti/cc3501e_hw_ti_wifi.c.
+ * no TI SDK) by design, so it is fully host-testable pulled out of
+ * hal/ti/cc3501e_hw_ti_wifi.c.
  */
 
 #include "wifi_retry.h"
