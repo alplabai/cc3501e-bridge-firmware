@@ -46,6 +46,7 @@
 #include "cc3501e_hw_ti_internal.h" /* reply_drained / ota_reboot_pending / ota_reboot_rc / cc3501e_hw_ota_pump */
 #include "transport.h" /* bridge_transport_spi_hw_reinit (Wlan_Start DMA-coexistence fix);
                         * cc3501e_bridge_busy -- READY driven LOW from init (#17) */
+#include "../../src/link_quiet_rearm.h" /* #142: the pure once-per-episode quiet-rearm decision */
 
 /* Bridge SPI desync counter (transport_hw_ti_spi.c): increments each time the
  * slave re-arms the header phase on a reserved-range/0xA5 header (a misframe).
@@ -436,6 +437,110 @@ void cc3501e_hw_tick(void)
 	}
 #endif
 
+	/* #142: the four SPI self-heals that used to live HERE (dead-handle
+	 * reopen, resync-burst reinit, arm-fail reinit, reply-stall reinit) now
+	 * run on cc3501e_link_task, a dedicated 10 ms FreeRTOS task, instead of
+	 * being frozen for up to 70 s while this task is blocked inside a
+	 * WIFI_CONNECT/Wlan_Start body -- see cc3501e_hw_link_tick() below and
+	 * src/main.c's cc3501e_link_task.  g_resync_count/g_arm_fail_count are
+	 * still declared just above (this TU also reads them nowhere else) and
+	 * are now read ONLY from cc3501e_hw_link_tick() -- plus
+	 * bridge_transport_spi_probe_tick() under CC3501E_WEDGE_PROBE below,
+	 * which is a second, harmless volatile READER (the SPI ISR is still the
+	 * sole WRITER of both). */
+
+	/* Deferred self-reset, gated on reply_drained so the CMD_RESET ack has
+	 * FULLY clocked to the host before the chip resets (audit
+	 * "reset-fires-before-ack-clocked": the reset previously raced the
+	 * in-flight ack and the host never saw it).  The host sees the ack,
+	 * then the link goes quiet, then the firmware re-PINGs alive. */
+	/* Drain any queued OTA op: the slow psa_fwu flash work runs HERE (bring-up
+	 * task), never in the SPI ISR.  The flash op still stalls the CC35, so the
+	 * pump stands the bridge slave down for its duration (suspend/reinit, like a
+	 * radio op) -- see cc3501e_hw_ota_pump(). */
+	cc3501e_hw_ota_pump();
+
+	if (reset_pending && reply_drained) {
+		NVIC_SystemReset(); /* CMSIS: M33 system reset -- does not return */
+	}
+
+	/* Fill the socket RX ring on the TASK, so the dispatch can serve
+	 * CMD_SOCK_RECV with a memcpy instead of a worker round trip. */
+	cc3501e_hw_sock_pump();
+	/* Take any inbound connection on a listening socket, also on the TASK and
+	 * also non-blocking, and publish it as EVT_SOCK_ACCEPTED (protocol v9).
+	 * No-op until the host has actually called SOCK_LISTEN. */
+	cc3501e_hw_sock_accept_pump();
+#ifdef CC3501E_WEDGE_PROBE
+	bridge_transport_spi_probe_tick(); /* #1691 wedge snapshot (bench builds only) */
+#endif
+	/* Apply any power policy the SPI-dispatch ISR latched: Wlan_Set() is a
+	 * blocking vendor radio call and belongs on the task, not in the ISR. */
+	cc3501e_hw_power_service();
+
+	/* Deferred OTA reboot: once the FINISH ack has clocked back (reply_drained),
+	 * request the PSA-FWU reboot so the cold BL2/MCUboot swaps the STAGED slot to
+	 * primary (TRIAL).  Same ack-before-reboot race fix as CMD_RESET above. */
+	if (ota_reboot_pending && reply_drained) {
+		ota_reboot_pending = false; /* one-shot: don't re-request every tick if refused */
+		/* Returns ONLY if the swap was refused (e.g. BL2 anti-rollback on a
+		 * downgrade); on success it reboots and never returns.  Capture the rc so
+		 * the host can distinguish "refused" from "never fired" via OTA_STATUS. */
+		ota_reboot_rc = (int8_t)psa_fwu_request_reboot();
+	}
+}
+
+/* #142: how long the slave may sit parked at PH_REQ_HEADER, unarmed, with no
+ * host traffic at all, before the quiet-armed detector treats it as an
+ * armed-but-deaf wedge rather than an ordinarily-idle host.  Long enough
+ * that a host's own worst-case poll gap (WIFI_STATUS every 50 ms,
+ * CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS's own 150 ms window, or a human
+ * pausing between `alp companion` commands on the bench) never trips it;
+ * short enough to recover well inside the ~70 s a WIFI_CONNECT body can
+ * hold the bring-up task. */
+#define CC3501E_LINK_QUIET_REARM_MS 3000u
+
+/* #142 item 2: count of quiet-rearm heals fired -- link-task-owned (single
+ * writer, cc3501e_hw_link_tick() below; no ISR or other task touches it), so
+ * a plain non-volatile counter is enough.  NOT wired onto the wire: no
+ * existing GET_DIAG_INFO/OTA_STATUS reserved field has spare room without a
+ * protocol MAJOR bump (see ALP_CC3501E_PROTOCOL_MAJOR's own guard in
+ * <alp/protocol/cc3501e.h>), which is out of scope for this fix -- read over
+ * SWD like g_spi_reopen_count/g_rx_overrun_count until a future wire change
+ * has room to carry it. */
+static uint32_t g_quiet_rearm_heal_count;
+
+uint32_t cc3501e_hw_link_quiet_rearm_count(void)
+{
+	return g_quiet_rearm_heal_count;
+}
+
+/* #142: the SPI self-heal checks, moved OFF the bring-up task and onto their
+ * own dedicated 10 ms FreeRTOS task (cc3501e_link_task, src/main.c) so they
+ * keep running while the bring-up task is blocked for up to ~70 s inside a
+ * WIFI_CONNECT/Wlan_Start body -- see this file's own header and
+ * cc3501e_hw_tick()'s comment at the old call site for the root-cause
+ * writeup this closes.
+ *
+ * NO-OP while polled (bridge_transport_spi_polled(): the whole-boot OTA
+ * update-mode loop owns the slave single-threaded and every one of these
+ * calls already self-guards for that case, but skipping the whole function
+ * here keeps this task from doing any work at all during a mode where it
+ * has nothing useful to check) or quiesced (bridge_transport_spi_quiesced():
+ * an OTA flush in NORMAL mode legitimately holds the slave dead for the
+ * DURATION of a psa_fwu flash burst -- up to a 22-41 s slot erase, see
+ * src/main.c's update-mode loop comment for where that figure comes from --
+ * and this task must not race cc3501e_hw_ota_pump()'s own release/reinit
+ * pair around it). */
+void cc3501e_hw_link_tick(void)
+{
+	const bool polled   = bridge_transport_spi_polled();
+	const bool quiesced = bridge_transport_spi_quiesced();
+
+	if (polled || quiesced) {
+		return;
+	}
+
 	/* === Bridge SPI open-failure recovery (#1610) ===
 	 * The two self-heals below both key off counters (g_resync_count,
 	 * g_arm_fail_count) that can only move while the slave HAS a handle.  If every
@@ -492,44 +597,27 @@ void cc3501e_hw_tick(void)
 		bridge_transport_spi_hw_reinit();
 	}
 
-	/* Deferred self-reset, gated on reply_drained so the CMD_RESET ack has
-	 * FULLY clocked to the host before the chip resets (audit
-	 * "reset-fires-before-ack-clocked": the reset previously raced the
-	 * in-flight ack and the host never saw it).  The host sees the ack,
-	 * then the link goes quiet, then the firmware re-PINGs alive. */
-	/* Drain any queued OTA op: the slow psa_fwu flash work runs HERE (bring-up
-	 * task), never in the SPI ISR.  The flash op still stalls the CC35, so the
-	 * pump stands the bridge slave down for its duration (suspend/reinit, like a
-	 * radio op) -- see cc3501e_hw_ota_pump(). */
-	cc3501e_hw_ota_pump();
-
-	if (reset_pending && reply_drained) {
-		NVIC_SystemReset(); /* CMSIS: M33 system reset -- does not return */
-	}
-
-	/* Fill the socket RX ring on the TASK, so the dispatch can serve
-	 * CMD_SOCK_RECV with a memcpy instead of a worker round trip. */
-	cc3501e_hw_sock_pump();
-	/* Take any inbound connection on a listening socket, also on the TASK and
-	 * also non-blocking, and publish it as EVT_SOCK_ACCEPTED (protocol v9).
-	 * No-op until the host has actually called SOCK_LISTEN. */
-	cc3501e_hw_sock_accept_pump();
-#ifdef CC3501E_WEDGE_PROBE
-	bridge_transport_spi_probe_tick(); /* #1691 wedge snapshot (bench builds only) */
-#endif
-	/* Apply any power policy the SPI-dispatch ISR latched: Wlan_Set() is a
-	 * blocking vendor radio call and belongs on the task, not in the ISR. */
-	cc3501e_hw_power_service();
-
-	/* Deferred OTA reboot: once the FINISH ack has clocked back (reply_drained),
-	 * request the PSA-FWU reboot so the cold BL2/MCUboot swaps the STAGED slot to
-	 * primary (TRIAL).  Same ack-before-reboot race fix as CMD_RESET above. */
-	if (ota_reboot_pending && reply_drained) {
-		ota_reboot_pending = false; /* one-shot: don't re-request every tick if refused */
-		/* Returns ONLY if the swap was refused (e.g. BL2 anti-rollback on a
-		 * downgrade); on success it reboots and never returns.  Capture the rc so
-		 * the host can distinguish "refused" from "never fired" via OTA_STATUS. */
-		ota_reboot_rc = (int8_t)psa_fwu_request_reboot();
+	/* === Quiet-armed recovery (#142) ===
+	 * See src/link_quiet_rearm.h's top comment for the full writeup: an SPI
+	 * slave armed in PH_REQ_HEADER whose DMA never completes is invisible to
+	 * every self-heal above.  0u below is PH_REQ_HEADER's own enum value in
+	 * hal/ti/transport_hw_ti_spi.c's file-local `enum spi_phase` -- not
+	 * exported as a named constant because bridge_transport_spi_phase()'s
+	 * own contract (see transport.h) already documents it as the wire value
+	 * OTA_STATUS reserved[2] reports, so this is the SAME public contract,
+	 * not a new one. */
+	static link_quiet_rearm_state_t quiet_state;
+	const bool                      at_idle_header = (bridge_transport_spi_phase() == 0u);
+	const bool fire = link_quiet_rearm_tick(&quiet_state,
+	                                        at_idle_header,
+	                                        bridge_transport_spi_reply_armed(),
+	                                        bridge_transport_spi_quiet_ms(),
+	                                        cc3501e_hw_uptime_ms(),
+	                                        CC3501E_LINK_QUIET_REARM_MS,
+	                                        false /* polled/quiesced already handled above */);
+	if (fire) {
+		bridge_transport_spi_hw_reinit();
+		g_quiet_rearm_heal_count++;
 	}
 }
 

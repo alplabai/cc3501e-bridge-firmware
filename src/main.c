@@ -80,6 +80,87 @@ static StackType_t bringup_stack[CC3501E_BRINGUP_STACK_WORDS];
 
 static StaticTask_t bringup_tcb;
 
+/* #142: dedicated link-healer task.  cc3501e_hw_tick() (drained on
+ * bringup_task above) can be frozen for up to ~70 s inside a
+ * WIFI_CONNECT/Wlan_Start body -- Wlan_Start/Wlan_Connect/Wlan_RoleUp all
+ * block the calling task -- which froze the four SPI self-heals that used
+ * to run from it too (hal/ti/cc3501e_hw_ti.c's own comment at
+ * cc3501e_hw_tick()'s old call site has the root-cause writeup).  Moving
+ * JUST those checks to their own task, independent of whatever the bring-up
+ * task is blocked inside, is the fix; see hal/ti/cc3501e_hw_ti.c's
+ * cc3501e_hw_link_tick() for what actually runs.
+ *
+ * STACK SIZING (NOT bench-verified -- this task has never run on silicon as
+ * of this change): the call graph is shallow next to bringup_task's own --
+ * on an idle tick, cc3501e_hw_link_tick() only calls bridge_transport_spi_
+ * is_dead()/_phase_stalled()/_reply_armed()/_quiet_ms()/_phase() (a handful
+ * of instructions each, no locals of note); on a self-heal firing it
+ * additionally calls through bridge_transport_spi_hw_reinit() ->
+ * spi_open_and_arm() (own frame 0x24/36 B by direct disassembly --
+ * tiarmobjdump on the built .o shows `sub sp, #0x24` at that function's
+ * entry) -> SPI_open()/SPI_close() (TI driver internals, UNMEASURED -- not
+ * rebuilt with -fstack-usage here) plus ClockP_usleep().  No Wlan_* NWP
+ * host-driver chain, no PSA crypto (psa_fwu_start's SHA/ECDSA verification
+ * is what actually drove bringup_task's own 8 KB/32 KB sizing, see the
+ * comments above) -- 1024 words is generous headroom over what this graph
+ * needs, not a measured minimum, same shape as bringup_task's own sizing.
+ *
+ * PLACEMENT: TCM (.bss.link_stack, ti/build_ti.sh's linker.cmd patch #5),
+ * NOT the default DRAM_NON_SECURE every other static in this file lands in.
+ * ti/build_ti.sh --wifi --ble (the ship config this whole fix targets) was
+ * ALREADY within ~431 B of exhausting DRAM_NON_SECURE before this change --
+ * that number is not a guess, it is build_ti.sh's own pre-existing comment
+ * on the .bss.sock_ring TCM move ("DRAM is full ... 431 bytes spare") --
+ * and this task's stack alone needs several times that.  Confirmed on the
+ * real linker: with this array left in its default DRAM section, EVERY
+ * stack size from 512 words down to 80 words either failed placement (512
+ * words: short by 1695 B; 128 words: short by 159 B; 96 words: short by
+ * 31 B; 88 words: short by 8 B, in the smaller GROUP_5 rather than GROUP_4
+ * once GROUP_4 itself finally had room) or left CC3501E_WEDGE_PROBE (which
+ * adds its own DRAM-resident diagnostic state, hal/ti/transport_hw_ti_spi.c)
+ * with no room at all.  TCM_DRAM_NON_SECURE is a SEPARATE ~128 KB region
+ * (origin 0x20000000, the vendor board's own linker.cmd) that
+ * .bss.sock_ring already proves has room for a 16 KB buffer -- moving 4 KB
+ * of task stack there costs this design nothing (the link task never DMAs
+ * out of its own stack) and gives DRAM_NON_SECURE its ~431 B back, which is
+ * what actually lets 1024 words -- and CC3501E_WEDGE_PROBE on top of it --
+ * link clean.  Verify in cc3501e-bridge.map that link_stack resolves at
+ * 0x200xxxxx, NOT 0x28xxxxxx, same check build_ti.sh's own comment already
+ * prescribes for rx_ring.
+ *
+ * configCHECK_FOR_STACK_OVERFLOW == 2 (see bringup_task's own PSA-crypto
+ * comment) still catches an overrun at runtime with no application hook
+ * defined -- an overflow here halts the bridge rather than silently
+ * corrupting an adjacent task's memory, the same fail-safe bringup_task
+ * relies on.  FIRST BENCH ACTION for this task should still be
+ * uxTaskGetStackHighWaterMark() on link_tcb after a soak (idle and through
+ * at least one quiet-rearm heal and one desync/arm-fail/stall recovery) to
+ * confirm the generous-headroom assumption above, now that DRAM is no
+ * longer the constraint forcing a smaller number. */
+#define CC3501E_LINK_TASK_STACK_WORDS 1024u
+/* See the placement paragraph above -- ti/build_ti.sh patches
+ * cc3501e_vendor.cmd to route .bss.link_stack to TCM_DRAM_NON_SECURE; a
+ * build that skips that patch (or a linker.cmd that no longer has the
+ * anchor the patch keys off) fails loudly at link time instead of silently
+ * landing this back in the already-exhausted DRAM bank. */
+static StackType_t link_stack[CC3501E_LINK_TASK_STACK_WORDS]
+    __attribute__((section(".bss.link_stack")));
+static StaticTask_t link_tcb;
+
+/* 10 ms period -- matches the bring-up task's own housekeeping cadence
+ * (cc3501e_hw_tick()'s vTaskDelay below), which is also the period the
+ * pre-#142 self-heals ran at before they were ever moved off it. */
+#define CC3501E_LINK_TASK_PERIOD_MS 10u
+
+static void link_task(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		cc3501e_hw_link_tick();
+		vTaskDelay(pdMS_TO_TICKS(CC3501E_LINK_TASK_PERIOD_MS));
+	}
+}
+
 static void bringup_task(void *arg)
 {
 	(void)arg;
@@ -198,6 +279,30 @@ static void bringup_task(void *arg)
 	 * no polled transfer in flight, which is precisely the lie that produced
 	 * ~26 B/s with every WRITE returning -5. */
 	cc3501e_bridge_ready();
+
+	/* #142: create the link-healer task HERE, not in main() before the
+	 * scheduler starts.  bridge_transport_spi_polled()'s read-and-clear
+	 * (this function's very first statement, above the update_mode branch)
+	 * and transport_spi_init()'s spi_open_and_arm() (which creates the
+	 * reinit/release/suspend mutex -- see hal/ti/transport_hw_ti_spi.c's
+	 * bridge_transport_spi_hw_init()) must both complete before a SECOND
+	 * task can safely call into any of that state.  Creating link_task from
+	 * main(), before vTaskStartScheduler(), cannot guarantee that ordering:
+	 * once the scheduler starts, task start order is not guaranteed, so
+	 * link_task could call cc3501e_hw_link_tick() -> bridge_transport_spi_
+	 * polled() before bringup_task ever reaches its own first call -- a
+	 * non-volatile, non-atomic check-then-set race on that function's OWN
+	 * g_boot_read/g_polled latch (transport_hw_ti_spi.c), which was never a
+	 * hazard before this change because exactly one task ever called it.
+	 * Reaching this line proves both preconditions already happened. */
+	(void)xTaskCreateStatic(
+	    link_task,
+	    "cc3501e_link",
+	    CC3501E_LINK_TASK_STACK_WORDS,
+	    NULL,
+	    CC3501E_BRINGUP_TASK_PRIO, /* same priority as bring-up -- see link_task's own comment */
+	    link_stack,
+	    &link_tcb);
 
 	/* Confirm the MCUboot/PSA-FWU image FIRST (psa_fwu_accept, run by the first
 	 * cc3501e_hw_tick) -- BEFORE anything that might block.  SHIP-CRITICAL

@@ -191,6 +191,14 @@ cflags+=("-DCC3501E_BRIDGE_FW_VERSION_U16=$fw_u16")
 txdef=(-DCC3501E_WIRE_CRC=$WIRE_CRC)
 [ "$TRANSPORT" = sdio ] && txdef+=(-DCC3501E_CONTROL_TRANSPORT_SDIO=1)
 [ "$OTA_SELFTEST" = 1 ] && txdef+=(-DCC3501E_OTA_SELFTEST)
+# Bench wedge-probe instrumentation (#1691) -- OFF by default, opt in with the
+# env var, mirroring build_ti.ps1's `if ($env:CC3501E_WEDGE_PROBE)` (line
+# ~224).  This script had NO hook for it at all: run13 (#142 bench follow-up)
+# built with CC3501E_WEDGE_PROBE set in the environment expecting the .ps1's
+# behaviour, got a plain unguarded build instead, and the resulting map/`nm`
+# had 0 probe symbols.  `${VAR:-}` (not bare `$CC3501E_WEDGE_PROBE`) because
+# this script runs under `set -u`; an unset var must not abort the build.
+[ -n "${CC3501E_WEDGE_PROBE:-}" ] && txdef+=(-DCC3501E_WEDGE_PROBE=1)
 
 ntDir="$SDK_DIR/examples/rtos/LP_EM_CC35X1/demos/network_terminal"
 if [ "$WIFI_HOST_DRIVER" = 1 ]; then
@@ -360,6 +368,34 @@ PYRING
 grep -q 'bss[.]sock_ring' "$localCmd" || {
     echo "build_ti.sh: sock-ring TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
     echo "  The ring would fall back to the FULL DRAM bank and the link would overflow."
+    exit 4
+}
+
+# 3b. .bss.link_stack -> TCM (#142).  Same DRAM-is-full reasoning as #3 just
+#     above, ported the same way (a SECOND GROUP inserted before the SAME
+#     catch-all anchor, so both land in TCM ahead of it) -- see src/main.c's
+#     link_stack for the full sizing story.  DRAM_NON_SECURE had only ~431 B
+#     spare (the comment on #3 above cites this from the SAME shortage); the
+#     link-healer task's stack alone needs several times that, and left in
+#     DRAM it starved EVERY stack size tried, from 512 words down to 80,
+#     before this patch existed.
+python3 - "$localCmd" <<'PYLINKSTACK'
+import io, sys
+p = sys.argv[1]
+anchor = ("/* Move entire BSS section (including COMMON symbols) to DRAM"
+          " to save TCM space */")
+block = ("    /* Alp #142: link-healer task stack in TCM (DRAM is full, same"
+         " as sock_ring above). */\n"
+         "    GROUP {\n"
+         "        .bss.link_stack: {} palign(8)\n"
+         "    } > TCM_DRAM_NON_SECURE\n\n")
+t = io.open(p, encoding="utf-8", newline="").read()
+if ".bss.link_stack" not in t and anchor in t:
+    io.open(p, "w", encoding="utf-8", newline="").write(t.replace(anchor, block + anchor, 1))
+PYLINKSTACK
+grep -q 'bss[.]link_stack' "$localCmd" || {
+    echo "build_ti.sh: link-healer stack TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
+    echo "  The stack would fall back to the FULL DRAM bank and the link would overflow (#142)."
     exit 4
 }
 

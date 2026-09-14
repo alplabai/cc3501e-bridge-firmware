@@ -1187,7 +1187,19 @@ static void wifi_connect_fail_skip_sleep_ms(uint32_t ms)
 
 static void wifi_connect_fail_mark_skip(void)
 {
-	g_connect_fail_skip_ok      = wifi_wait_host_frame(cc3501e_hw_host_txn_count,
+	/* #142 item 5: bridge_transport_spi_valid_req_count(), NOT
+	 * cc3501e_hw_host_txn_count().  The old witness bumps once a whole REPLY
+	 * has clocked back out (cc3501e_hw_notify_reply_sent(), only reachable
+	 * after dispatch_frame() already ran) -- so it says "the slave answered
+	 * something", not "the slave decoded a genuine request", and a lagged/
+	 * misaligned slave that dispatches garbage still drains a reply and
+	 * bumps it.  The new counter is bumped earlier and more narrowly, at
+	 * on_transfer()'s own header-decode gate (hal/ti/transport_hw_ti_spi.c),
+	 * the same opcode < ALP_CC3501E_CMD_RESERVED_VENDOR_BASE check that
+	 * rejects a desynced/reserved header into g_resync_count instead -- so
+	 * it only counts a REQUEST the slave itself judged well-formed, whether
+	 * or not its reply ever finishes clocking out. */
+	g_connect_fail_skip_ok      = wifi_wait_host_frame(bridge_transport_spi_valid_req_count,
 	                                                   wifi_connect_fail_skip_sleep_ms,
 	                                                   CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS,
 	                                                   CC3501E_WIFI_CONNECT_FAIL_SKIP_STEP_MS);
@@ -2030,6 +2042,14 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	 * the role-up-fail one right below) and cc3501e_hw_wifi_connect_sta_take_
 	 * fail_skip(). */
 	if (!role_up_was_latched) {
+		/* #142 item 4: drop READY BEFORE the reinit, matching every other
+		 * reinit call site in this file (this function's own SUCCESS-exit
+		 * reinit ~2587) and src/worker.c's drain (~1284) -- a role-up is a
+		 * radio op like any other and tears the slave's DMA down, so the
+		 * host must see the line go LOW across that window instead of
+		 * clocking a live-looking READY into a slave whose reinit has not
+		 * finished re-arming yet. */
+		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}
 
