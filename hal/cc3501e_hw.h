@@ -330,7 +330,17 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * re-issues Wlan_Connect once, and clears this value again immediately
  * before doing so, so a caller observing this byte mid-attempt cannot tell
  * a first try from a retried one -- only the FINAL value, once the attempt
- * reaches a terminal state or CONNECTED, is meaningful.  A late event
+ * reaches a terminal state or CONNECTED, is meaningful.  That FINAL value is
+ * NOT simply whatever the retry pass's own events happen to produce: if the
+ * retry pass itself ends in reason 3 (WLAN_REASON_DEAUTH_LEAVING -- either
+ * our own pre-retry cleanup's Wlan_Disconnect() echoing back, or hostap's
+ * generic SME give-up timer) or reason 0 (nothing recorded on the retry pass
+ * at all), cc3501e_hw_wifi_connect_sta() restores the FIRST pass's real,
+ * AP-issued reason (the 30 that made this eligible for a retry in the first
+ * place) instead of publishing that less-informative retry-pass outcome --
+ * see wifi_retry_should_restore_first_pass() (src/wifi_retry.h) for the
+ * mechanism.  Any OTHER retry-pass reason (a real, different AP reject code)
+ * still publishes as the retry's own outcome.  A late event
  * from the PREVIOUS attempt (still in flight on the host-driver thread) that
  * lands in the tiny window between that second reset and the vendor actually
  * processing the new connect can still be recorded against the new one.  Not

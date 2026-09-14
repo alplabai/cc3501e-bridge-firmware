@@ -241,7 +241,7 @@ fi
 
 # App + silicon-free layer + ti HAL + SysConfig unity aggregates (see .ps1 149-165).
 sources=(
-  "$fw/src/main.c" "$fw/src/protocol.c" "$fw"/src/protocol_*.c "$fw/src/worker.c" "$fw/src/event_ring.c" "$fw/src/transport_spi.c" "$fw/src/transport_sdio.c"
+  "$fw/src/main.c" "$fw/src/protocol.c" "$fw"/src/protocol_*.c "$fw/src/worker.c" "$fw/src/event_ring.c" "$fw/src/transport_spi.c" "$fw/src/transport_sdio.c" "$fw/src/wifi_retry.c"
   "$fw/hal/ti/cc3501e_hw_ti.c" "$fw/hal/ti/cc3501e_hw_ti_ble.c" "$fw/hal/ti/cc3501e_hw_ti_gpio.c"
   "$fw/hal/ti/cc3501e_hw_ti_log.c" "$fw/hal/ti/cc3501e_hw_ti_ota.c" "$fw/hal/ti/cc3501e_hw_ti_power.c"
   "$fw/hal/ti/cc3501e_hw_ti_sock.c" "$fw/hal/ti/cc3501e_hw_ti_wifi.c"
