@@ -10,7 +10,18 @@
 
 #include "wifi_connect_fail_skip.h"
 
-bool wifi_connect_fail_skip_reinit(uint32_t txn_count_at_reinit, uint32_t txn_count_now)
+bool wifi_wait_host_frame(uint32_t (*count_fn)(void),
+                          void (*sleep_ms_fn)(uint32_t),
+                          uint32_t window_ms,
+                          uint32_t step_ms)
 {
-	return txn_count_now != txn_count_at_reinit;
+	const uint32_t baseline = count_fn(); /* THIS call's own sample -- see the header. */
+
+	for (uint32_t elapsed_ms = 0u; elapsed_ms < window_ms; elapsed_ms += step_ms) {
+		sleep_ms_fn(step_ms);
+		if (count_fn() != baseline) {
+			return true; /* a frame landed -- stop polling immediately. */
+		}
+	}
+	return false; /* window exhausted with no change: no evidence of life. */
 }

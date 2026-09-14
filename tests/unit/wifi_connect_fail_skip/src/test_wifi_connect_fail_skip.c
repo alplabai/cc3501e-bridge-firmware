@@ -2,13 +2,21 @@
  * Copyright 2026 Alp Lab AB
  * SPDX-License-Identifier: Apache-2.0
  *
- * Unit tests for src/wifi_connect_fail_skip.c -- the pure "has the slave
- * answered a host frame since the connect body's own last reinit" decision
- * behind the WIFI_CONNECT_STA failure-exit drain-reinit skip.  The real
- * Wlan_Connect body + g_host_txn_count plumbing (hal/ti/cc3501e_hw_ti.c,
- * hal/ti/cc3501e_hw_ti_wifi.c) needs the vendored TI SimpleLink SDK and is
- * built ONLY for CC3501E_HAL_BACKEND=ti, never linked into a host test
- * binary -- this is the host-testable half of that fix.
+ * Unit tests for src/wifi_connect_fail_skip.c -- wifi_wait_host_frame(), the
+ * pure poll/wait behind the WIFI_CONNECT_STA failure-exit drain-reinit skip.
+ * The real Wlan_Connect body + g_host_txn_count plumbing (hal/ti/
+ * cc3501e_hw_ti.c, hal/ti/cc3501e_hw_ti_wifi.c) needs the vendored TI
+ * SimpleLink SDK and is built ONLY for CC3501E_HAL_BACKEND=ti, never linked
+ * into a host test binary -- this is the host-testable half of that fix.
+ *
+ * count_fn / sleep_ms_fn are injected fakes (no vendored SDK, no real
+ * clock): g_fake_values[] scripts what successive count_fn() calls return
+ * (index 0 is the function's OWN baseline sample, per wifi_wait_host_frame's
+ * contract -- it never takes an externally-supplied baseline); past the end
+ * of the script the fake holds the last scripted value (no further change).
+ * fake_sleep_ms_fn() does not actually sleep -- it only accumulates elapsed
+ * time and a call count, so a test can assert the wait is BOUNDED without
+ * a real clock.
  */
 
 #include <zephyr/ztest.h>
@@ -17,55 +25,122 @@
 
 ZTEST_SUITE(cc3501e_wifi_connect_fail_skip, NULL, NULL, NULL, NULL, NULL);
 
-/* The common case the fix exists for: at least one host frame completed
- * since the reinit -- the slave is demonstrably still armed, so the drain
- * may skip paying a second, destructive reinit. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_count_advanced_by_one_skips)
+static uint32_t g_fake_values[8];
+static int      g_fake_num_values;
+static int      g_fake_call_count;
+
+static uint32_t fake_count_fn(void)
 {
-	zassert_true(wifi_connect_fail_skip_reinit(10u, 11u),
-	             "a single advanced frame must permit the skip");
+	const int idx = g_fake_call_count;
+
+	g_fake_call_count++;
+	if (idx < g_fake_num_values) {
+		return g_fake_values[idx];
+	}
+	return g_fake_values[g_fake_num_values - 1]; /* past the script: hold steady. */
 }
 
-/* Several frames served -- still just "advanced", still skips. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_count_advanced_by_many_skips)
+static uint32_t g_fake_total_slept_ms;
+static uint32_t g_fake_sleep_call_count;
+
+static void fake_sleep_ms_fn(uint32_t ms)
 {
-	zassert_true(wifi_connect_fail_skip_reinit(10u, 500u),
-	             "many advanced frames must still permit the skip");
+	g_fake_total_slept_ms += ms;
+	g_fake_sleep_call_count++;
 }
 
-/* The built-in falsifier: NOTHING completed since the reinit -- the slave
- * may have gone dead partway through this attempt, so the caller must still
- * reinit as before this fix. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_count_unchanged_does_not_skip)
+static void fake_reset(void)
 {
-	zassert_false(wifi_connect_fail_skip_reinit(42u, 42u),
-	              "no frame served since the reinit must NOT permit the skip");
+	g_fake_call_count       = 0;
+	g_fake_num_values       = 0;
+	g_fake_total_slept_ms   = 0u;
+	g_fake_sleep_call_count = 0u;
 }
 
-/* Both zero (a cold boot, or the accessor never having incremented) is the
- * same "unchanged" case, pinned separately since 0 is also often an
- * off-by-one edge for an unsigned comparison. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_count_both_zero_does_not_skip)
+/* A frame lands on the SECOND polling check (elapsed 20 ms of a 150 ms
+ * window): baseline (call 1) = 5, first check (call 2) = 5 (unchanged),
+ * second check (call 3) = 6 (changed) -- must return true immediately,
+ * without waiting out the rest of the 150 ms window. */
+ZTEST(cc3501e_wifi_connect_fail_skip, test_frame_at_second_poll_returns_true_and_stops_early)
 {
-	zassert_false(wifi_connect_fail_skip_reinit(0u, 0u),
-	              "two zero samples must NOT permit the skip");
+	fake_reset();
+	g_fake_values[0]  = 5u;
+	g_fake_values[1]  = 5u;
+	g_fake_values[2]  = 6u;
+	g_fake_num_values = 3;
+
+	const bool served = wifi_wait_host_frame(fake_count_fn, fake_sleep_ms_fn, 150u, 10u);
+
+	zassert_true(served, "a count change must report a served frame");
+	zassert_equal(g_fake_sleep_call_count, 2u, "must stop polling the instant a frame lands");
+	zassert_equal(g_fake_total_slept_ms, 20u, "must not sleep past the change");
 }
 
-/* Wrap-around of the counter type: even though g_host_txn_count itself
- * SATURATES rather than wraps (see wifi_connect_fail_skip.h), the decision
- * is a plain inequality and must stay correct if the counter type ever did
- * wrap -- "now" landing numerically BELOW "at_reinit" after a wrap is still
- * "the two differ", i.e. still a served frame, and must still skip. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_wrap_around_low_now_still_skips)
+/* A frame lands on the very FIRST polling check (elapsed 10 ms). */
+ZTEST(cc3501e_wifi_connect_fail_skip, test_frame_at_first_poll_returns_true)
 {
-	zassert_true(wifi_connect_fail_skip_reinit(UINT32_MAX, 0u),
-	             "a wrapped counter (now < at_reinit) must still count as advanced");
+	fake_reset();
+	g_fake_values[0]  = 100u;
+	g_fake_values[1]  = 101u;
+	g_fake_num_values = 2;
+
+	const bool served = wifi_wait_host_frame(fake_count_fn, fake_sleep_ms_fn, 150u, 10u);
+
+	zassert_true(served, "a change on the first check must still report served");
+	zassert_equal(g_fake_sleep_call_count, 1u, "must stop after exactly one poll");
 }
 
-/* The UINT32_MAX/UINT32_MAX unchanged case at the saturated ceiling itself --
- * pins the boundary the real (saturating) counter can actually reach. */
-ZTEST(cc3501e_wifi_connect_fail_skip, test_saturated_ceiling_unchanged_does_not_skip)
+/* The built-in falsifier: the count NEVER changes -- no frame lands in the
+ * whole 150 ms / 10 ms-step window.  Must return false AND the total sleep
+ * must be bounded at exactly the window (15 steps of 10 ms), not run away. */
+ZTEST(cc3501e_wifi_connect_fail_skip, test_no_frame_ever_returns_false_and_bounds_total_sleep)
 {
-	zassert_false(wifi_connect_fail_skip_reinit(UINT32_MAX, UINT32_MAX),
-	              "two identical saturated-ceiling samples must NOT permit the skip");
+	fake_reset();
+	g_fake_values[0]  = 42u;
+	g_fake_num_values = 1;
+
+	const bool served = wifi_wait_host_frame(fake_count_fn, fake_sleep_ms_fn, 150u, 10u);
+
+	zassert_false(served, "no change in the whole window must NOT report served");
+	zassert_equal(g_fake_sleep_call_count, 15u, "must poll exactly window_ms/step_ms times");
+	zassert_equal(g_fake_total_slept_ms, 150u, "total sleep must be bounded at window_ms");
+}
+
+/* The exact ordering bug the blocker (host review of 580f748) was about: the
+ * counter had ALREADY advanced, by unrelated host polling, before this wait
+ * is ever called -- simulated here by a NON-ZERO count that is already
+ * "settled" the moment wifi_wait_host_frame takes its own baseline sample.
+ * A stale, externally-supplied baseline (the old, buggy design) would have
+ * reported this as "served" on the strength of that EARLIER advance; the
+ * fixed design takes its OWN fresh baseline as call 1, so with nothing
+ * changing AFTER that sample it must report false, exactly like the
+ * never-changes case above -- proving the earlier advance is correctly
+ * invisible to this call. */
+ZTEST(cc3501e_wifi_connect_fail_skip, test_advance_before_this_calls_own_baseline_does_not_count)
+{
+	fake_reset();
+	g_fake_values[0]  = 37u; /* already-advanced value, settled before this call started */
+	g_fake_num_values = 1;
+
+	const bool served = wifi_wait_host_frame(fake_count_fn, fake_sleep_ms_fn, 150u, 10u);
+
+	zassert_false(served,
+	              "an advance that happened before this call's own baseline sample "
+	              "must not be reported as a served frame");
+}
+
+/* Saturation, not wrap: g_host_txn_count SATURATES at UINT32_MAX rather than
+ * wrapping (cc3501e_hw_ti.c's cc3501e_hw_notify_reply_sent()), so the
+ * ceiling itself is a value the real counter can actually reach and hold at
+ * -- two samples at that ceiling must read as "unchanged", same as any other
+ * steady value. */
+ZTEST(cc3501e_wifi_connect_fail_skip, test_saturated_ceiling_steady_returns_false)
+{
+	fake_reset();
+	g_fake_values[0]  = UINT32_MAX;
+	g_fake_num_values = 1;
+
+	const bool served = wifi_wait_host_frame(fake_count_fn, fake_sleep_ms_fn, 150u, 10u);
+
+	zassert_false(served, "a steady value at the saturated ceiling must not report served");
 }

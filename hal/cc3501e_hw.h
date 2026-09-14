@@ -296,10 +296,13 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4]);
  * that reinit, so the drain can skip paying it a second time and instead
  * trust @p armed_out for whether the slave actually came up armed.  A run
  * that took a FAILURE exit (bad args, role-up fail, Wlan_Connect reject,
- * association timeout, no DHCP lease) never reaches that reinit, so this
- * reports false for it and the drain's own reinit still runs, unchanged from
- * before #106.  The stub / silicon-free build always reports false (no body
- * ever takes the reinit there). */
+ * association timeout, no DHCP lease) never reaches that reinit, so THIS
+ * (SUCCESS-flavour) handoff reports false for it, unchanged from before
+ * #106.  That does NOT mean the drain's own reinit runs unconditionally for
+ * a FAILURE exit any more, though -- see the connect-FAILURE-flavour handoff
+ * below, a SEPARATE per-run signal each FAILURE exit sets on its own.  The
+ * stub / silicon-free build always reports false (no body ever takes the
+ * reinit there). */
 bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out);
 
 /* ---- drain reinit handoff (issue #106, RSSI flavour) ----------------------- *
@@ -324,30 +327,41 @@ bool cc3501e_hw_wifi_connect_sta_take_reinit(bool *armed_out);
 bool cc3501e_hw_wifi_get_rssi_take_reinit_skip(bool *skip_ok_out);
 
 /* ---- drain reinit handoff (connect-FAILURE flavour, advisor analysis) ------ *
- * cc3501e_hw_wifi_connect_sta()'s FAILURE exit (bad args aside -- role-up
- * fail, Wlan_Connect reject, association timeout, no DHCP lease) has always
+ * cc3501e_hw_wifi_connect_sta()'s FAILURE exits (bad args aside -- role-up
+ * fail, Wlan_Connect reject, association timeout, no DHCP lease) have always
  * paid src/worker.c's drain reinit unconditionally, unlike the SUCCESS exit
  * above.  Advisor analysis (moderate confidence, NOT bench-proven -- see
  * src/wifi_connect_fail_skip.h for the full argument and its citation trail)
  * argues that is the SAME destructive-reinit-on-a-live-slave hazard #106
- * measured for RSSI and WIFI_DISCONNECT: Wlan_Connect and the failure path's
- * own Wlan_Disconnect cleanup (wifi_clear_stale_assoc()) never touch the
- * bridge's own DMA channels, so a slave the body armed before Wlan_Connect
- * (the role-up reinit) stays armed through the whole failed attempt -- UNLESS
- * it went dead by some mechanism this trace missed, in which case the built-in
- * falsifier below still reinits.
+ * measured for RSSI and WIFI_DISCONNECT.  What the trace actually covers:
+ * Wlan_Connect() is synchronous but only queues a message for the CME task
+ * (it does not itself touch the bridge's DMA); the failure path's trailing
+ * Wlan_Disconnect() cleanup (wifi_clear_stale_assoc()) is safe on the SAME
+ * evidence as the unconditional WIFI_DISCONNECT skip (src/worker.c's
+ * wifi_disconnect group, sourced against worker.c ~1192-1212) -- a
+ * synchronous message-queue post, no DMA/SPI/interrupt-mask touched.  What
+ * the trace does NOT cover: the ASYNCHRONOUS CME association work that
+ * actually performs the 802.11 handshake after Wlan_Connect()'s message is
+ * drained -- that traffic is UNTRACED, which is exactly why a slave that was
+ * armed before Wlan_Connect cannot simply be assumed to still be armed after
+ * a failed attempt.
  *
- * take_fail_skip() is a ONE-SHOT read-and-clear, set unconditionally at the
- * top of the FAILURE-exit block (before wifi_clear_stale_assoc() can run),
- * so it reports the same fact regardless of which failure reason exit took
- * it.  @p skip_ok_out reports whether the bridge SPI slave served at least
- * one full host transaction (cc3501e_hw_host_txn_count(), hal/ti/
- * cc3501e_hw_ti_internal.h) between the body's own last reinit and this
- * exit -- see src/wifi_connect_fail_skip.h's wifi_connect_fail_skip_reinit()
- * for the pure comparison.  A run that took the SUCCESS exit instead never
- * reaches this handoff, so this reports false for it and the drain's own
- * reinit still runs as normal.  The stub / silicon-free build always
- * reports false (no body ever takes this exit there). */
+ * So instead of trusting an early snapshot, each failure exit calls
+ * wifi_connect_fail_mark_skip() (hal/ti/cc3501e_hw_ti_wifi.c) to POLL, right
+ * there, for a host frame to complete within a short window -- see
+ * wifi_wait_host_frame() (src/wifi_connect_fail_skip.h) for the pure wait
+ * this wraps, including why an EARLIER baseline undercounts a slave that
+ * died mid-attempt.  take_fail_skip() is a ONE-SHOT read-and-clear, set by
+ * that poll immediately before its own exit's wifi_conn_set(FAILED) --
+ * "before wifi_clear_stale_assoc() can run" is true only for THAT exit's own
+ * trailing call, not across the whole function: on a RETRIED pass, an
+ * EARLIER wifi_clear_stale_assoc() (the retry branch's own mid-loop cleanup)
+ * has already run by the time this poll starts, and its effects (if any) are
+ * exactly what the poll is measuring forward from.  @p skip_ok_out reports
+ * whether a host frame landed in that window.  A run that took the SUCCESS
+ * exit instead never reaches this handoff, so this reports false for it and
+ * the drain's own reinit still runs as normal.  The stub / silicon-free
+ * build always reports false (no body ever takes this exit there). */
 bool cc3501e_hw_wifi_connect_sta_take_fail_skip(bool *skip_ok_out);
 
 /* ---- async-connect status latch (CMD_WIFI_STATUS) -------------------------- *
