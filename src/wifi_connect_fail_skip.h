@@ -62,19 +62,31 @@
  * failure (host review of 580f748).
  *
  * THE FIX: sample a FRESH baseline at the failure exit itself -- after
- * Wlan_Connect, the retry pass, the wait, and the trailing
- * wifi_clear_stale_assoc(), i.e. after everything untraced has already had
- * its chance to disturb the slave -- and POLL forward from there for up to
- * ~3 host WIFI_STATUS poll gaps (150 ms) for a frame to land.  A slave still
- * being serviced answers within that window; a dead one does not, and the
- * caller falls through to the unconditional reinit exactly as before this
- * whole fix -- the built-in falsifier.  See wifi_wait_host_frame() below.
+ * Wlan_Connect, the retry pass, and the wait -- and POLL forward from there
+ * for up to ~3 host WIFI_STATUS poll gaps (150 ms) for a frame to land.  A
+ * slave still being serviced answers within that window; a dead one does
+ * not, and the caller falls through to the unconditional reinit exactly as
+ * before this whole fix -- the built-in falsifier.  See wifi_wait_host_frame()
+ * below.
+ *
+ * WHAT THE WINDOW DOES NOT COVER: the sample is taken BEFORE that exit's own
+ * trailing wifi_clear_stale_assoc() runs, not after -- so neither the
+ * Wlan_Disconnect() that call queues nor any asynchronous CME work still in
+ * flight once the 150 ms window ends is observed by this poll.  That is not
+ * a regression: the PREVIOUS unconditional drain reinit did not cover that
+ * tail either (it ran once, after worker_execute() returned, with no
+ * knowledge of what the slave was doing at that instant).  This fix narrows
+ * "assume-alive" to "observed-alive-recently", it does not claim to observe
+ * the whole tail.
  *
  * The caller is TI-only (built for CC3501E_HAL_BACKEND=ti only, against the
- * vendored SDK) and is bench-covered by the ship-bar validation in
+ * vendored SDK).  UNLIKE the SUCCESS path, no FAILURE exit of this function
+ * has been exercised on the bench: the ship-bar validation in
  * bringing-up-the-cc3501e-wifi-ble-bridge (cold-cycle, `wifi connect`, then
- * `ver` still answering) -- this header covers only the pure wait, not
- * silicon behaviour.
+ * `ver` still answering) is a SUCCESSFUL connect -- it never takes a failure
+ * exit at all, so it says nothing about this fix.  This header covers only
+ * the pure wait, not silicon behaviour, and that pure wait is presently the
+ * ONLY testing this fix has.
  */
 
 #ifndef CC3501E_BRIDGE_WIFI_CONNECT_FAIL_SKIP_H

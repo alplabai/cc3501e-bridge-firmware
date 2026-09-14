@@ -1159,15 +1159,22 @@ static void wifi_connect_fail_skip_sleep_ms(uint32_t ms)
  * reinit -- the only thing that could have recovered it -- never ran.
  *
  * THE FIX: sample fresh, HERE, at the failure exit itself -- after
- * Wlan_Connect, the retry pass, the association wait, and (for the terminal
- * exit) the trailing wifi_clear_stale_assoc() have all already had their
- * chance to disturb the slave -- and POLL for up to
+ * Wlan_Connect, the retry pass, and the association wait have already had
+ * their chance to disturb the slave -- and POLL for up to
  * CC3501E_WIFI_CONNECT_FAIL_SKIP_WINDOW_MS (three host WIFI_STATUS poll
  * gaps) for a frame to land.  A slave still being serviced answers within
  * that window; a dead one does not, and the caller falls through to the
  * unconditional reinit exactly as before this whole fix -- the built-in
  * falsifier.  See wifi_wait_host_frame() (src/wifi_connect_fail_skip.h) for
  * the pure wait this wraps.
+ *
+ * NOT covered: the sample is taken BEFORE that exit's own trailing
+ * wifi_clear_stale_assoc() runs, so neither the Wlan_Disconnect() it queues
+ * nor any asynchronous CME work still in flight once the window ends is
+ * observed.  Not a regression -- the PREVIOUS unconditional drain reinit
+ * never covered that tail either, it just ran once regardless.  See src/
+ * wifi_connect_fail_skip.h's own header for the full statement of what this
+ * poll does and does not prove.
  *
  * Call this LAST at EVERY failure exit of cc3501e_hw_wifi_connect_sta(),
  * immediately before that exit's own wifi_conn_set(FAILED) -- including the
@@ -2027,11 +2034,18 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 	}
 
 	if (wifi_rv != CC3501E_HW_OK) {
-		/* After a failed Wlan_Start (inside ensure_sta_role's lazy_start), the
-		 * slave may genuinely be dead -- wifi_connect_fail_mark_skip() polls for
-		 * a frame the same as every other failure exit; if none lands (the
-		 * expected outcome here), the drain's reinit still runs, unchanged from
-		 * before this whole fix. */
+		/* This exit is reached ONLY when role_up_was_latched was false:
+		 * cc3501e_hw_wifi_ensure_sta_role() returns CC3501E_HW_OK immediately
+		 * at its own wifi_sta_role_up early-return (above, ~1273) whenever the
+		 * role was already up, so a non-OK wifi_rv here means that branch was
+		 * NOT taken -- the reinit just above (`if (!role_up_was_latched)`)
+		 * always ran right before this exit, unconditionally.  So this is not
+		 * a case of "expect no frame": wifi_connect_fail_mark_skip() polls the
+		 * same as every other failure exit, and if THAT reinit's own arm
+		 * succeeded, host polls land within the window and the skip correctly
+		 * fires; if it failed (the slave genuinely dead after a failed
+		 * Wlan_Start), no frame lands and the drain's reinit still runs,
+		 * unchanged from before this whole fix. */
 		wifi_connect_fail_mark_skip();
 		wifi_conn_set(
 		    (uint8_t)ALP_CC3501E_WIFI_CONN_FAILED, (uint8_t)ALP_CC3501E_WIFI_FAIL_KICK, 0);
@@ -2448,9 +2462,16 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		 * it -- a spontaneous AP deauth/disassoc arriving mid-poll, or a leftover
 		 * ASSOCIATION_REJECTED(30) from a comeback the vendor's own retry ultimately
 		 * WON (see that case's non-terminal handling) that this L2-success path never
-		 * cleared.  Freeze whatever is actually there with a single load.
-		 *
-		 * This is the exit run10 P2-01's death most likely took (host review of
+		 * cleared.  Freeze whatever is actually there with a single load -- TAKEN
+		 * HERE, BEFORE wifi_connect_fail_mark_skip()'s own poll below, not after:
+		 * state is STILL CONNECTING for the ENTIRE duration of that poll too (the
+		 * same reason this snapshot has to be a single load in the first place),
+		 * so a late event landing inside the poll's window must not be allowed to
+		 * change the reason this exit publishes -- matching how the terminal
+		 * REJECTED/TIMEOUT exit above already resolves its own connect_reason_code
+		 * before doing anything else. */
+		const int16_t no_dhcp_reason_code = wifi_reason_tag_reason(wifi_last_reason_tag);
+		/* This is the exit run10 P2-01's death most likely took (host review of
 		 * 580f748): a WIFI_STATUS verdict of CONN_FAILED/FAIL_TIMEOUT read at
 		 * 50.4 s, the link alive at that point, then silence.  The FIRST version
 		 * of this fix never called wifi_connect_fail_mark_skip() here at all --
@@ -2462,7 +2483,7 @@ int cc3501e_hw_wifi_connect_sta(const uint8_t *ssid,
 		wifi_connect_fail_mark_skip();
 		wifi_conn_set((uint8_t)ALP_CC3501E_WIFI_CONN_FAILED,
 		              (uint8_t)ALP_CC3501E_WIFI_FAIL_TIMEOUT,
-		              wifi_reason_tag_reason(wifi_last_reason_tag));
+		              no_dhcp_reason_code);
 		return CC3501E_HW_ERR_IO;
 	}
 

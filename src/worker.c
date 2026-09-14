@@ -1261,7 +1261,18 @@ void worker_run_pending(void)
 		 * as RSSI's skip, because "no frame in the window" does not prove the
 		 * slave is dead, only that there is no evidence it is alive, so the
 		 * built-in falsifier is to keep reinitting in that case exactly as
-		 * before this fix. */
+		 * before this fix.
+		 *
+		 * What the count proves, same as every other skip group in this list
+		 * that reads it: the slave finished a request/reply cycle on ITS OWN
+		 * side -- it is bumped (cc3501e_hw_notify_reply_sent(), hal/ti/
+		 * transport_hw_ti_spi.c ~809) right after the whole reply clocked,
+		 * BEFORE that same call re-arms the next request header
+		 * (arm_request_header(), ~810) -- and it does NOT depend on whether
+		 * the HOST successfully decoded that reply.  A failed re-arm or a
+		 * desynced slave still reads as "live" by this count; recovery from
+		 * either then falls to cc3501e_hw_tick()'s own g_arm_fail_count /
+		 * g_resync_count self-heal, same as it always has, not to this skip. */
 		bool       skip_ok_by_connect_fail = false;
 		const bool connect_fail_reported_skip =
 		    (cmd == ALP_CC3501E_CMD_WIFI_CONNECT_STA) &&

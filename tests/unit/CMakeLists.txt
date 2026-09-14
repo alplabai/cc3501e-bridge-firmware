@@ -352,10 +352,10 @@ target_compile_options(test_wifi_retry PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_wifi_retry PRIVATE ztest_shim)
 add_test(NAME wifi_retry COMMAND test_wifi_retry)
 
-# wifi_connect_fail_skip: the pure "has the slave answered a host frame since
-# the connect body's own last reinit" decision behind the WIFI_CONNECT_STA
-# failure-exit drain-reinit skip (hal/ti/cc3501e_hw_ti_wifi.c).  Same
-# reasoning as wifi_retry above for building it standalone rather than from
+# wifi_connect_fail_skip: the pure "has the slave answered a host frame
+# within a fresh poll window at the failure exit" decision behind the
+# WIFI_CONNECT_STA failure-exit drain-reinit skip (hal/ti/cc3501e_hw_ti_wifi.c).
+# Same reasoning as wifi_retry above for building it standalone rather than from
 # FW_SOURCES: no dependency on the rest of the firmware, and the real
 # Wlan_Connect body it was pulled out of needs the vendored TI SimpleLink SDK
 # and is never linked into a host build.  (Also in the top-level CMakeLists.txt's

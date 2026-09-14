@@ -106,16 +106,22 @@ ZTEST(cc3501e_wifi_connect_fail_skip, test_no_frame_ever_returns_false_and_bound
 	zassert_equal(g_fake_total_slept_ms, 150u, "total sleep must be bounded at window_ms");
 }
 
-/* The exact ordering bug the blocker (host review of 580f748) was about: the
- * counter had ALREADY advanced, by unrelated host polling, before this wait
- * is ever called -- simulated here by a NON-ZERO count that is already
- * "settled" the moment wifi_wait_host_frame takes its own baseline sample.
- * A stale, externally-supplied baseline (the old, buggy design) would have
- * reported this as "served" on the strength of that EARLIER advance; the
- * fixed design takes its OWN fresh baseline as call 1, so with nothing
- * changing AFTER that sample it must report false, exactly like the
- * never-changes case above -- proving the earlier advance is correctly
- * invisible to this call. */
+/* Documents the shape of the ordering bug the blocker (host review of
+ * 580f748) was about -- NOT a regression test for it: the actual bug lived
+ * entirely in TI-only code (hal/ti/cc3501e_hw_ti_wifi.c's old
+ * txn_count_after_reinit snapshot, taken at the ROLE-UP reinit, long before
+ * any failure exit), which this host build never links or exercises, and
+ * wifi_wait_host_frame() itself is a NEW function with no old
+ * implementation to regress against -- there is no way for this test to
+ * fail against "the old design".  What it DOES pin down is the CONTRACT
+ * that makes the fix correct: the counter may have ALREADY advanced, by
+ * unrelated host polling, before this wait is ever called -- simulated here
+ * by a NON-ZERO count that is already "settled" the moment
+ * wifi_wait_host_frame takes its own baseline sample.  A stale, externally-
+ * supplied baseline would have reported this as "served" on the strength of
+ * that EARLIER advance; this function takes its OWN fresh baseline as call
+ * 1, so with nothing changing AFTER that sample it must report false,
+ * exactly like the never-changes case above. */
 ZTEST(cc3501e_wifi_connect_fail_skip, test_advance_before_this_calls_own_baseline_does_not_count)
 {
 	fake_reset();
