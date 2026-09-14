@@ -738,7 +738,34 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 		const size_t   hdr     = sizeof(alp_cc3501e_sock_recv_resp_t);
 		if (reply_cap > hdr) {
 			size_t room = reply_cap - hdr;
-			if (max_len != 0u && room > (size_t)max_len) room = (size_t)max_len;
+			/* PRE-EXISTING BUG, same class as the worker-path want == 0
+			 * BLOCKER (sock_worker_recv_eof.h): max_len == 0 on the wire
+			 * means "the host's OWN cap was 0", never "no cap" --
+			 * confirmed against alp-sdk's chips/cc3501e/cc3501e_sockets.c
+			 * cc3501e_sock_recv(): it sends `want = cap` (clamped only
+			 * DOWNWARD to want_max, a small positive constant, never UP
+			 * to it and never to 0 from a nonzero cap), so a wire
+			 * max_len of 0 can only originate from a host-side cap of 0.
+			 * Leaving `room` at the buffer's own size here (an earlier
+			 * version of this line did, `if (max_len != 0u && room >
+			 * max_len) room = max_len` -- silently skipping the clamp
+			 * entirely for max_len == 0) let the ring serve up to a FULL
+			 * FRAME of real stream bytes, this function reported them
+			 * consumed (retiring them from the ring's lazy-commit tail,
+			 * cc3501e_hw_sock_recv_ring()), and the host then copied
+			 * min(data_len, cap == 0) == 0 of them into its own buffer --
+			 * silent data loss, the ring drained and never delivered.
+			 * worker.c's own SOCK_RECV case already gets this right (see
+			 * its comment on this exact divergence) -- clamping room to 0
+			 * here makes the ring match it: sock_recv_commit() then
+			 * reports n == 0 unconditionally (`used < cap` is false for
+			 * any cap == 0), so this call can never drain a real byte off
+			 * the ring, regardless of how much it actually holds. */
+			if (max_len == 0u) {
+				room = 0u;
+			} else if (room > (size_t)max_len) {
+				room = (size_t)max_len;
+			}
 
 			const bool replay = (seq != 0u && seq == last_recv_seq && handle == last_recv_handle);
 
@@ -787,6 +814,27 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 			last_recv_handle = handle;
 
 			if (rc == -2) {
+				if (max_len == 0u) {
+					/* room == 0 (above) forced sock_recv_commit() to report
+					 * n == 0 regardless of what the ring actually holds, so
+					 * this is not really "armed but momentarily empty" --
+					 * the ring may well have bytes queued, this call just
+					 * asked for none of them.  BUSY would be wrong here:
+					 * poll_by_repeat() retries on BUSY waiting for MORE
+					 * data, but the host asked for ZERO bytes and already
+					 * has everything it asked for.  Answer OK with an
+					 * empty (zeroed) header immediately instead -- the
+					 * SAME "always OK, never BUSY" contract
+					 * cc3501e_hw_sock_recv()'s own want == 0 short-circuit
+					 * gives the worker path (sock_worker_recv_eof.h).  A
+					 * genuinely CLOSED peer already takes the rc == 0
+					 * branch below regardless of max_len (peer_closed is
+					 * independent of room), so this arm is reached only
+					 * for a peer that is still open. */
+					memset(reply_data, 0, hdr);
+					*reply_data_len = hdr;
+					return ALP_CC3501E_RESP_OK;
+				}
 				/* Armed for this handle but momentarily empty.  The pump is the
 				 * ONLY reader of this fd -- do NOT fall through and submit a
 				 * worker job, or cc3501e_hw_sock_recv()'s lwip_recvfrom() becomes
@@ -805,7 +853,15 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 				 * BUSY would just spin the host to its poll_by_repeat timeout
 				 * instead of reporting the failure.  Same status a genuine
 				 * worker-path socket failure gets (sock_worker_hw_err_to_resp()
-				 * above maps CC3501E_HW_ERR_IO to this too). */
+				 * above maps CC3501E_HW_ERR_IO to this too).
+				 *
+				 * NOT overridden for max_len == 0, unlike -2 above: a
+				 * REAL socket failure is independent of how many bytes
+				 * this call happened to ask for, and masking it just
+				 * because the host requested 0 bytes would hide a
+				 * genuine RST from a caller that -- unlike the worker
+				 * path's blanket want == 0 short-circuit -- is still
+				 * asking THIS specific ring-owned handle a question. */
 				*reply_data_len = 0u;
 				return ALP_CC3501E_RESP_ERR_RADIO;
 			}

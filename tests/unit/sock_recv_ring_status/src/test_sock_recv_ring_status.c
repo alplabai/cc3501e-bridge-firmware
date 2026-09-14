@@ -16,8 +16,9 @@
  * errno branch that actually sets rx_ring.peer_error, and the
  * top-of-function guard that stops the pump from calling lwip_recv() again
  * once either sticky flag is set -- lives in hal/ti/cc3501e_hw_ti_sock.c and
- * cannot link on the host.  Covered only by review and by a bench RST
- * injection. */
+ * cannot link on the host.  TI-only; not yet bench-verified -- covered
+ * only by review so far, unlike sock_prefetch_arm.h's own call site, which
+ * the run12 two-concurrent-socket bench actually exercised. */
 
 #include <zephyr/ztest.h>
 

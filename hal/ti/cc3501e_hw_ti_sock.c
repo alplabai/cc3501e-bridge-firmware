@@ -45,6 +45,7 @@ extern size_t xPortGetFreeHeapSize(void);
 #include "sock_prefetch_arm.h"
 #include "sock_recv_commit.h"
 #include "sock_recv_ring_status.h"
+#include "sock_worker_recv_eof.h"
 
 #include "../cc3501e_hw.h"
 
@@ -900,12 +901,34 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
  * fd's FIN".  The per-fd table costs MEMP_NUM_NETCONN bytes of .bss and
  * removes that ambiguity entirely.
  *
+ * BLOCKER (host review of bfb5f08): "the FIRST 0-byte STREAM recv" above is
+ * not the same thing as "the first recv that saw the peer close" -- a recv
+ * with want == min(max_len, cap) == 0 is a LEGAL call (alp-sdk's
+ * cc3501e_sock_recv() only rejects a NULL buffer when cap is nonzero, so
+ * cap == 0 is always accepted) and ALSO returns n == 0 from
+ * lwip_recvfrom(), but TI's
+ * lwip_recv_tcp() given a requested length of 0 copies zero bytes and
+ * returns 0 with errno 0 -- it never reaches the ERR_CLSD path below at
+ * all, so it says NOTHING about whether the peer actually closed.  Latching
+ * on n == 0 alone (gated only on SOCK_STREAM, as an earlier version of this
+ * fix did) let a single want == 0 poll on a perfectly LIVE socket
+ * permanently latch a FALSE EOF -- every later recv then answered OK/0
+ * without ever touching lwIP again, and the host's own 3-zero completion
+ * heuristic reported a truncated stream as finished: silent data loss,
+ * worse than the RESP_ERR_RADIO bug this fix exists to close.  The latch
+ * decision therefore also requires want > 0 -- see
+ * sock_worker_recv_eof.h's sock_worker_recv_eof_should_latch(), which owns
+ * this decision (and the table's bounded get/set) as a pure, host-testable
+ * function; this file only supplies the real n/want/is_stream/table.
+ *
  * ECONNRESET/ECONNABORTED are NOT masked by this: lwIP delivers a reset
  * through lwip_netconn_err_to_msg() posting to conn->recvmbox BEFORE the
- * mbox is torn down the FIN way (api_msg.c:445-469 above), so a reset
- * always surfaces as its own errno on an actual lwip_recvfrom() call at
- * least once -- this table is only ever set from the n == 0 (orderly close)
- * arm below, never from an error return.
+ * mbox is torn down the FIN way (a DIFFERENT lwIP file, api_msg.c:445-469 --
+ * not api_lib.c/sockets.c, cited above, which is why it is not itself
+ * "above" in this comment), so a reset always surfaces as its own errno on
+ * an actual lwip_recvfrom() call at least once -- this table is only ever
+ * set from the n == 0, want > 0 (orderly close) arm below, never from an
+ * error return.
  *
  * Indexed by the lwIP fd directly (0 .. MEMP_NUM_NETCONN-1 -- lwipopts.h,
  * visible here via lwip/sockets.h -> lwip/opt.h; LWIP_SOCKET_OFFSET is 0 on
@@ -915,11 +938,24 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
  * lwip_close() -- so clearing the bit in cc3501e_hw_sock_close() (below)
  * makes a reused fd start clean regardless of what handle number the host
  * sees it as next.  Confirmed against every OTHER lwip_close() site in this
- * file (sock_open()'s failure path, and accept_pump()'s two failure paths):
+ * file (sock_open()'s failure path, accept_pump()'s two failure paths, and
+ * radio_speedtest_udp()'s bind-failure path under CC3501E_RADIO_SPEEDTEST):
  * each of those closes an fd that was allocated moments earlier by
  * lwip_socket()/lwip_accept() and never used for a recv, so it can never be
  * marked here -- cc3501e_hw_sock_close() is the only path a marked fd can
- * ever reach lwip_close() through, so clearing there is sufficient. */
+ * ever reach lwip_close() through, so clearing there is sufficient.
+ *
+ * CC3501E_SOCK_EOF_MAX_FD == MEMP_NUM_NETCONN is a SINGLE source of truth
+ * checked on both sides of the fd space, not two independently-verified
+ * numbers that could drift: this array's own bound comes from lwipopts.h
+ * (confirmed 16 in this SDK's default, non-SUPPORT_{4,8}_STREAMS_CONCURRENTLY
+ * branch, ti_config/lwip-port/osi/include/lwipopts.h:205-211), and lwIP's
+ * OWN fd-space bound -- the prebuilt lwip.a's sockets[] array
+ * (sockets_priv.h: `#define NUM_SOCKETS MEMP_NUM_NETCONN`) -- resolves
+ * against that identical macro at ITS build time, since the prebuilt
+ * library ships built from this same config header.  A real fd this table
+ * ever sees is therefore always < MEMP_NUM_NETCONN by construction, never
+ * merely by luck. */
 #define CC3501E_SOCK_EOF_MAX_FD MEMP_NUM_NETCONN
 static bool sock_eof[CC3501E_SOCK_EOF_MAX_FD];
 
@@ -942,9 +978,17 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	const int fd   = (int)handle - 1; /* handle != 0 here, so fd >= 0 always */
 	uint16_t  want = (max_len < cap) ? max_len : cap;
 
-	if (fd < CC3501E_SOCK_EOF_MAX_FD && sock_eof[fd]) {
+	if (sock_worker_recv_eof_check(sock_eof, CC3501E_SOCK_EOF_MAX_FD, fd)) {
 		/* Sticky EOF already recorded for this fd -- see the block comment
 		 * above.  Answer OK/0 without touching lwIP at all. */
+		return CC3501E_HW_OK;
+	}
+	if (want == 0u) {
+		/* BLOCKER fix (host review of bfb5f08): nothing was actually asked
+		 * for, so lwIP must not be called at all -- a want == 0
+		 * lwip_recvfrom() proves nothing about the peer (see the block
+		 * comment above sock_eof) and must never be allowed to reach the
+		 * latch check below. */
 		return CC3501E_HW_OK;
 	}
 
@@ -981,13 +1025,18 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 		}
 		return CC3501E_HW_ERR_IO;
 	}
-	/* n == 0 on a STREAM socket means the peer closed -- still OK, 0 bytes.
-	 * Latch it (STREAM only -- a 0-byte UDP recv is a legitimate empty
-	 * datagram, not EOF) so the NEXT recv on this fd takes the short-circuit
-	 * above instead of reaching lwIP's post-FIN ENOTCONN path -- see the
-	 * block comment above sock_eof. */
-	if (n == 0 && fd < CC3501E_SOCK_EOF_MAX_FD && sock_is_stream(fd)) {
-		sock_eof[fd] = true;
+	/* n == 0 on a STREAM socket, for a real want > 0 (guaranteed here -- the
+	 * want == 0 short-circuit above already returned), means the peer
+	 * closed -- still OK, 0 bytes.  Latch it (STREAM only -- a 0-byte UDP
+	 * recv is a legitimate empty datagram, not EOF) so the NEXT recv on
+	 * this fd takes the short-circuit above instead of reaching lwIP's
+	 * post-FIN ENOTCONN path.  The full n/want/is_stream decision is
+	 * sock_worker_recv_eof_should_latch() (sock_worker_recv_eof.h) -- see
+	 * its own header for the want == 0 BLOCKER this specific check closes,
+	 * and the block comment above sock_eof for the ENOTCONN bug it was
+	 * originally written to close. */
+	if (sock_worker_recv_eof_should_latch((int)n, want, sock_is_stream(fd))) {
+		sock_worker_recv_eof_set(sock_eof, CC3501E_SOCK_EOF_MAX_FD, fd, true);
 	}
 	if (recv_len_out != 0) *recv_len_out = (uint16_t)n;
 	if (from.sin_family == AF_INET) {
@@ -1016,9 +1065,7 @@ int cc3501e_hw_sock_close(uint16_t handle)
 		 * (any recv would just observe lwIP directly again), while leaving
 		 * it SET would risk short-circuiting a future close-then-reopen of
 		 * the same fd number. */
-		if (fd < CC3501E_SOCK_EOF_MAX_FD) {
-			sock_eof[fd] = false;
-		}
+		sock_worker_recv_eof_set(sock_eof, CC3501E_SOCK_EOF_MAX_FD, fd, false);
 	}
 	if (lwip_close((int)handle - 1) != 0) {
 		return CC3501E_HW_ERR_IO;
