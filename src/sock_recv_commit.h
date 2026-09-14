@@ -28,40 +28,39 @@
  * independently of the held-back tail) -- correct stream-prefix semantics,
  * never fewer.
  *
- * RESIDUAL 1 -- seq aliasing (NOT fixed here).  protocol_sockets.c's
- * handle_sock_recv() identifies a replay by the generic per-dispatch 5-bit
- * header seq (protocol.c's s_current_req_seq) plus handle, recorded on
- * EVERY SOCK_RECV dispatch for that handle.  That seq is not SOCK_RECV's
- * own counter -- it is shared by every opcode the host issues through
- * cc3501e_core.c's poll_by_repeat().  Two consecutive ring recvs on the
- * SAME handle therefore collide (the second is wrongly read as a replay of
- * the first, duplicating a block, still reported OK) when exactly 30 mod 31
- * OTHER seq-allocating poll_by_repeat() calls -- ANY opcode, not just
- * SOCK_RECV -- separate them: the 5-bit field has 31 non-zero values
- * (ALP_CC3501E_REQ_SEQ_NONE = 0 never claims a replay), so the counter
- * returns to the same value once every 31 allocations on that shared
- * counter.  The fix is a dedicated SOCK_RECV-only seq counter on the host
- * side, which removes this by construction (nothing else could ever
- * advance it between two ring recvs); this firmware-side change cannot
- * remove it alone, since the firmware only ever sees the seq the host chose
- * to send.
+ * RESIDUAL 1 -- seq aliasing -- CLOSED BY THE HOST COUNTER.  Before
+ * alp-sdk#2108 (branch fix/cc3501e-sock-recv-seq), protocol_sockets.c's
+ * handle_sock_recv() identified a replay by the generic per-dispatch 5-bit
+ * header seq (protocol.c's s_current_req_seq) plus handle -- shared by every
+ * opcode the host issues through cc3501e_core.c's poll_by_repeat(), so two
+ * consecutive ring recvs on the SAME handle could collide (the second wrongly
+ * read as a replay of the first, duplicating a block, still reported OK)
+ * whenever exactly 30 mod 31 OTHER seq-allocating calls separated them (31
+ * non-zero values in the 5-bit field).  AFTER #2108: the host gives SOCK_RECV
+ * its OWN dedicated seq counter, advanced ONLY after an ALP_OK recv -- no
+ * other opcode can ever tick it, so two same-handle recvs can no longer
+ * alias by construction.  A host that does not carry #2108 (an older SDK, or
+ * one that never adopts the dedicated counter) still shares the generic
+ * counter and keeps this residual; this firmware-side fix cannot close it
+ * unilaterally, since the firmware only ever sees the seq the host chose to
+ * send.
  *
- * RESIDUAL 2 -- a dropped reply with no retry (NOT fixed here).  Lazy-
- * commit retires the previous call's bytes when a DIFFERENT request
- * arrives, not when the previous reply is actually known to have reached
- * the host.  Those are usually the same event (a lost reply provokes
- * poll_by_repeat()'s same-seq retry, which this fix catches), but not
- * always: if the host drops a lost reply WITHOUT issuing that same-seq
- * retry -- poll_by_repeat()'s own deadline expiring immediately after the
- * CRC-failed attempt, or a corrupted status byte decoding as one of the
- * terminal codes (0x06/0x07/0xFF) instead of the CRC error it should have
- * been -- the next call this handle makes is a genuinely new (non-replay)
- * recv, which commits the still-unacknowledged block and loses it exactly
- * as before this fix.  The host side will need a same-seq grace re-poll for
- * recv (retry once more before giving up, rather than surfacing the error
- * immediately) to close this; this firmware change cannot close it alone,
- * since by the time a non-replay call arrives there is no way left to tell
- * "host never saw the last reply" from "host saw it and moved on".
+ * RESIDUAL 2 -- a dropped reply with no retry -- ALSO CLOSED BY THE HOST
+ * COUNTER.  Lazy-commit retires the previous call's bytes when a DIFFERENT
+ * request arrives, not when the previous reply is actually known to have
+ * reached the host -- usually the same event (a lost reply provokes
+ * poll_by_repeat()'s same-seq retry, which this fix catches), but not when
+ * the host drops a lost reply WITHOUT issuing that retry (poll_by_repeat()'s
+ * deadline expiring right after a CRC failure, or a corrupted status byte
+ * decoding as a terminal code instead of the CRC error it should have been).
+ * #2108's dedicated counter is advanced ONLY after an ALP_OK recv, so a
+ * FAILED recv leaves the host's seq UNCHANGED -- its next recv on that handle
+ * therefore carries the SAME seq as the one that was lost, which this fix's
+ * replay check reads as a replay (not a new call), re-serving the
+ * still-unacknowledged block instead of committing past it.  Closed as a
+ * consequence of the counter's advance-on-success-only rule, not by a
+ * separate grace re-poll.  A host that does not carry #2108 keeps this
+ * residual, for the same reason RESIDUAL 1 does.
  *
  * PURE ARITHMETIC, SILICON-FREE.  This file owns ONLY the tail/uncommitted
  * bookkeeping -- head/tail as plain integers, no ring buffer, no memcpy, no

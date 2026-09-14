@@ -129,11 +129,14 @@ static volatile uint8_t            g_sock_send_reply[2]; /* valid iff g_sock_sen
 
 /* Mirrors handle_worker_routed_payload_reply()'s WORKER_ERR mapping
  * (protocol.c) byte-for-byte, so a cached ERR answers identically to what a
- * genuine collect through that path would have produced.  SOCK_SEND's own
- * HAL body (cc3501e_hw_sock_send) has not been observed to return
- * CC3501E_HW_ERR_STATE -- that code is BLE_GATT_REGISTER / sock_listen's --
- * but the mapping stays complete rather than assume it never will. */
-static alp_cc3501e_resp_t sock_send_hw_err_to_resp(int hw_rv)
+ * genuine collect through that path would have produced.  Shared by BOTH
+ * completion-time caches in this file -- SOCK_SEND's above and SOCK_RECV's
+ * worker-fallback cache below -- since the mapping is generic (HAL error
+ * code -> wire response), not specific to either opcode's HAL body.  Neither
+ * cc3501e_hw_sock_send() nor cc3501e_hw_sock_recv() has been observed to
+ * return CC3501E_HW_ERR_STATE -- that code is BLE_GATT_REGISTER / sock_listen's
+ * -- but the mapping stays complete rather than assume it never will. */
+static alp_cc3501e_resp_t sock_worker_hw_err_to_resp(int hw_rv)
 {
 	if (hw_rv == CC3501E_HW_ERR_NOTIMPL) return ALP_CC3501E_RESP_ERR_NOT_READY;
 	if (hw_rv == CC3501E_HW_ERR_INVAL) return ALP_CC3501E_RESP_ERR_INVALID;
@@ -152,10 +155,158 @@ void protocol_sock_send_on_worker_complete(uint8_t seq, int hw_rv, const uint8_t
 		memcpy((void *)g_sock_send_reply, data, sizeof(g_sock_send_reply));
 		g_sock_send_status = ALP_CC3501E_RESP_OK;
 	} else {
-		g_sock_send_status = sock_send_hw_err_to_resp(hw_rv);
+		g_sock_send_status = sock_worker_hw_err_to_resp(hw_rv);
 	}
 	g_sock_send_seq    = seq;
 	g_sock_send_cached = true;
+}
+
+/* SOCK_RECV WORKER-FALLBACK retry-safe reply cache.
+ *
+ * Closes the KNOWN FOLLOW-UP handle_sock_recv()'s ring fast path used to
+ * document below (host review): a handle NOT owned by the prefetch ring --
+ * UDP, or a STREAM socket accepted but never armed for prefetch -- falls
+ * back to handle_worker_routed_payload_reply(), a submit/collect PAIR with no
+ * lazy-commit ring to hold bytes back in.  cc3501e_hw_sock_recv()'s
+ * lwip_recvfrom() has no way to re-deliver bytes a lost reply already
+ * consumed from the socket, so a CRC-rejected reply followed by
+ * poll_by_repeat()'s identical-frame retry used to hand the retry the NEXT
+ * bytes off the socket -- the lost reply's bytes were gone for good, and for
+ * a STREAM socket that silently dropped data reported OK.
+ *
+ * SAME SHAPE as the #88/#107 SOCK_SEND cache immediately above, adapted for a
+ * request that carries no seq of its own: alp_cc3501e_sock_recv_t is just
+ * { handle | max_len } (v9 protocol, <alp/protocol/cc3501e.h>), so this cache
+ * keys on the request's *generic* 5-bit header seq
+ * (protocol_current_req_seq(), the SAME field the ring fast path's own
+ * lazy-commit replay check above already uses) PLUS the handle, rather than a
+ * per-opcode wire field.  Since that seq does not ride in job.req the way
+ * SOCK_SEND's does, protocol_sock_recv_note_submit() (worker.h) carries it
+ * across the submit -> completion gap: protocol.c's
+ * handle_worker_routed_payload_reply() calls it on the WORKER_IDLE -> QUEUED
+ * submit edge (the same seam WIFI_CONNECT_STA already special-cases there for
+ * cc3501e_hw_wifi_mark_connecting()), and worker.c's worker_execute() reads
+ * the handle straight out of job.req and pairs it with the noted seq to fill
+ * this cache -- in the SAME critical section that publishes job.state,
+ * exactly like protocol_sock_send_on_worker_complete() (see worker.h for why
+ * that ordering is load-bearing).
+ *
+ * BOTH OUTCOMES ARE CACHED (OK with the received bytes, or a decoded ERR),
+ * for the identical reason the SOCK_SEND cache does: a same seq+handle poll
+ * is BY DEFINITION a retry of the SAME logical recv, so whatever the first
+ * execution produced is the correct, final answer for every later poll of
+ * it.
+ *
+ * CAPPED WELL BELOW the worker's own reply buffer (job.result / worker.c's
+ * local buf[], both ALP_CC3501E_MAX_PAYLOAD = 4096 B): a first attempt sized
+ * this cache to match that 4096 B ceiling and LINK-FAILED the real
+ * `--wifi --ble` production image ("program will not fit into available
+ * memory" -- tiarmlnk, GROUP_4 needed 0x2487 B where only a 0x16cb B hole
+ * remained) -- the WiFi+BLE stacks already consume most of DRAM_NON_SECURE,
+ * so a second MAX_PAYLOAD-sized static buffer alongside worker.c's existing
+ * one does not fit.  CC3501E_SOCK_RECV_WK_CACHE_CAP below (256 B) is the
+ * chosen middle ground: it covers a typical UDP datagram or a brief
+ * STREAM-accepted-but-unarmed read -- the actual traffic this FALLBACK path
+ * serves; the ring fast path above is what carries bulk STREAM transfer
+ * once a socket is armed for prefetch, and that path is unaffected by this
+ * cap.  RAM COST: 256 B (g_sock_recv_wk_reply) + 6 B (seq/handle/status/len)
+ * + 1 B (g_sock_recv_job_seq) = ~263 B static, still far larger than
+ * SOCK_SEND's 2-byte cache because a recv reply carries the received DATA,
+ * not a small fixed count, but small enough to fit alongside the WiFi+BLE
+ * stacks.  Single most-recent entry only, the same tradeoff the SOCK_SEND
+ * cache already makes (see its own block comment).
+ *
+ * A REPLY LARGER THAN THE CAP IS NOT CACHED -- mirrors protocol.c's generic
+ * retry_latch_store()'s own "too big to cache, do not store" exemption
+ * (s_retry_latch.data[32]) rather than truncating it (which would answer a
+ * byte-identical retry with FEWER bytes than the original reply, corrupting
+ * it) or growing the buffer to cover every case (the RAM budget above says
+ * no).  RESIDUAL: a worker-fallback recv whose OWN reply exceeds the cap and
+ * is then CRC-rejected on the wire has no cached copy to re-serve, so a
+ * same-seq+handle retry falls through to a genuine re-recv -- the ORIGINAL
+ * KNOWN FOLLOW-UP data-loss hole, narrowed to "replies over 256 B on this
+ * fallback path" rather than closed for every size.  UDP datagrams over the
+ * cap and STREAM sockets that stay unarmed long enough to receive a large
+ * chunk through this path both keep the residual; the ring fast path (this
+ * function's fast-path block above) is unaffected and remains fully fixed
+ * at any size.
+ *
+ * INVALIDATED ON A DIFFERENT SEQ, A DIFFERENT HANDLE, OR EITHER
+ * HANDLE-OWNING OPCODE: handle_sock_recv() below drops a mismatched entry
+ * before falling through, mirroring handle_sock_send()'s own different-seq
+ * rule; handle_sock_close() drops it when the handle being closed matches (a
+ * closed handle's last recv reply must never outlive the socket); and
+ * handle_sock_open() drops it unconditionally on every call, since a freshly
+ * issued handle number can be a REUSE of one this cache still remembers --
+ * clearing on every open is the cheap, always-safe superset of "only when the
+ * new handle happens to collide".
+ *
+ * RESIDUAL, same family as the ring fast path's (sock_recv_commit.h) and the
+ * SOCK_SEND cache's own: keyed on a 5-bit seq SHARED with every other opcode,
+ * not a per-recv counter, so two worker-routed recvs on the SAME handle
+ * separated by exactly 30 mod 31 OTHER seq-allocating requests alias -- see
+ * sock_recv_commit.h's RESIDUAL 1/2 for the host-side fix (a dedicated
+ * SOCK_RECV seq counter) that removes this by construction; this
+ * firmware-side cache cannot close it alone, for the identical reason the
+ * ring fast path cannot. */
+/* See the cache block comment above for why this is 256, not
+ * ALP_CC3501E_MAX_PAYLOAD: a full-size cache measurably does not fit
+ * alongside the WiFi+BLE stacks in the real `--wifi --ble` production link. */
+#define CC3501E_SOCK_RECV_WK_CACHE_CAP 256u
+
+static volatile bool               g_sock_recv_wk_cached;
+static volatile uint8_t            g_sock_recv_wk_seq;
+static volatile uint16_t           g_sock_recv_wk_handle;
+static volatile alp_cc3501e_resp_t g_sock_recv_wk_status;
+static volatile uint16_t           g_sock_recv_wk_reply_len;
+static volatile uint8_t            g_sock_recv_wk_reply[CC3501E_SOCK_RECV_WK_CACHE_CAP];
+
+/* WRITTEN ONLY from protocol.c's WORKER_IDLE submit edge (SPI-ISR/dispatch
+ * context); READ from worker.c's worker_execute() at completion, which on
+ * the real (CC3501E_WIFI) build runs on the DRAIN THREAD -- a genuinely
+ * different context, unlike last_recv_seq/last_recv_handle further down
+ * (dispatch-context-only on both ends).  volatile for that cross-context
+ * hand-off, the same reasoning worker.c applies to job.req/job.state.  Cannot
+ * be overwritten mid-flight by an unrelated SOCK_RECV: worker_poll() matches
+ * an in-flight job by OPCODE ALONE, so a second SOCK_RECV dispatch landing
+ * while this one is QUEUED/RUNNING only ever observes QUEUED/RUNNING and
+ * answers BUSY without reaching the IDLE submit edge again. */
+static volatile uint8_t g_sock_recv_job_seq;
+
+void protocol_sock_recv_note_submit(uint8_t seq)
+{
+	g_sock_recv_job_seq = seq;
+}
+
+void protocol_sock_recv_on_worker_complete(uint16_t       handle,
+                                           int            hw_rv,
+                                           const uint8_t *data,
+                                           size_t         len)
+{
+	if (hw_rv == CC3501E_HW_OK && len > sizeof(g_sock_recv_wk_reply)) {
+		/* TOO BIG TO CACHE (see the cache block's own comment on this
+		 * exemption): invalidate rather than leave stale, so a later
+		 * same-key poll correctly MISSES and re-executes instead of being
+		 * served a PREVIOUS, unrelated cache entry that happens to still be
+		 * marked valid -- returning here without doing this left
+		 * g_sock_recv_wk_cached at whatever it was before (possibly true,
+		 * from an earlier, smaller cached recv), which a same-seq+handle
+		 * retry of THIS oversized recv would then have matched against that
+		 * stale, unrelated reply. */
+		g_sock_recv_wk_cached = false;
+		return;
+	}
+	g_sock_recv_wk_seq    = g_sock_recv_job_seq;
+	g_sock_recv_wk_handle = handle;
+	if (hw_rv == CC3501E_HW_OK) {
+		memcpy((void *)g_sock_recv_wk_reply, data, len);
+		g_sock_recv_wk_reply_len = (uint16_t)len;
+		g_sock_recv_wk_status    = ALP_CC3501E_RESP_OK;
+	} else {
+		g_sock_recv_wk_reply_len = 0u;
+		g_sock_recv_wk_status    = sock_worker_hw_err_to_resp(hw_rv);
+	}
+	g_sock_recv_wk_cached = true;
 }
 
 /* SOCK_OPEN (0x20): req = alp_cc3501e_sock_open_t { family | type | protocol |
@@ -171,6 +322,11 @@ alp_cc3501e_resp_t handle_sock_open(const uint8_t *req,
 	if (req[0] != (uint8_t)ALP_CC3501E_SOCK_FAMILY_IPV4) {
 		return ALP_CC3501E_RESP_ERR_INVALID; /* v1 IP stack is IPv4-only */
 	}
+	/* A freshly issued handle can REUSE a number the SOCK_RECV worker-fallback
+	 * replay cache still remembers from a since-closed socket (see that
+	 * cache's own block comment) -- drop it unconditionally rather than track
+	 * which handle this OPEN is about to hand back. */
+	g_sock_recv_wk_cached = false;
 	return handle_worker_routed_payload_reply(ALP_CC3501E_CMD_SOCK_OPEN,
 	                                          req,
 	                                          req_len,
@@ -399,31 +555,36 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 	 * handle is not the prefetched one, and then we fall through to the original
 	 * worker path unchanged.
 	 *
-	 * KNOWN FOLLOW-UP, NOT FIXED HERE: the fallback below --
+	 * WORKER-FALLBACK REPLAY, FIXED BELOW: the fallback --
 	 * handle_worker_routed_payload_reply() for a handle that is NOT the
 	 * prefetched one (UDP sockets, and STREAM sockets accepted but never
-	 * armed for prefetch) -- has the SAME CRC-rejected-reply data-loss hole
-	 * this fast path just closed: cc3501e_hw_sock_recv()'s lwip_recvfrom()
-	 * also has no way to re-deliver bytes a lost reply already consumed from
-	 * the socket.  It is excluded from the generic retry latch for the same
-	 * "stream-consuming, not idempotent" reason SOCK_RECV as a whole is (see
-	 * protocol.c's retry_latch_applies()), and it is worker-routed rather
-	 * than a single synchronous call, which does not fit this fast path's
-	 * lazy-commit shape (there is no ring to hold bytes back in). */
+	 * armed for prefetch) -- used to have the SAME CRC-rejected-reply
+	 * data-loss hole this fast path closes: cc3501e_hw_sock_recv()'s
+	 * lwip_recvfrom() has no way to re-deliver bytes a lost reply already
+	 * consumed from the socket.  It is excluded from the generic retry latch
+	 * for the same "stream-consuming, not idempotent" reason SOCK_RECV as a
+	 * whole is (see protocol.c's retry_latch_applies()), and it is
+	 * worker-routed rather than a single synchronous call, so it cannot reuse
+	 * this fast path's lazy-commit shape (there is no ring to hold bytes back
+	 * in) -- it gets its own completion-time reply cache instead, below. */
+	const uint16_t handle = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
+
+	/* seq 0 (ALP_CC3501E_REQ_SEQ_NONE) never claims a replay, same
+	 * reservation the generic retry latch uses -- a host that does not
+	 * assign one (every bare cc3501e_request() call site, or a pre-v8 host)
+	 * would otherwise read every frame as "seq 0, same as last", i.e. always
+	 * a replay of whatever was last served.  Shared by the fast path below
+	 * AND the worker-fallback cache further down -- both key off this same
+	 * generic per-dispatch seq. */
+	const uint8_t seq = protocol_current_req_seq();
+
 	{
-		const uint16_t handle  = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
 		const uint16_t max_len = (uint16_t)((uint16_t)req[2] | ((uint16_t)req[3] << 8));
 		const size_t   hdr     = sizeof(alp_cc3501e_sock_recv_resp_t);
 		if (reply_cap > hdr) {
 			size_t room = reply_cap - hdr;
 			if (max_len != 0u && room > (size_t)max_len) room = (size_t)max_len;
 
-			/* seq 0 (ALP_CC3501E_REQ_SEQ_NONE) never claims a replay, same
-			 * reservation the generic retry latch uses -- a host that does not
-			 * assign one (every bare cc3501e_request() call site, or a pre-v8
-			 * host) would otherwise read every frame as "seq 0, same as last",
-			 * i.e. always a replay of whatever was last served. */
-			const uint8_t seq = protocol_current_req_seq();
 			const bool replay = (seq != 0u && seq == last_recv_seq && handle == last_recv_handle);
 
 			uint16_t  got = 0u;
@@ -484,6 +645,55 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 		}
 	}
 
+	/* WORKER-FALLBACK REPLAY CACHE (see the block comment above
+	 * g_sock_recv_wk_cached): a different seq or a different handle than what
+	 * is cached proves the host has moved on to a new logical recv -- drop
+	 * the stale entry here, mirroring handle_sock_send()'s own different-seq
+	 * rule, rather than leave it to linger until some LATER recv happens to
+	 * overwrite it. */
+	if (g_sock_recv_wk_cached && (seq != g_sock_recv_wk_seq || handle != g_sock_recv_wk_handle)) {
+		g_sock_recv_wk_cached = false;
+	}
+
+	if (seq != 0u && g_sock_recv_wk_cached) {
+		/* This exact poll is what would once have reached
+		 * handle_worker_routed_payload_reply()'s own WORKER_DONE/WORKER_ERR
+		 * -> worker_reset() path -- now short-circuited by the cache hit
+		 * above.  Reclaim the slot here instead of leaving that to chance,
+		 * same reason handle_sock_send() does after its own cache hit.  The
+		 * 1-byte key (handle's low byte) is the same approximation
+		 * worker_discard_stale_terminal()/worker_reclaim_matching_terminal()
+		 * already accept for SOCK_SEND's own seq -- sufficient to reclaim
+		 * THIS job, since the full seq+handle match above already proved
+		 * this reply is ours. */
+		(void)worker_reclaim_matching_terminal(ALP_CC3501E_CMD_SOCK_RECV,
+		                                       offsetof(alp_cc3501e_sock_recv_t, handle),
+		                                       (uint8_t)(handle & 0xFFu));
+		if (g_sock_recv_wk_status == ALP_CC3501E_RESP_OK) {
+			if (reply_cap < (size_t)g_sock_recv_wk_reply_len) return ALP_CC3501E_RESP_ERR_NO_MEM;
+			memcpy(reply_data, (const void *)g_sock_recv_wk_reply, g_sock_recv_wk_reply_len);
+			*reply_data_len = g_sock_recv_wk_reply_len;
+		}
+		return g_sock_recv_wk_status;
+	}
+
+	/* STALE-JOB GUARD, same purpose as handle_sock_send()'s (protocol_sockets.c,
+	 * same file) but a DIFFERENT mechanism: reaching here means this
+	 * request's seq+handle is NOT cached -- either the very first
+	 * worker-routed SOCK_RECV ever, or the host has moved on to a genuinely
+	 * NEW recv while an OLDER recv's job may still be sitting in the worker
+	 * slot, finished but never collected.  worker_poll() inside
+	 * handle_worker_routed_payload_reply() below matches the job slot by
+	 * OPCODE ALONE, so without this check that call would hand the OLD job's
+	 * finished bytes back as if they were THIS request's answer -- and
+	 * unlike SOCK_SEND, that OLD job can share THIS request's own handle (a
+	 * job.req byte-compare cannot tell them apart; see
+	 * worker_discard_stale_recv()'s doc comment, worker.h, for why), so this
+	 * uses the unconditional-by-opcode variant instead: the cache-miss check
+	 * just above it already proved, with FULL (seq, handle) precision, that
+	 * whatever is sitting there is not this request's. */
+	(void)worker_discard_stale_recv();
+
 	return handle_worker_routed_payload_reply(ALP_CC3501E_CMD_SOCK_RECV,
 	                                          req,
 	                                          req_len,
@@ -504,5 +714,14 @@ alp_cc3501e_resp_t handle_sock_close(const uint8_t *req,
 	(void)reply_data;
 	(void)reply_cap;
 	if (req_len != sizeof(alp_cc3501e_sock_close_t)) return ALP_CC3501E_RESP_ERR_INVALID;
+	{
+		const uint16_t handle = (uint16_t)((uint16_t)req[0] | ((uint16_t)req[1] << 8));
+		if (g_sock_recv_wk_cached && handle == g_sock_recv_wk_handle) {
+			/* A closed handle's last recv reply must not outlive the socket:
+			 * a LATER handle-number reuse must never be answered from it (see
+			 * the cache's own block comment). */
+			g_sock_recv_wk_cached = false;
+		}
+	}
 	return handle_worker_routed_payload(ALP_CC3501E_CMD_SOCK_CLOSE, req, req_len, reply_data_len);
 }

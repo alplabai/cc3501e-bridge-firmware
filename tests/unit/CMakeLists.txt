@@ -246,3 +246,35 @@ target_include_directories(test_sock_recv_commit PRIVATE
 target_compile_options(test_sock_recv_commit PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_sock_recv_commit PRIVATE ztest_shim)
 add_test(NAME sock_recv_commit COMMAND test_sock_recv_commit)
+
+# sock_recv_worker_cache: the WORKER-FALLBACK reply cache in
+# protocol_sockets.c's handle_sock_recv() (g_sock_recv_wk_cached et al.) --
+# closes the KNOWN FOLLOW-UP the ring fast path's own fix (sock_recv_replay,
+# sock_recv_commit above) used to leave documented: a handle NOT owned by the
+# prefetch ring falls back to a submit/collect pair with no ring to hold
+# bytes back in.  Unreachable on the plain stub HAL because
+# cc3501e_hw_sock_recv() there always returns CC3501E_HW_ERR_NOTIMPL (no real
+# socket stack on the host), so a genuine RESP_OK -- and therefore this
+# cache's store arm -- never fires in test_transport_spi.c.  `--wrap`
+# redirects every firmware call to cc3501e_hw_sock_recv() to
+# __wrap_cc3501e_hw_sock_recv() (the test file), which reports success with a
+# fixed payload -- turning a real WORKER_DONE into a code path this suite can
+# drive and inspect over the wire.  Same FW_SOURCES + stub HAL as
+# test_sock_send_done (no CC3501E_WIFI: the synchronous-submit stub shape is
+# exactly what this needs to reach DONE inside a single transaction()).
+add_executable(test_sock_recv_worker_cache
+    sock_recv_worker_cache/src/test_sock_recv_worker_cache.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_sock_recv_worker_cache PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_sock_recv_worker_cache PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1)
+target_compile_options(test_sock_recv_worker_cache PRIVATE ${TEST_FLAGS})
+target_link_options(test_sock_recv_worker_cache PRIVATE -Wl,--wrap=cc3501e_hw_sock_recv)
+target_link_libraries(test_sock_recv_worker_cache PRIVATE ztest_shim)
+add_test(NAME sock_recv_worker_cache COMMAND test_sock_recv_worker_cache)

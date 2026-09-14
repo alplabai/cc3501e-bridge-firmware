@@ -614,7 +614,15 @@ alp_cc3501e_resp_t handle_worker_routed_payload_reply(alp_cc3501e_cmd_t cmd,
 		retry_latch_store(cmd, ALP_CC3501E_RESP_ERR_RADIO, NULL, 0u);
 		return ALP_CC3501E_RESP_ERR_RADIO;
 	case WORKER_IDLE:
-		/* No job in flight: queue THIS one (with its payload) + return BUSY. */
+		/* No job in flight: queue THIS one (with its payload) + return BUSY.
+		 * For SOCK_RECV, stash this dispatch's seq for the worker-fallback
+		 * replay cache BEFORE submitting -- see protocol_sock_recv_note_submit()
+		 * (worker.h) for why: alp_cc3501e_sock_recv_t carries no seq of its
+		 * own, unlike SOCK_SEND, so it cannot ride out to completion in
+		 * job.req the way SOCK_SEND's does. */
+		if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+			protocol_sock_recv_note_submit(s_current_req_seq);
+		}
 		(void)worker_submit_payload((uint8_t)cmd, req, (uint16_t)req_len);
 		return ALP_CC3501E_RESP_ERR_BUSY;
 	default: /* QUEUED / RUNNING (incl. another cmd in flight) */

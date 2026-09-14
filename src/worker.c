@@ -523,6 +523,15 @@ static void worker_execute(uint8_t cmd)
 		protocol_sock_send_on_worker_complete(
 		    job.req[offsetof(alp_cc3501e_sock_send_t, seq)], rv, buf, len);
 	}
+	/* SOCK_RECV-ONLY, same ordering rationale as the SOCK_SEND call above:
+	 * the handle rides in job.req (unlike SOCK_SEND's seq, no separate
+	 * capture needed for it), computed identically to the SOCK_RECV case
+	 * above (wk_get_le16(job.req, 0u)) -- recomputed here rather than
+	 * threading it out of the switch, since this call must stay inside this
+	 * one critical section regardless of which case ran. */
+	if (cmd == ALP_CC3501E_CMD_SOCK_RECV) {
+		protocol_sock_recv_on_worker_complete(wk_get_le16(job.req, 0u), rv, buf, len);
+	}
 	if (rv == CC3501E_HW_OK) {
 		memcpy((void *)job.result, buf, len);
 		job.result_len = (uint16_t)len;
@@ -699,6 +708,22 @@ int worker_reclaim_matching_terminal(uint8_t cmd, size_t req_off, uint8_t req_by
 	}
 	worker_critical_exit(key);
 	return reclaimed;
+}
+
+int worker_discard_stale_recv(void)
+{
+	const unsigned long key       = worker_critical_enter();
+	int                 discarded = 0;
+	if (job.job_cmd == ALP_CC3501E_CMD_SOCK_RECV &&
+	    (job.state == WORKER_DONE || job.state == WORKER_ERR)) {
+		job.state      = WORKER_IDLE;
+		job.job_cmd    = 0u;
+		job.result_len = 0u;
+		job.err        = 0;
+		discarded      = 1;
+	}
+	worker_critical_exit(key);
+	return discarded;
 }
 
 void worker_run_pending(void)
