@@ -25,6 +25,34 @@ release; see `hal/ti/cc3501e_hw_ti_wifi.c`'s `cc3501e_hw_wifi_ensure_sta_role()`
 and `hal/ti/cc3501e_hw_ti_power.c`'s `cc3501e_hw_power_apply_radio_now()`,
 which now apply the policy synchronously instead.
 
+- **Worker-path `SOCK_RECV` after EOF answered `RESP_ERR_RADIO`.** A socket
+  not owned by the prefetch ring (UDP, or an accepted STREAM socket never
+  armed for it) got its full body, one `OK`/0-byte EOF recv, then
+  `RESP_ERR_RADIO` on the NEXT recv. TI's lwIP frees the socket's `recvmbox`
+  on the first post-FIN recv; every later recv then returns `ENOTCONN` as a
+  genuine error, not another 0-byte `OK`. A per-fd sticky EOF latch now
+  short-circuits every later recv on that fd to `OK`/0 without touching lwIP
+  again.
+- **A reset on the prefetch-ring socket spun to `ALP_ERR_TIMEOUT` instead of
+  erroring.** The ring's pump silently ignored a real `lwip_recv()` failure
+  (RST etc, not `EAGAIN`), so a drained, dead ring kept answering `BUSY`
+  forever and the host spun to its own `timeout_ms`. The pump now latches the
+  failure, and the ring answers `RESP_ERR_RADIO` once drained -- the same
+  status a worker-path socket failure gets.
+- **A zero-length recv could latch a false EOF.** The sticky-EOF latch above
+  originally fired on any 0-byte result from a STREAM socket; a recv whose
+  `max_len`/`cap` clamp to 0 also returns 0 bytes from TI's lwIP, with no
+  bearing on whether the peer actually closed, so it could freeze a
+  perfectly live socket as "EOF" and truncate the stream. The latch now also
+  requires the request to have asked for more than 0 bytes.
+- **A ring-served `SOCK_RECV` with `max_len == 0` silently dropped bytes.**
+  The ring's room computation read wire `max_len == 0` as "no cap" rather
+  than "the host's own capacity is 0", so it served up to a full frame from
+  the ring and retired those bytes from the ring's lazy-commit tail -- the
+  host then copied `min(data_len, cap == 0)` of them, i.e. none, and the
+  rest were gone. `max_len == 0` now clamps the ring's room to 0 and
+  answers `OK` immediately, matching the worker path.
+
 ## v0.8.0
 
 GPE: `0.254.5.0`. Wire protocol: `4.0`. sha256
