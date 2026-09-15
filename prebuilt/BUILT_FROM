@@ -56,7 +56,7 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   94d8a37755750c2774f4f60ebe41d58a0d545c46
+built-from:   1b074228472ca538d279015fdbc0cb0b5760022a
 image-sha256: 79c62f0de11a2582d60521c5f66d5dcc0fdd993cd4baa9f0ce317450701a7104
 raw-sha256:   2a6f85c6b260fb4aa2f2e5edef8e9ef5cb1ddecdc6ebb8d86afdb676d8db9bdb
 
