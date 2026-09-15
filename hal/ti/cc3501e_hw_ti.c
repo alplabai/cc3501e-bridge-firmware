@@ -699,7 +699,22 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 #endif
 }
 
-/* Software-reset marker, retained across the warm reset (#111).
+/* Software-reset marker (#111), WRITTEN before NVIC_SystemReset() and MEANT to
+ * be retained across the warm reset it triggers.
+ *
+ * WARNING: that retention is an ASSUMPTION on this silicon, not a proven fact
+ * -- the same caveat transport_hw_ti_spi.c's g_persist carries for the OTA
+ * update-mode flag, and neither has been measured any more than the other.
+ * (#148, run14 P6) is a HOST nRESET measurement and found the .TI.noinit
+ * wedge snapshot does NOT survive it; this marker uses the SAME section but a
+ * DIFFERENT reset source (this firmware's own SYSRESETREQ), which run14 P6
+ * did not exercise, so its result neither confirms nor refutes this marker's
+ * survival.  Plainly: the soft-vs-power-on split cc3501e_hw_reset_cause()
+ * reports to `diag info` on every shipping build is only as trustworthy as
+ * this unmeasured retention assumption -- if SYSRESETREQ does not retain
+ * .TI.noinit either, every CMD_RESET reboot will silently misreport as
+ * `power-on` instead of `soft`, with no self-heal to catch it (the marker
+ * being unset is indistinguishable from a power-on that never armed one).
  *
  * PowerWFF3_getResetReason() answers PowerWFF3_RESET_PIN_POR for a SYSRESETREQ on
  * this part, so the SDK accessor reports `power-on` after a CMD_RESET (bench-

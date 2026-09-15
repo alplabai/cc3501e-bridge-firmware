@@ -441,11 +441,21 @@ static struct {
 	uint32_t probe_ch13tsta;
 	uint8_t  probe_phase; /* enum spi_phase the slave was parked in */
 	uint8_t  probe_flags; /* bit0 reply_armed, bit1 is_dead, bit2 polled */
-	/* #148: raw .TI.noinit retention test, refreshed every tick -- NO derived
-	 * logic to read, unlike `boots` (case 5), which needs the read-and-clear
-	 * semantics explained to be trusted.  [31:16] = a fixed 0x5AA5 test
-	 * pattern, [15:0] = its 16-bit ones' complement (0xA55A) -- so a single
-	 * raw read tells the three outcomes apart at a glance:
+	/* #148: raw .TI.noinit retention test -- NO derived logic to read, unlike
+	 * `boots` (case 5), which needs the read-and-clear semantics explained to
+	 * be trusted.  [31:16] = a fixed 0x5AA5 test pattern, [15:0] = its 16-bit
+	 * ones' complement (0xA55A), refreshed every tick.
+	 *
+	 * REVIEW FIX: selector 12 does NOT read this field live -- it is
+	 * rewritten every ~10ms tick, but a bench reader can only reach it over
+	 * the wire after the link recovers (run14 P6: ~3.5s), by which time
+	 * hundreds of ticks have already overwritten whatever the reset left
+	 * behind, so a live read would show the magic regardless of what the
+	 * reset did.  g_retention_magic_pair_boot (declared with
+	 * g_retention_latched above bridge_transport_spi_probe_tick()) latches
+	 * this field's content on the FIRST tick, before this boot's own write
+	 * ever runs -- selector 12 returns THAT.  A single raw read of the latch
+	 * tells the three outcomes apart at a glance:
 	 *   0x5AA5A55A exactly => this word survived the reset (retained)
 	 *   0x00000000          => the bootloader/ROM zeroed .TI.noinit
 	 *   anything else       => RAM came back randomised, not simply cleared
@@ -1414,6 +1424,24 @@ void bridge_transport_spi_probe_xfer(void)
 #endif
 
 #ifdef CC3501E_WEDGE_PROBE
+/* #148 (review fix): BOTH retention domains below (the AON scratchpad LINE2
+ * word and g_persist.probe_magic_pair) are rewritten with a fresh pattern
+ * every ~10ms tick -- but a bench reader can only reach either one over the
+ * wire AFTER the link comes back up (run14 P6: ~3.5s of recovery), by which
+ * time hundreds of ticks have already stamped the fresh pattern over
+ * whatever the reset actually left behind.  A live re-read at that point
+ * would therefore read the magic NO MATTER WHAT the reset did -- the exact
+ * defect this whole change exists to diagnose, reproduced in the diagnostic
+ * itself.
+ *
+ * Fix: latch each domain's PRE-WRITE content exactly ONCE, on the first tick
+ * this boot, into these plain-.bss copies (NOT .TI.noinit: they must start
+ * zero/unlatched on every fresh boot and latch exactly once that boot).
+ * Selectors 11 and 12 below return these latches, not a live re-read. */
+static bool     g_retention_latched;
+static uint32_t g_retention_aon_line2_boot;  /* raw LINE2 word as found on the first tick */
+static uint32_t g_retention_magic_pair_boot; /* raw probe_magic_pair as found on the first tick */
+
 /* Refresh the wedge snapshot.  Called from cc3501e_hw_tick() on the task, so a
  * frozen probe_ticks in the read-back proves the TASK stopped running, while a
  * still-advancing one proves the task lived and only the SPI slave was stuck --
@@ -1527,22 +1555,40 @@ void bridge_transport_spi_probe_tick(void)
 	    (uint8_t)((reply_armed ? 1u : 0u) | (bridge_transport_spi_is_dead() ? 2u : 0u) |
 	              (g_polled ? 4u : 0u) | (GPIO_read(CC3501E_READY_GPIO) ? 8u : 0u));
 
-	/* #148: refresh the .TI.noinit-domain raw retention pattern -- see its
-	 * declaration on g_persist above for what the three read-back outcomes
-	 * mean. */
+	/* #148 (review fix): latch BOTH retention domains' PRE-WRITE content
+	 * exactly ONCE, on the first tick this boot, BEFORE either write below
+	 * touches them -- see g_retention_latched's declaration above for why a
+	 * live re-read at selector time cannot answer #148.  g_retention_latched
+	 * gates both captures together since both writes happen in this same
+	 * function; nothing before this point in the file ever writes either
+	 * word, so "first tick" here is also "before anything else can write
+	 * them". */
+	if (!g_retention_latched) {
+		g_retention_aon_line2_boot  = HWREG(CC3501E_PROBE_AON_LINE2_ADDR);
+		g_retention_magic_pair_boot = g_persist.probe_magic_pair;
+		g_retention_latched         = true;
+	}
+
+	/* #148: refresh the .TI.noinit-domain raw retention pattern for the NEXT
+	 * reset to be tested against -- see g_persist.probe_magic_pair's
+	 * declaration for what the three read-back outcomes mean.  This is a
+	 * LIVE write, refreshed every tick like the rest of this snapshot;
+	 * selectors 11/12 read the LATCH above, not this word, for exactly the
+	 * reason g_retention_latched's declaration explains. */
 	g_persist.probe_magic_pair = 0x5AA5A55Au;
 
 	/* #148: reset-surviving capture in the AON scratchpad -- a SECOND,
 	 * INDEPENDENT retention domain from .TI.noinit/DRAM (see
 	 * CC3501E_PROBE_AON_LINE2_ADDR above for the address and its provenance).
-	 * This is the direct answer to whether run14 P6's non-retained
-	 * .TI.noinit is a DRAM-specific finding or a whole-chip one:
-	 *   - magic survives (reads back [31:28]==0xA exactly, byte-for-byte
-	 *     with what was last written) => a reset-surviving snapshot exists
-	 *     in AON, and the .TI.noinit non-retention is DRAM-specific
-	 *   - reads 0                     => the bootloader clears this word too
-	 *   - reads random/garbage        => the warm nRESET is a POR to the AON
-	 *     bank as well, and no on-chip retention exists for either domain
+	 * This write refreshes the LIVE word for the NEXT reset to be tested
+	 * against; g_retention_aon_line2_boot (selector 11) is the answer for
+	 * THIS boot's reset, latched above before this write ever ran.  Read
+	 * selector 11's [31:28] nibble to tell the three outcomes apart:
+	 *   - magic (0xA) exactly    => a reset-surviving snapshot exists in
+	 *     AON, and the .TI.noinit non-retention (run14 P6) is DRAM-specific
+	 *   - reads 0                => the bootloader clears this word too
+	 *   - reads random/garbage   => the warm nRESET is a POR to the AON bank
+	 *     as well, and no on-chip retention exists for either domain
 	 *
 	 * Packed into bits [31:16] ONLY -- bits [15:0] belong to psa_fwu (see the
 	 * constant's comment) and are preserved exactly via read-modify-write:
@@ -1564,6 +1610,12 @@ void bridge_transport_spi_probe_tick(void)
 		    (((g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u ? 1u : 0u) << 22) |
 		    (((g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u ? 1u : 0u) << 21) |
 		    (quiet5 << 16);
+		/* RACE NOTE: this read-modify-write is only safe because it and every
+		 * psa_fwu_request_reboot() call site run on the SAME task, this probe
+		 * tick always runs before request_reboot within a given tick, and a
+		 * successful request_reboot() never returns to let a second RMW race
+		 * it.  Moving either off that task (or making request_reboot return
+		 * on success) would silently corrupt a live OTA reboot request. */
 		const uint32_t lo16_preserved       = HWREG(CC3501E_PROBE_AON_LINE2_ADDR) & 0x0000FFFFu;
 		HWREG(CC3501E_PROBE_AON_LINE2_ADDR) = hi16 | lo16_preserved;
 	}
@@ -1619,14 +1671,16 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag loglevel 9  -> ADC probe status (open/convert bits)
  *   alp companion diag loglevel 10 -> #142 quiet-rearm heal count (cc3501e_hw_
  *                                     link_quiet_rearm_count())
- *   alp companion diag loglevel 11 -> raw AON scratchpad LINE2 word (#148),
- *                                     the SECOND, INDEPENDENT retention
- *                                     capture -- see
- *                                     CC3501E_PROBE_AON_LINE2_ADDR and
- *                                     bridge_transport_spi_probe_tick()
- *   alp companion diag loglevel 12 -> raw g_persist.probe_magic_pair (#148):
- *                                     a fixed 0x5AA5A55A test pattern,
- *                                     refreshed every tick -- lets a reader
+ *   alp companion diag loglevel 11 -> AON scratchpad LINE2 word AS FOUND ON
+ *                                     THE FIRST TICK AFTER BOOT (#148), the
+ *                                     SECOND, INDEPENDENT retention capture
+ *                                     -- a LATCH, not a live read (see
+ *                                     g_retention_latched and
+ *                                     CC3501E_PROBE_AON_LINE2_ADDR)
+ *   alp companion diag loglevel 12 -> g_persist.probe_magic_pair AS FOUND ON
+ *                                     THE FIRST TICK AFTER BOOT (#148): a
+ *                                     fixed 0x5AA5A55A test pattern -- also a
+ *                                     LATCH, not a live read -- lets a reader
  *                                     tell ZEROED .TI.noinit RAM (reads 0)
  *                                     apart from RANDOMISED .TI.noinit RAM
  *                                     (garbage, near-certainly not this exact
@@ -1692,19 +1746,27 @@ uint32_t bridge_transport_spi_probe_read(void)
 		 * that never took this path at all. */
 		return cc3501e_hw_link_quiet_rearm_count();
 	case 11u:
-		/* #148: raw AON scratchpad LINE2 word -- see
-		 * CC3501E_PROBE_AON_LINE2_ADDR's comment for the address provenance
-		 * and bridge_transport_spi_probe_tick()'s bit layout.  Read RAW, not
-		 * masked to [31:16]: bits [15:0] (psa_fwu's own state) are part of
-		 * what a bench reader needs to confirm the read-modify-write actually
-		 * preserved them. */
-		return HWREG(CC3501E_PROBE_AON_LINE2_ADDR);
+		/* #148: raw AON scratchpad LINE2 word AS FOUND ON THE FIRST TICK
+		 * AFTER BOOT -- the pre-boot content, latched by
+		 * bridge_transport_spi_probe_tick() into g_retention_aon_line2_boot
+		 * BEFORE that function's own write ever ran (see its declaration and
+		 * CC3501E_PROBE_AON_LINE2_ADDR's comment for the address
+		 * provenance).  NOT a live read: a live HWREG() read here would
+		 * always show this firmware's own ~10ms-old write by the time a
+		 * bench reader can reach it over the wire (run14 P6: ~3.5s
+		 * post-reset) -- reading raw, not masked to [31:16], so bits [15:0]
+		 * (psa_fwu's own state) are visible too. */
+		return g_retention_aon_line2_boot;
 	case 12u:
-		/* #148: raw .TI.noinit retention pattern -- see g_persist.
-		 * probe_magic_pair's declaration for what the three read-back
-		 * outcomes mean.  Companion to case 11 above but in the OTHER
-		 * retention domain (.TI.noinit/DRAM, not the AON scratchpad). */
-		return g_persist.probe_magic_pair;
+		/* #148: raw .TI.noinit retention pattern AS FOUND ON THE FIRST TICK
+		 * AFTER BOOT, latched into g_retention_magic_pair_boot before
+		 * bridge_transport_spi_probe_tick()'s own write ever ran -- see
+		 * g_persist.probe_magic_pair's declaration for what the three
+		 * read-back outcomes mean, and g_retention_latched's declaration for
+		 * why this must be a latch, not a live read.  Companion to case 11
+		 * above but in the OTHER retention domain (.TI.noinit/DRAM, not the
+		 * AON scratchpad). */
+		return g_retention_magic_pair_boot;
 	default:
 		break;
 	}
