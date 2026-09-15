@@ -314,6 +314,13 @@ on the residual rate 11.7%). Both default to a no-op, so a host that wants the
 mitigation must opt in. A large `STREAM_WRITE` also wedges the link — 64 B and
 256 B pass, 1024 B and 4092 B do not — and that is still open.
 
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0 + Wi-Fi toolbox 4.2.4) via
+`ti/build_ti.sh --wifi --ble`. Stage-1 raw image sha256
+`0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90` (`prebuilt/BUILT_FROM`'s
+`raw-sha256`) is the evidence those are the right flags: rebuilding at
+`built-from` with this exact command reproduces it bit for bit.
+
 ## v0.7.0
 
 Three landings since v0.6.0, none of which were in a shipped artifact until now.

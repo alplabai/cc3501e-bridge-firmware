@@ -49,10 +49,16 @@ Two stages. Stage 1 needs the license-gated TI toolchain; stage 2 needs the
 license-gated TI Wi-Fi Toolbox **and** two Alp Lab bench-only assets that are
 deliberately not in this repository.
 
-**Stage 1 — compile + link (`ti/build_ti.ps1`).**
+**Stage 1 — compile + link (`ti/build_ti.ps1` on Windows, `ti/build_ti.sh` on
+Linux — equivalent paths).**
 
 ```
 build_ti.ps1 -Ble -AlpSdkRoot <alp-sdk checkout>
+# or, on Linux (CHANGELOG.md's v0.2.0/v0.3.0 entries already record this as
+# the command used, and it reproduces built-from's raw-sha256 bit for bit --
+# see the 2026-09-15 measurement below, NOT the separate "Evidence (issue
+# #94)" section further down, which is a different commit/hash/size):
+ti/build_ti.sh --wifi --ble
 ```
 
 - `ticlang` 5.1.1, SysConfig 1.28.0, SimpleLink Wi-Fi SDK 10.10.01.08 (the
@@ -106,15 +112,31 @@ simplelink-wifi-toolbox flash-images-builder sign vendor_image \
   (`keys/alp_cc3501e_vendor_VALIDATION_public.pem`). This is a bench/staging
   key, not the production HSM key `ti/package_cc3501e_prod.ps1` uses.
 
-Reproducing the exact signed bytes therefore needs bench access this
-recipe's stage 2 cannot be run without. What stage 1 + the unsigned half of
-stage 2 *can* prove — and does — is that this is the right mechanism.
+**The mechanics of this recipe are fully reproducible given BOTH bench-only
+assets staged** (the SoM-specific `--conf_bin_file` and the VALIDATION
+`--signing_module` — neither is in this repository, see above) — measured
+2026-09-15: stage 1 at `built-from` (`017e7cf`), via `ti/build_ti.sh --wifi
+--ble`, rebuilt `build/ti/cc3501e-bridge.bin` to `raw-sha256`
+`0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90` — bit-exactly
+the value `prebuilt/BUILT_FROM` records — and stage 2 then wrapped and signed
+that `.out` at GPE `0.254.5.0`, differing from the shipped
+`prebuilt/cc3501e-v0.8.0.bin` in exactly 64 bytes, all inside offsets
+`1105602..1105668` (the ECDSA signature TLV tail): same size (`1105668`), same
+GPE stamp bytes, everything before offset `1105602` byte-identical — the
+64-byte delta itself is evidence the SoM-specific `cc35xx-conf.bin` was used
+here rather than a stock default, since the "Evidence" section below measures
+3 additional differing bytes in the `CONF_BIN` TLV when the stock default is
+substituted for it. **What cannot be reproduced without the private key is
+the signature tail** — the private key is not in this repository
+(`keys/README.md`) and never will be.
 
 ## Evidence (issue #94)
 
-Stage 1, run against `prebuilt/BUILT_FROM`'s `built-from` commit
-(`3d963c98107178961ff7341ee8a9ac37d947ed75`, protocol-7 `alp-sdk`),
-reproduces the raw image exactly:
+Stage 1, run against what `prebuilt/BUILT_FROM`'s `built-from` field named at
+the time of this investigation (`3d963c98107178961ff7341ee8a9ac37d947ed75`,
+protocol-7 `alp-sdk` — NOT the current `built-from`, which has since moved to
+`017e7cf76ef78d6e31b59254b26b8de1371021b0` for the v0.8.0 cut; see the
+2026-09-15 measurement above for that one), reproduces the raw image exactly:
 
 ```
 sha256  64ad6abbc06df3b8537fc944ec53f23223dab2ac0a39ef723f8a9d322842a267

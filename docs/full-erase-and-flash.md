@@ -34,11 +34,12 @@ the part → prove you have a complete set → only then erase.**
 
 Three more things that have each cost a part or a day here:
 
-- **The GPE stamp must be monotonically ≥ anything ever flashed on that unit**,
-  and the SBL enforces this **even when every `*_rollback_protection_*` fuse
-  reads `0`**. A warm programming run burns no fuses, so an all-zero fuse report
-  looks permissive and is not. A stamp below the part's last-seen version
-  streams clean, reports success, and then refuses to boot.
+- **The GPE stamp must be strictly greater than anything ever flashed on that
+  unit** -- equal to the last-seen value is already spent, not safe -- and the
+  SBL enforces this **even when every `*_rollback_protection_*` fuse reads
+  `0`**. A warm programming run burns no fuses, so an all-zero fuse report
+  looks permissive and is not. A stamp at or below the part's last-seen
+  version streams clean, reports success, and then refuses to boot.
 - **`major` must be `0`.** A GPE major `>= 1` fails BL2 secure-boot with
   `AUTH_ERROR 0x80`; the app core never launches and the host reads
   `get_version = -5`. Byte-identical firmware authenticated at `0.0.1.0` and
@@ -148,8 +149,11 @@ highest of:
 - the stamps in `prebuilt/CHANGELOG.md` if you ever flashed a published artifact.
 
 **If a unit has been used for OTA or flash iteration, assume its floor is high.**
-Bench units here sit around `0.149.x.x`. A part flashed at `0.254.0.0` has a
-floor of `0.254.0.0`, and every later image must be `>= 0.254.0.0`.
+e1m-aen-evk-01, for example, sits at `0.254.14.0` as of this writing
+(`prebuilt/BUILT_FROM`'s FLASHING LOG). A part flashed at `0.254.14.0` has a
+floor of `0.254.14.0`, and every later image must be `> 0.254.14.0` -- check
+the current log rather than reusing this number, it moves with every bench
+run.
 
 ---
 
@@ -165,7 +169,7 @@ one:
 | `primary_ti_wsoc` (TI wireless firmware) | no | **yes** |
 | `primary_vendor_image` (our application) | yes | yes |
 
-Pick `VERSION` above the floor from step 2, with `major = 0` and every field
+Pick `VERSION` strictly above the floor from step 2, with `major = 0` and every field
 `<= 255`. **`ti/regen_flashset.sh` builds a WARM set** — correct for the fast
 path in the README, wrong for this one. Use `ti/build_full_set.py`, which is the
 script this procedure was validated with:
@@ -174,7 +178,7 @@ script this procedure was validated with:
 TOOLBOX=<path-to-simplelink-wifi-toolbox> \
 SIGNING_DIR=<dir with the vendor key, sign module and cc35xx-conf.bin> \
 REF_SET=<a prior COMPLETE set> \
-python3 ti/build_full_set.py 0.149.65.0
+python3 ti/build_full_set.py <VERSION from step 2, strictly above the floor>
 ```
 
 It prints every component with its size so you can see the set is complete
