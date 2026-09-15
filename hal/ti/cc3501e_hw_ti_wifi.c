@@ -197,6 +197,19 @@ static bool wifi_conn_is_connecting(void);
  * lifetime; subsequent GET_MAC / Wi-Fi ops skip straight to the op. */
 static bool wifi_started;
 
+/* Issue #144 (the persistent stale-deauth-reason-3 fix): has THIS firmware
+ * ever issued its own Wlan_Disconnect() -- wifi_clear_stale_assoc()'s
+ * post-failure cleanup below, or cc3501e_hw_wifi_disconnect()'s host-
+ * requested teardown -- since boot?  Both resolve to the SAME vendor call
+ * (`Wlan_Disconnect(WLAN_ROLE_STA, NULL)`), which (when the STA state
+ * machine is not already idle) leaves pDrv->deauthReason == 3
+ * (WLAN_REASON_DEAUTH_LEAVING) with no per-attempt reset -- see
+ * wifi_retry_sanitize_reason()'s own comment (src/wifi_retry.h) for the
+ * full SDK trace and the residual this coarse, boot-scoped flag accepts.
+ * Set at both Wlan_Disconnect() call sites below, read only by
+ * wifi_conn_set() right before it freezes a terminal reason. */
+static bool wifi_own_disconnect_issued;
+
 /* One-time STA role-up guard.  Wlan_Start (lazy_start) is enough for the factory
  * MAC read, but SCAN and CONNECT need the STA ROLE up.  RoleUp is brought up once
  * (bounded timeout, NOT WLAN_WAIT_FOREVER -- a stuck role-up must never hang the
@@ -1552,7 +1565,15 @@ static void wifi_conn_set(uint8_t state, uint8_t fail_reason, int16_t reason)
 		wifi_last_reason_tag = 0;
 		g_wifi_conn.reason   = 0;
 	} else {
-		g_wifi_conn.reason = reason;
+		/* Issue #144: a reason of exactly 3 (WLAN_REASON_DEAUTH_LEAVING) can
+		 * be OUR OWN earlier Wlan_Disconnect() cleanup leaking through
+		 * rather than this attempt's own wire verdict -- see
+		 * wifi_retry_sanitize_reason()'s own comment (src/wifi_retry.h) for
+		 * the full trace.  Applies to both CONN_FAILED (a fresh terminal
+		 * freeze) and DISCONNECTED (cc3501e_hw_wifi_disconnect()'s
+		 * republish of an already-frozen value) alike -- idempotent either
+		 * way, since sanitizing an already-sanitized value is a no-op. */
+		g_wifi_conn.reason = wifi_retry_sanitize_reason(reason, wifi_own_disconnect_issued);
 	}
 	g_wifi_conn.state = state;
 
@@ -1647,6 +1668,14 @@ static void wifi_clear_stale_assoc(void)
 		 * that gate can still record THIS disconnect's reason against the
 		 * wrong attempt. */
 		(void)Wlan_Disconnect(WLAN_ROLE_STA, NULL);
+		/* Issue #144: this is one of the two write sites that can leave
+		 * pDrv->deauthReason == 3 for a LATER attempt to inherit -- see
+		 * wifi_own_disconnect_issued's own declaration comment.  Set
+		 * unconditionally, not gated on a return value: the vendor call
+		 * dispatches its CME message and returns before any of this can be
+		 * observed either way (best-effort, per this function's own top
+		 * comment). */
+		wifi_own_disconnect_issued = true;
 	}
 }
 
@@ -2763,7 +2792,17 @@ int cc3501e_hw_wifi_disconnect(void)
 	 * clears it there) and the last FROZEN reason otherwise, so a WIFI_DISCONNECT
 	 * republishes exactly what was already true, no matter which state it is
 	 * actually called from. */
-	if (Wlan_Disconnect(WLAN_ROLE_STA, NULL) != 0) {
+	const int disconnect_rv = Wlan_Disconnect(WLAN_ROLE_STA, NULL);
+	/* Issue #144: this is the OTHER write site that can leave
+	 * pDrv->deauthReason == 3 for a LATER connect attempt to inherit -- see
+	 * wifi_own_disconnect_issued's own declaration comment.  Set regardless
+	 * of disconnect_rv, same reasoning as wifi_clear_stale_assoc()'s own
+	 * call: a non-zero return here means the SDK's own
+	 * set_cond_in_process_wlan_discconnect() found a disconnect ALREADY
+	 * in-flight and refused this one, not that no disconnect happened at
+	 * all -- the in-flight one still runs and can still write the stale 3. */
+	wifi_own_disconnect_issued = true;
+	if (disconnect_rv != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	/* Host-requested teardown succeeded: mirror the state into the latch and

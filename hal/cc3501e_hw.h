@@ -455,8 +455,24 @@ int  cc3501e_hw_wifi_conn_status(uint8_t *state, uint8_t *fail_reason, int8_t *r
  * closing reason.
  *
  * This is an OBSERVABILITY byte: it is scoped to "was an attempt open when
- * this arrived", not to "did WE cause it".  A disconnect this firmware itself
- * issues while actually connected or mid-association (a host WIFI_DISCONNECT
+ * this arrived", not to "did WE cause it" -- EXCEPT for reason 3 specifically
+ * (issue #144): once this firmware has EVER issued its own Wlan_Disconnect()
+ * (wifi_clear_stale_assoc()'s post-failure cleanup, or a host WIFI_DISCONNECT),
+ * a reason of exactly 3 (WLAN_REASON_DEAUTH_LEAVING) is republished as 0
+ * instead -- wifi_conn_set() applies wifi_retry_sanitize_reason() (src/
+ * wifi_retry.h) to every non-CONNECTED value it freezes.  That earlier
+ * Wlan_Disconnect() can leave pDrv->deauthReason == 3 with NO per-attempt
+ * reset, and a wrong-passphrase WPA3-SAE failure in particular is detected
+ * PURELY LOCALLY (a bad SAE Confirm hash, sme.c:1457/1583-1588) with no
+ * deauth/disassoc frame and no fresh reason write at all -- so a LATER,
+ * unrelated attempt that fails this way would otherwise republish the STALE
+ * 3 as if it were this attempt's own AP-issued verdict.  See wifi_retry_
+ * sanitize_reason()'s own comment for the full trace and its accepted
+ * residual (a genuine AP-sent reason-3 deauth on any attempt AFTER the first
+ * Wlan_Disconnect() this boot reads as 0 too -- there is no cheaper, precise
+ * way to tell the two apart with what this SDK exposes on this path).  A
+ * disconnect this firmware itself issues while actually connected or
+ * mid-association (a host WIFI_DISCONNECT
  * while connected, or the #1437 stale-association cleanup after a failed
  * connect) is excluded not because either is specially flagged, but because
  * the #1437 cleanup genuinely cannot run while an attempt is open -- it
