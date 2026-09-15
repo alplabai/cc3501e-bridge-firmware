@@ -56,9 +56,9 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   017e7cf76ef78d6e31b59254b26b8de1371021b0
-image-sha256: c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7
-raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
+built-from:   94d8a37755750c2774f4f60ebe41d58a0d545c46
+image-sha256: 79c62f0de11a2582d60521c5f66d5dcc0fdd993cd4baa9f0ce317450701a7104
+raw-sha256:   2a6f85c6b260fb4aa2f2e5edef8e9ef5cb1ddecdc6ebb8d86afdb676d8db9bdb
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -87,7 +87,7 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.14.0 (measured 2026-09-15).
+# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.15.0 (measured 2026-09-15).
 #
 # That unit (module 2026W36-0003) was warm-programmed THREE TIMES that evening,
 # 0.254.2.0 -> 0.254.3.0 -> 0.254.4.0, the last streaming 1105668 bytes in
@@ -100,14 +100,38 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 #     0.254.0.0 set in cc3501e-release-0.254.0.0.  Both are rollbacks on it now.
 #   - 0.254.2.0 and 0.254.3.0 are ALSO rollbacks on it now -- each intermediate
 #     flash is spent the moment the next one lands.
-#   - any future image for it must be STRICTLY ABOVE 0.254.14.0.  A stamp chosen
-#     between 0.254.2.0 and 0.254.14.0 looks new against an older log entry and
+#   - any future image for it must be STRICTLY ABOVE 0.254.15.0.  A stamp chosen
+#     between 0.254.2.0 and 0.254.15.0 looks new against an older log entry and
 #     permanently bricks the part, which is why this entry is kept current rather
 #     than appended to.
 #
+#   - the RELEASED v0.9.0 blob (GPE 0.254.15.0, image-sha256 79c62f0d...) was
+#     programmed to this unit on 2026-09-15 at 14:25 over XDS110 L50015YR:
+#     PROGRAM_RC=0, 1108844 bytes in 17.589660825033206 s, wall 31.461015269 s,
+#     no -1141/SECAP reject and no retry.  The streamed
+#     content_primary_vendor_image.flashready.bin hashes to the published
+#     79c62f0d..., so the exact shipped bytes reached the part.  It then answered
+#     over the bridge: `alp companion ver` -> fw 0.9.0 (wire 4.0), `diag info` ->
+#     fw: 0x0900, reset: power-on (1), and `bench 25` -> 25 GET_VERSION ops,
+#     fails=0, alongside 6/6 PINGs.  So this unit now runs exactly what ships.
+#
+#     A WARNING FOR THE NEXT PERSON, because it cost a round here: the first
+#     post-flash check used examples/aen/aen-cc3501e-bringup and reported PING
+#     -5 twenty-five times and GET_VERSION -5 across three cold cycles, which
+#     reads exactly like the anti-rollback brick signature (streams clean, then
+#     a dead link).  It was a host-app artefact.  That example has no recorded
+#     working link against any 0.254.x image on this module.  Verify with the
+#     alp-console companion shell instead, and note that `bridge bring-up -> 0`
+#     proves nothing: cc3501e_reset() returns ALP_OK even when the GET_VERSION
+#     round trip never completes (alp-sdk chips/cc3501e/cc3501e_core.c:264-279).
+#     Two other things that look like evidence and are not: the XDS110 `query`
+#     image table is empty BY CONSTRUCTION (the stock query action request has
+#     every query_req_content field false, so it asks for nothing), and SWD
+#     DPIDR 0x4c013477 is the Alif E8's SW-DP, not the CC3501E's.
+#
 #   - it ran the RELEASED v0.8.0 blob (GPE 0.254.5.0, sha256 c67ad58a...) and
 #     that was validated on it, but LATER bench builds at 0.254.6.0 through
-#     0.254.14.0 have since superseded it, so the released artifact is now a ROLLBACK on this one unit
+#     0.254.15.0 have since superseded it, so that older artifact is now a ROLLBACK on this one unit
 #     and cannot be re-flashed here without a fresh cut.  The v0.8.0 run streamed
 #     1105668 bytes in 17.479 s with PROGRAM_RC=0 and answered across 16 cold
 #     power cycles, each edge verified electrically via the SW-DP rather than
@@ -190,25 +214,16 @@ raw-sha256:   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
 # (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and does
 # not move this floor -- but if it was ever programmed to a unit, that unit's
 # real floor is 0.254.0.0.
-gpe-floor:    0.254.5.0
+gpe-floor:    0.254.15.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and
 # compares against `raw-sha256`, not `image-sha256`.
-#   (none from before the v0.8.0 cut -- it supersedes them.)
+#   (none from before the v0.9.0 cut -- it supersedes them.)
 #
-# Comment and documentation only: corrects boot_start()'s claim that RoleUp needs
-# a quiesced bridge (refuted by scan_run()'s 5-of-5 first-op measurement) and
-# records the first-radio-op wedge as a host-handled condition.  Evidence: rebuilt
-# build/ti/cc3501e-bridge.bin with this commit applied and the stage-1 hash is
-# BYTE-IDENTICAL to raw-sha256 above --
-#   0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90
-# That rebuild was taken on the PR branch's commit a55d661; this line names the
-# squash commit that landed (#128).  `git diff a55d661 b6da302 -- src hal ti` is
-# empty, so the attested source is the same.
-inert: b6da302c9403d7eb012c4b346c92eaa2b748688f
+#   (none -- the v0.9.0 cut supersedes every line that described the v0.8.0 blob.)
 #
-# built-from names the commit that bumps firmware-version.txt to 0.8.0. That
+# built-from names the commit that bumps firmware-version.txt to 0.9.0. That
 # bump is split into its own commit deliberately: it feeds the fw_version
 # marker ti/build_ti.sh compiles in, so it is the last thing that changes the
 # blob, and naming a commit without it would be off by the one field a
