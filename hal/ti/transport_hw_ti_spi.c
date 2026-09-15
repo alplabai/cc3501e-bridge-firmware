@@ -333,7 +333,24 @@ volatile uint32_t g_adc_probe_stat;
  * struct in the first fitting range -- FLASH_INT_VEC (RWX) at 0x14000000, i.e.
  * flash.  persist_writable() below makes that outcome FAIL SAFE rather than
  * fatal, but update mode is then silently dead: check the linker map puts
- * g_persist inside 0x28000DB0..0x2807FFFF. */
+ * g_persist inside 0x28000DB0..0x2807FFFF.
+ *
+ * SYSRESETREQ retention has NEVER BEEN MEASURED (#148).  Everything on the
+ * bench so far (run14 P6) measured the OTHER reset path -- the host's warm
+ * nRESET -- and found .TI.noinit does NOT read back the pre-reset state
+ * there (see the CC3501E_WEDGE_PROBE struct member below).  Nothing in this
+ * file has ever bench-proven that a CC35-internal NVIC_SystemReset behaves
+ * any differently.  Treat this OTA flag's retention as an equally unproven
+ * assumption, not a weaker cousin of a proven one.
+ *
+ * NOT DONE HERE (costs a flash cycle, separate experiment): g_persist sits at
+ * the very TOP of DRAM_NON_SECURE (the linker map puts it at 0x2807fe68 /
+ * 0x2807fea4, with only 0x157 bytes free above it) -- moving the placement
+ * rule's origin DOWN, away from the top of the region, is what would tell
+ * apart "the bootloader/boot ROM stomps a stack or scratch buffer that
+ * happens to land at the top of DRAM" from "the boot ROM scrubs .TI.noinit
+ * outright, wherever it lands".  Those are different failure classes with
+ * different fixes, and this change does not distinguish them. */
 static struct {
 	uint32_t magic;
 	uint32_t magic_inv;
@@ -342,10 +359,25 @@ static struct {
 	/* BENCH PROBE ONLY (#1691).  A wedged bridge is unreachable in band, which is
 	 * why four rounds of guess-and-test failed to explain it.  A WARM reset
 	 * (nRESET only, rails up) was bench-proven to recover the wedge -- so the
-	 * firmware STATE is what is bad, and .TI.noinit survives that reset.  This
-	 * snapshot is refreshed every housekeeping tick; after the warm reset the host
-	 * reads back the LAST state the slave was in before it stopped answering.
-	 * Never compiled into a shipping build. */
+	 * firmware STATE is what is bad.
+	 *
+	 * CORRECTED (#148, run14 P6): .TI.noinit does NOT survive that warm nRESET
+	 * on a HEALTHY link.  `diag loglevel 5` (boots) and `diag info` (reset
+	 * cause) read IDENTICAL before and after `alp companion recover`, and the
+	 * elapsed time (3.566 s / 3.573 s) matches the warm-nRESET path, not the
+	 * power-off fallback -- so the read-back both sides saw was a FRESH boot's
+	 * snapshot, not the pre-reset one.  #1691's "the .TI.noinit snapshot read
+	 * back after a warm reset showed the firmware perfectly healthy" is
+	 * therefore UNSUPPORTED, and the residual wedge's classification (state
+	 * corruption vs. something else) is RE-OPENED.  See
+	 * bridge_transport_spi_probe_tick() below for the independent AON-
+	 * scratchpad capture (#148) added to test retention directly instead of
+	 * inferring it from this struct's read-back.
+	 *
+	 * This snapshot is refreshed every housekeeping tick; after a reset the
+	 * host reads back whatever state happens to be in .TI.noinit at that
+	 * point -- proven NOT to be reliably the pre-reset state.  Never compiled
+	 * into a shipping build. */
 	uint32_t probe_ticks;   /* housekeeping ticks (masked on read -- ambiguous) */
 	uint32_t probe_quiet;   /* ticks since the LAST completed SPI transfer.  THIS is
 	                         * the discriminator: large => the task kept running while
@@ -409,6 +441,18 @@ static struct {
 	uint32_t probe_ch13tsta;
 	uint8_t  probe_phase; /* enum spi_phase the slave was parked in */
 	uint8_t  probe_flags; /* bit0 reply_armed, bit1 is_dead, bit2 polled */
+	/* #148: raw .TI.noinit retention test, refreshed every tick -- NO derived
+	 * logic to read, unlike `boots` (case 5), which needs the read-and-clear
+	 * semantics explained to be trusted.  [31:16] = a fixed 0x5AA5 test
+	 * pattern, [15:0] = its 16-bit ones' complement (0xA55A) -- so a single
+	 * raw read tells the three outcomes apart at a glance:
+	 *   0x5AA5A55A exactly => this word survived the reset (retained)
+	 *   0x00000000          => the bootloader/ROM zeroed .TI.noinit
+	 *   anything else       => RAM came back randomised, not simply cleared
+	 * Companion to CC3501E_PROBE_AON_LINE2_ADDR's magic nibble below, but in
+	 * the OTHER retention domain (.TI.noinit/DRAM, not the AON scratchpad) --
+	 * read together they say whether EITHER domain retains anything at all. */
+	uint32_t probe_magic_pair;
 #endif
 } g_persist __attribute__((section(".TI.noinit")));
 
@@ -1457,6 +1501,22 @@ void bridge_transport_spi_probe_tick(void)
 #ifndef CC3501E_READY_GPIO
 #define CC3501E_READY_GPIO 17u /* mirrors cc3501e_hw_ti_gpio.c -- CC35 GPIO17 -> Alif P2_6 */
 #endif
+	/* #148: AON scratchpad word LINE2 -- PRCM_SCRATCHPAD__PRCM_SCPAD2__ADDR in
+	 * TI's own source/ti/utils/FWU/psa_fwu.c:120, NOT hw_memmap.h's
+	 * PRCM_SCRATCHPAD_BASE (0x4109F000 + the RSTCAUS offset), which bus-faulted
+	 * on this silicon (see cc3501e_hw_ti_log.c:68-78's "DO NOT READ PRCM_
+	 * SCRATCHPAD RSTCAUS DIRECTLY").  psa_fwu_request_reboot()
+	 * (psa_fwu.c:1138, `REGISTER(PRCM_SCRATCHPAD__PRCM_SCPAD2__ADDR) =
+	 * scratchpad.ALL;`) already writes this EXACT address in production, so it
+	 * is PROVEN writable without a fault -- that is the only reason it is safe
+	 * to touch from a bench probe.
+	 *
+	 * Bits [15:0] are psa_fwu's PSA_FWU_SCRATCHPAD_FOR_TYPES (psa_fwu.c:
+	 * 136-148): BL2[0:2], WSOC_OR_RFTOOL[3:5], SBL[6:8], VENDOR_IMAGE[9:11],
+	 * START_MODE[12:14], M33_REQUEST[15].  This probe uses ONLY bits [31:16]
+	 * and preserves [15:0] byte-for-byte on every write (read-modify-write) --
+	 * corrupting them would silently break the OTA reboot-request path. */
+#define CC3501E_PROBE_AON_LINE2_ADDR 0x41099000u
 	/* bit3 = the READY line's ACTUAL level.  cc3501e_bridge_busy()/ready() are raw
 	 * GPIO writes with no pairing guarantee, so a path that takes an early return
 	 * between them leaves READY LOW forever -- and the host's cc3501e_reply_gate()
@@ -1466,6 +1526,47 @@ void bridge_transport_spi_probe_tick(void)
 	g_persist.probe_flags =
 	    (uint8_t)((reply_armed ? 1u : 0u) | (bridge_transport_spi_is_dead() ? 2u : 0u) |
 	              (g_polled ? 4u : 0u) | (GPIO_read(CC3501E_READY_GPIO) ? 8u : 0u));
+
+	/* #148: refresh the .TI.noinit-domain raw retention pattern -- see its
+	 * declaration on g_persist above for what the three read-back outcomes
+	 * mean. */
+	g_persist.probe_magic_pair = 0x5AA5A55Au;
+
+	/* #148: reset-surviving capture in the AON scratchpad -- a SECOND,
+	 * INDEPENDENT retention domain from .TI.noinit/DRAM (see
+	 * CC3501E_PROBE_AON_LINE2_ADDR above for the address and its provenance).
+	 * This is the direct answer to whether run14 P6's non-retained
+	 * .TI.noinit is a DRAM-specific finding or a whole-chip one:
+	 *   - magic survives (reads back [31:28]==0xA exactly, byte-for-byte
+	 *     with what was last written) => a reset-surviving snapshot exists
+	 *     in AON, and the .TI.noinit non-retention is DRAM-specific
+	 *   - reads 0                     => the bootloader clears this word too
+	 *   - reads random/garbage        => the warm nRESET is a POR to the AON
+	 *     bank as well, and no on-chip retention exists for either domain
+	 *
+	 * Packed into bits [31:16] ONLY -- bits [15:0] belong to psa_fwu (see the
+	 * constant's comment) and are preserved exactly via read-modify-write:
+	 *   [31:28] magic 0xA     recognisable framing nibble
+	 *   [27:26] phase         enum spi_phase (0..3, 2 bits is exact)
+	 *   [25]    reply_armed
+	 *   [24]    is_dead
+	 *   [23]    READY line level
+	 *   [22]    CH12STA.RUN
+	 *   [21]    CH12TSTA.STA
+	 *   [20:16] quiet count, saturating at 31 (ticks since last transfer) */
+	{
+		const uint32_t magic  = 0xAu;
+		const uint32_t quiet5 = (g_persist.probe_quiet > 31u) ? 31u : g_persist.probe_quiet;
+		const uint32_t hi16 =
+		    (magic << 28) | (((uint32_t)phase & 0x3u) << 26) | ((reply_armed ? 1u : 0u) << 25) |
+		    ((bridge_transport_spi_is_dead() ? 1u : 0u) << 24) |
+		    ((GPIO_read(CC3501E_READY_GPIO) ? 1u : 0u) << 23) |
+		    (((g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u ? 1u : 0u) << 22) |
+		    (((g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u ? 1u : 0u) << 21) |
+		    (quiet5 << 16);
+		const uint32_t lo16_preserved       = HWREG(CC3501E_PROBE_AON_LINE2_ADDR) & 0x0000FFFFu;
+		HWREG(CC3501E_PROBE_AON_LINE2_ADDR) = hi16 | lo16_preserved;
+	}
 }
 
 /* Packed read-back for GET_DIAG_INFO, riding the free_heap slot.  Layout:
@@ -1488,9 +1589,15 @@ void bridge_transport_spi_probe_tick(void)
  * format.  That matters: this rides free_heap precisely so GET_DIAG_INFO's fixed
  * payload does not change (#21).
  *
- * Survives the warm reset that recovers the wedge.  The full 32-bit CH12/CH13
- * STA+TSTA words are in g_persist and readable over SWD when the nibble is not
- * enough. */
+ * Does NOT survive the warm reset that recovers the wedge (#148, run14 P6:
+ * `diag loglevel 5` read 1 before AND after `alp companion recover` on a
+ * HEALTHY link, and `diag info` reset cause read power-on both times --
+ * the read-back is a FRESH boot's snapshot, not the pre-reset one).  This
+ * struct's read-back after a warm reset is therefore not usable evidence for
+ * or against the wedge being a state-corruption bug; see
+ * bridge_transport_spi_probe_tick()'s AON-scratchpad capture for the
+ * independent retention test.  The full 32-bit CH12/CH13 STA+TSTA words are
+ * in g_persist and readable over SWD when the nibble is not enough. */
 /* BENCH ONLY: which word the probe reports in the free_heap slot.
  *
  * The packed word below is full -- all 32 bits carry something -- and the raw
@@ -1502,14 +1609,29 @@ void bridge_transport_spi_probe_tick(void)
  *   alp companion diag loglevel 2  -> raw CH12STA
  *   alp companion diag loglevel 3  -> raw CH13STA
  *   alp companion diag loglevel 4  -> raw SOC_AON ERRSRIS
- *   alp companion diag loglevel 5  -> boots (retention witness)
+ *   alp companion diag loglevel 5  -> boots (.TI.noinit retention witness --
+ *                                     PROVEN NOT retained across a warm
+ *                                     nRESET, #148 run14 P6: reads 1 both
+ *                                     sides of a healthy `recover`)
  *   alp companion diag loglevel 6  -> HOSTMCU_AON.CFGWDT   (watchdog config)
  *   alp companion diag loglevel 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
  *   alp companion diag loglevel 8  -> ADC internal temp: [15:0] raw, [31:16] count
  *   alp companion diag loglevel 9  -> ADC probe status (open/convert bits)
  *   alp companion diag loglevel 10 -> #142 quiet-rearm heal count (cc3501e_hw_
- *                                     link_quiet_rearm_count()) -- next free
- *                                     selector, no wire change
+ *                                     link_quiet_rearm_count())
+ *   alp companion diag loglevel 11 -> raw AON scratchpad LINE2 word (#148),
+ *                                     the SECOND, INDEPENDENT retention
+ *                                     capture -- see
+ *                                     CC3501E_PROBE_AON_LINE2_ADDR and
+ *                                     bridge_transport_spi_probe_tick()
+ *   alp companion diag loglevel 12 -> raw g_persist.probe_magic_pair (#148):
+ *                                     a fixed 0x5AA5A55A test pattern,
+ *                                     refreshed every tick -- lets a reader
+ *                                     tell ZEROED .TI.noinit RAM (reads 0)
+ *                                     apart from RANDOMISED .TI.noinit RAM
+ *                                     (garbage, near-certainly not this exact
+ *                                     word) -- next free selector,
+ *                                     no wire change
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1569,6 +1691,20 @@ uint32_t bridge_transport_spi_probe_read(void)
 		 * quiet-armed detector actually fired a reinit.  Zero on a build/boot
 		 * that never took this path at all. */
 		return cc3501e_hw_link_quiet_rearm_count();
+	case 11u:
+		/* #148: raw AON scratchpad LINE2 word -- see
+		 * CC3501E_PROBE_AON_LINE2_ADDR's comment for the address provenance
+		 * and bridge_transport_spi_probe_tick()'s bit layout.  Read RAW, not
+		 * masked to [31:16]: bits [15:0] (psa_fwu's own state) are part of
+		 * what a bench reader needs to confirm the read-modify-write actually
+		 * preserved them. */
+		return HWREG(CC3501E_PROBE_AON_LINE2_ADDR);
+	case 12u:
+		/* #148: raw .TI.noinit retention pattern -- see g_persist.
+		 * probe_magic_pair's declaration for what the three read-back
+		 * outcomes mean.  Companion to case 11 above but in the OTHER
+		 * retention domain (.TI.noinit/DRAM, not the AON scratchpad). */
+		return g_persist.probe_magic_pair;
 	default:
 		break;
 	}
