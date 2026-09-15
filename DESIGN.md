@@ -290,6 +290,15 @@ a policy was set with no role up always applies it for real.
 > is host-side via `cc3501e_recover()` (warm reset), which cleared every observed
 > wedge. The `CC3501E_WEDGE_PROBE` build flag captures the state into `.TI.noinit`
 > for further investigation.
+>
+> **CORRECTED ([#148](https://github.com/alplabai/alp-sdk/issues/148), run14
+> P6):** the `.TI.noinit` snapshot above does NOT survive the warm reset that
+> recovers the wedge, so a read-back after `cc3501e_recover()` is a FRESH
+> boot's state, not a rescued one -- it is a wedge-diagnostic tool only, not
+> a post-recovery readback channel. The actual reset-survival test is `diag
+> loglevel` selectors 11 and 12 (an AON-scratchpad capture and a `.TI.noinit`
+> latch, both taken on the boot's first tick, before this snapshot's own
+> write ever runs).
 
 ## Backends
 

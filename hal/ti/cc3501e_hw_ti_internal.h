@@ -83,8 +83,13 @@ void cc3501e_hw_power_service(void);
 
 #ifdef CC3501E_WEDGE_PROBE
 /* BENCH PROBE (#1691): refresh / read the .TI.noinit wedge snapshot.  See
- * transport_hw_ti_spi.c -- a warm reset recovers the wedge and preserves RAM, so
- * this is how the slave's last state is recovered from an unreachable bridge. */
+ * transport_hw_ti_spi.c -- a warm reset recovers the wedge, but (#148, run14
+ * P6) .TI.noinit does NOT survive that reset on a healthy link: the read-back
+ * this struct produces after a recovery is a FRESH boot's snapshot, not the
+ * slave's last state before it stopped answering.  transport_hw_ti_spi.c's
+ * g_retention_aon_line2_boot / g_retention_magic_pair_boot (selectors 11/12)
+ * are the actual retention test; this snapshot is a wedge-diagnostic tool
+ * only, not a recovery channel. */
 void     bridge_transport_spi_probe_tick(void);
 void     bridge_transport_spi_probe_xfer(void);
 uint32_t bridge_transport_spi_probe_read(void);

@@ -130,8 +130,14 @@ alp_cc3501e_resp_t handle_get_diag_info(const uint8_t *req,
 	}
 #else
 #ifdef CC3501E_WEDGE_PROBE
-	/* BENCH PROBE BUILD ONLY (#1691).  Reports the slave's LAST state before the
-	 * bridge stopped answering, read back after the warm reset that recovers it.
+	/* BENCH PROBE BUILD ONLY (#1691).  Reports the CURRENT wedge snapshot, NOT
+	 * the slave's last state before it stopped answering: (#148, run14 P6)
+	 * .TI.noinit does not survive the warm reset that recovers the wedge, so
+	 * a read-back after `alp companion recover` is a fresh boot's state, not
+	 * a rescued one -- see transport_hw_ti_spi.c's g_persist comment.  The
+	 * actual pre-reset-survival test is diag loglevel selectors 11/12
+	 * (bridge_transport_spi_probe_read()'s AON-scratchpad / .TI.noinit boot
+	 * latch), not the default (selector 0) this call reads.
 	 * Rides the heap field for the same reason the OTA probe does: the CC3501E has
 	 * no UART on the debug probe, so this is the only channel an old console can
 	 * already print.  Guarded, and must never leave a bench build. */
