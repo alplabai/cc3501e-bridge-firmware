@@ -6,7 +6,7 @@ Copyright 2026 Alp Lab AB
 # CC3501E bridge bring-up status
 
 Status of the Alif Ensemble E8 (M55-HE) <-> CC3501E (CC35X1E) SPI bridge on
-the E1M-AEN801 bench. Updated 2026-08-31.
+the E1M-AEN801 bench. Updated 2026-09-15.
 
 This is the consolidated on-silicon record for the **link / Wi-Fi / BLE**
 pillars. The authoritative topology is the hardware-framed SPI bridge described
@@ -22,8 +22,8 @@ only producers so far (see § 4).
 |---|---|---|
 | **Inter-chip link** (PING / GET_VERSION / GET_MAC / RESET) | PASS, cold + warm | Hardware SS0 + READY framing is bench-validated on E1M-AEN801; `ver` remains responsive after radio ops. |
 | **Wi-Fi GET_MAC / scan / RSSI** | PASS | Real scan records with security decode validated through the bridge. |
-| **Wi-Fi connect-STA** | PASS, DHCP measured | Association survives the bridge. The v0.8.0 re-cut fixed the two mechanisms that were costing DHCP leases (station power-save across DHCP, lwIP retransmit backoff) -- measured on `e1m-aen-evk-01` at -80/-81 dBm, cold-cycled between attempts: address inside the connect call **12 of 16** (was ~1 in 4), address by any route **14 of 16**. **Residual, stated plainly:** 1 of 16 still failed at `REQUESTING`/`tries = 3`, and 1 further attempt hit the separate first-radio-op scan wedge (see `prebuilt/CHANGELOG.md`'s v0.8.0 entry). |
-| **Sockets** | **PASS - 10/10 end-to-end** (fixed 2026-08-31) | `sock tcp-get` now completes 10 of 10 consecutive trials against a bare `accept()` listener, zero `send failed`. Two defects, both closed: (1) no request identity on `SOCK_SEND`, so `poll_by_repeat()`'s byte-identical retry hit `WORKER_IDLE` and re-transmitted the payload -- fixed by a `seq` byte at offset 3 (the old `reserved`), wire protocol 5 -> 7, #89 + alp-sdk#1872, taking it to 6/10 with zero `-4` timeouts; (2) the host's blind 40 us `CC3501E_PHASE_SETTLE_US` raced this side's re-arm, so the request payload landed short and this firmware correctly rejected it with `RESP_ERR_INVALID` -- fixed HOST-side at 250 us (alp-sdk#1873), taking it to 10/10. Nothing in `src/protocol_sockets.c` needed changing for (2); the length check was right all along. **Still open:** socket RX stalls around 2 kB, and 250 us is an empirical upper bound paid per payload phase, so it is a throughput tax on anything that streams (alp-sdk#1677). |
+| **Wi-Fi connect-STA** | PASS, DHCP measured | Association survives the bridge. The v0.8.0 re-cut fixed the two mechanisms that were costing DHCP leases (station power-save across DHCP, lwIP retransmit backoff) -- measured on `e1m-aen-evk-01` at -80/-81 dBm, cold-cycled between attempts: address inside the connect call **12 of 16** (was ~1 in 4), address by any route **14 of 16**. **Residual, stated plainly:** 1 of 16 still failed at `REQUESTING`/`tries = 3`, and 1 further attempt hit the separate first-radio-op scan wedge (see `prebuilt/CHANGELOG.md`'s v0.8.0 entry). **These numbers do NOT generalise to a `wifi connect` issued as the first radio op of a boot** -- that ordering skips the return-to-bringup-loop the ACTIVE power-default fix needs, so the fix does not land before association/DHCP for it; source fix pending release (`prebuilt/CHANGELOG.md`'s `[Unreleased]` section). |
+| **Sockets** | **PASS - 10/10 end-to-end** (fixed 2026-08-31), **not re-soaked on wire-4.0** | `sock tcp-get` completes 10 of 10 consecutive trials against a bare `accept()` listener, zero `send failed`. Two defects, both closed: (1) no request identity on `SOCK_SEND`, so `poll_by_repeat()`'s byte-identical retry hit `WORKER_IDLE` and re-transmitted the payload -- fixed by a `seq` byte at offset 3 (the old `reserved`), wire protocol 5 -> 7, #89 + alp-sdk#1872, taking it to 6/10 with zero `-4` timeouts; (2) the host's blind 40 us `CC3501E_PHASE_SETTLE_US` raced this side's re-arm, so the request payload landed short and this firmware correctly rejected it with `RESP_ERR_INVALID` -- fixed HOST-side at 250 us (alp-sdk#1873), taking it to 10/10. Nothing in `src/protocol_sockets.c` needed changing for (2); the length check was right all along. **This 10/10 is from the earlier wire-7/v0.5.1-era build and has not been re-run against the shipping wire-4.0 bits.** **Still open:** socket RX stalls around 2 kB, and 250 us is an empirical upper bound paid per payload phase, so it is a throughput tax on anything that streams (alp-sdk#1677). |
 | **Soft-AP** | PASS (fixed 2026-08-28, fw 0.4.1) | A real second radio (Intel AX200) associates from a cold boot -- **t+13s** WPA2, **t+13s** open, **t+20s** on the hold run -- and stays associated: **0 of 9** samples dropped across a 270 s hold, `connected` at t+291s at 93-94%, well past the ~100 s this issue was named for. `wifievt` steps 3 -> 4, the station event the broken build could never emit. **One live limitation:** a second `wifi ap` on a device already in AP role does NOT take (measured: no association across ~340 s, `wifievt` stuck at 3) -- cold-cycle between AP experiments, and do NOT use `ap-stop` to reset, it wedges the bridge (alp-sdk#1564). Root cause was `RoleUpApCmd_t.sta_limit` left at **0** by a zero-init, i.e. an AP permitted zero clients; it beaconed perfectly, which is why one radio could never tell the difference (alp-sdk#1562). `ap start` still returns `-4 unconfirmed` -- there is no AP status latch (alp-sdk#1385), so AP state is still checked out of band. |
 | **BLE** (enable / advertise / scan / connect + GATT scaffolding) | PASS for enable + real scan (re-confirmed 2026-08-28: 9-15 real advertisers) | NimBLE enable and `ble_gap_disc` scan validated with real advertisers; full runtime GATT/event parity remains v1.0 work. |
 | **CAM enables** | PASS | `which` 0 -> GPIO_1 (LDO0), 1 -> GPIO_0 (LDO1); mapping fixed from U4 pins 54/55. |
@@ -38,15 +38,20 @@ wire protocol **5**. Verified on E1M-AEN801: `GET_VERSION -> protocol v5 (host
 expects v5) -- match`, 20/20 soak PINGs, `GET_MAC ok 44:3e:8a:10:b6:9e`,
 `WIFI_SCAN ok -> 6 AP(s)`, and soft-AP association from a second radio.
 
-**Three version numbers, not interchangeable** -- app SemVer (`0.4.1`), wire protocol
-(`5`), and the GPE stamp on the flashed artifact (`0.149.64.0` for the current bench
-image). Conflating them has repeatedly cost bench time; see `prebuilt/CHANGELOG.md`.
+**Three version numbers, not interchangeable** -- app SemVer (`0.8.0`), wire protocol
+(`4.0`), and the GPE stamp on the shipped artifact (`0.254.5.0`). These are NOT the
+bench unit's own floor: `e1m-aen-evk-01` is bench-flashed past the shipped stamp, at
+`0.254.14.0` per `prebuilt/BUILT_FROM`'s FLASHING LOG (kept current -- check it, do
+not reuse a number from this doc). Conflating any of these has repeatedly cost bench
+time; see `prebuilt/CHANGELOG.md`.
 
 **What the GPE stamp does, precisely -- and the trap in reading the fuses.**
 Two independent couplings, and you must satisfy BOTH:
 
-1. **Monotonicity against the last-seen version.** The stamp must be `>=` anything
-   ever flashed on that unit. See "The #1 cause of *streams clean but dead link*"
+1. **Monotonicity against the last-seen version.** The stamp must be **strictly
+   greater than** anything ever flashed on that unit -- equal to the last-seen
+   value is already spent and the SBL refuses it. See "The #1 cause of *streams
+   clean but dead link*"
    below: a rollback streams the full ~1.09 MB, exits 0, and then the SBL simply
    refuses to boot the image -- dead link.
 2. **The matched pair.** `programming_instructions` must be built at the **same**
@@ -344,7 +349,7 @@ were rollbacks vs an earlier v0.99 → dead; **reprogramming a full set at v0.25
 (major=0, > anything ever flashed) with the validation key + a cold POR revived it**
 — PING ok, protocol v4, Wi-Fi 5 APs, persisted across the cold POR.)
 
-**Rules:** (1) VERSION must be monotonically ≥ anything ever flashed on the unit, and
+**Rules:** (1) VERSION must be **strictly greater than** anything ever flashed on the unit, and
 **major=0** (a GPE major ≥ 1 fails BL2 secure-boot AUTH). (2) The correct reflash flow
 is **WARM programming-only** — NO `activation` (activation on a DEPLOYED part is
 rejected `Life cycle DEPLOYED is not valid`; it was never the missing step). (3) Keys:

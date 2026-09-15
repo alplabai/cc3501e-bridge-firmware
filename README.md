@@ -122,7 +122,7 @@ just wants a working companion.  The signed blob in `prebuilt/` is already
 built and signed:
 
 > **`cc3501e-v0.8.0.bin` is built from this tree's v0.8.0 release commit
-> (`prebuilt/BUILT_FROM`'s `built-from`), which `main` is now ten commits
+> (`prebuilt/BUILT_FROM`'s `built-from`), which `main` is now twenty commits
 > past.**  `cc3501e-v0.7.0.bin` and older are kept only for traceability, and
 > note they are not all the same KIND of artifact: 0.2.0, 0.3.0 and 0.5.0 are
 > raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1, 0.6.0, 0.7.0 and this
@@ -136,12 +136,11 @@ built and signed:
 > change the compiled image) in `prebuilt/BUILT_FROM`, so this is a checked
 > claim rather than an asserted one -- that gap is what let 0.4.1 go stale
 > under a green `prebuilt integrity` (#75).  **It is checked and currently
-> RED**: ten commits touching `src/`, `hal/` or `ti/` sit on `main` after
+> RED**: commits touching `src/`, `hal/` or `ti/` sit on `main` after
 > `built-from` with no `inert:` attestation and no new release cut, so the
 > shipped `v0.8.0` blob predates the Wi-Fi/socket fixes that have since
-> landed on `main` -- a release that re-cuts it is in progress, but until it
-> lands the claim above is "this is what v0.8.0 was built from", not "this
-> matches `main`".
+> landed on `main`.  The claim above is "this is what v0.8.0 was built
+> from", not "this matches `main`".
 >
 > **Why 0.5.1 and not 0.6.0.**  This content shipped briefly as 0.6.0, which
 > burned a minor version for no reason: neither 0.5.0 nor 0.6.0 was ever tagged
@@ -312,7 +311,8 @@ dumps` and `prebuilt integrity`.
 `protocol_dispatch()` routes **55 opcodes**, covering every command family
 in the wire header: META (PING, GET_VERSION, GET_MAC, RESET,
 STREAM_WRITE), Wi-Fi station/AP/scan/status, BLE (enable, advertise,
-scan, connect, GATT), sockets, the GPIO proxy, camera enables, power
+scan, connect, GATT), sockets, the SPI1 host passthrough
+(`0x55`/`0x56`/`0x57`), the GPIO proxy, camera enables, power
 policy, diagnostics + `GET_PENDING_EVENTS`, and OTA including
 `OTA_UPDATE_MODE`.  Routed is not the same as proven: the Status table
 below and `BRINGUP_STATUS.md` record what is silicon-validated. Sockets
@@ -384,5 +384,5 @@ accepts no clients (alp-sdk#1562).
 | TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the critical path — SPI is the default. |
 | Async events: attention edge on READY | ❌ **NOT delivered by an edge on this board rev (#57, measured 2026-08-29).** Alif `P2_6` is an OPEN net at the host: with the Alif powered and only the CC35 held in nRESET, `P2_6` read HIGH in **48 of 48** samples across a 46 s window that spans the CC35's entire reset → `Board_init()` → first-arm sequence — the window in which `cc3501e_hw_init()` holds `cc3501e_bridge_busy()` (READY LOW) for *seconds*. The bridge answered `protocol v5` afterwards, so it really did reset and re-init in that window. A connected wire could not stay HIGH through it. This corroborates the independent "0 edges in 20000 samples" note in `src/worker.c` and `hal/ti/cc3501e_hw_ti_ble.c`, and **refutes** the previous row's claim of "135/135 firmware pushes delivered" *on the edge* — the host cannot observe edges on a net it does not see, so that delivery came from the timer poll, not the attention edge. The CC35-side pulse code is real and harmless; it is the HOST-side edge that does not exist here. Needs a board rev, or a dedicated HOST_IRQ pad. Build-time opt-in (`build_ti.ps1 -AttnPulse`, default OFF). |
 | `flash.py` real flashing | 🔮 moved to `alp-sdk-internal` (Alp-internal OTA-build tooling); blocked on TI's `cc3501e-flasher` CLI (not public yet); manual SWD/J-Link is the interim bench path |
-| `prebuilt/` populated | ✅ `cc3501e-v0.8.0.bin` signed (full bridge: META + Wi-Fi + BLE + OTA + the E1M SPI1 passthrough, **proto v4.0**), GPE `0.254.5.0`, sha256 `c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7`. **`prebuilt freshness` is currently RED**, and has been on every PR since #130: ten commits touching `src/`, `hal/` or `ti/` have landed on `main` since `built-from` with no release or `inert:` attestation, so the shipped blob predates those fixes; a re-cut is in progress. Sockets now connect end-to-end (fixed 2026-08-31, #89 + alp-sdk#1872/#1873) -- closure evidence is from the earlier wire-7/v0.5.1-era build, not yet re-soaked on the shipping wire-4.0 bits; see `prebuilt/CHANGELOG.md`. |
+| `prebuilt/` populated | ✅ `cc3501e-v0.8.0.bin` signed (full bridge: META + Wi-Fi + BLE + OTA + the E1M SPI1 passthrough, **proto v4.0**), GPE `0.254.5.0`, sha256 `c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7`. **`prebuilt freshness` is currently RED**, and has been on every PR since #130: commits touching `src/`, `hal/` or `ti/` have landed on `main` since `built-from` with no release or `inert:` attestation, so the shipped blob predates those fixes. Sockets now connect end-to-end (fixed 2026-08-31, #89 + alp-sdk#1872/#1873) -- closure evidence is from the earlier wire-7/v0.5.1-era build, not yet re-soaked on the shipping wire-4.0 bits; see `prebuilt/CHANGELOG.md`. |
 | Wi-Fi / BLE / GPIO-proxy groups | ✅ implemented and silicon-validated (alp-sdk v0.8.0 on E1M-AEN801): Wi-Fi scan with security decode, real BLE scan (ble_gap_disc), GPIO proxy warm-boot, OTA-over-bridge staged (see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)). |

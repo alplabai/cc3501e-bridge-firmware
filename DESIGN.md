@@ -10,9 +10,10 @@ framing they share.
 
 `protocol_dispatch()` (`src/protocol.c`) routes **55 opcodes** -- every
 command family in the wire header: META, Wi-Fi station/AP/scan/status,
-BLE (enable, advertise, scan, connect, GATT), sockets, the GPIO proxy,
-camera enables, power policy, diagnostics + `GET_PENDING_EVENTS`, and OTA
-including `OTA_UPDATE_MODE`.  All of them route to TI's CC35xx Wi-Fi /
+BLE (enable, advertise, scan, connect, GATT), sockets, the SPI1 host
+passthrough (`0x55`/`0x56`/`0x57`), the GPIO proxy, camera enables, power
+policy, diagnostics + `GET_PENDING_EVENTS`, and OTA including
+`OTA_UPDATE_MODE`.  All of them route to TI's CC35xx Wi-Fi /
 NimBLE / lwIP / `psa_fwu` APIs through the `hal/ti/` backend.
 
 The META group is still the floor the link is debugged against -- nothing
