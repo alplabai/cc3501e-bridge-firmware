@@ -121,12 +121,12 @@ installed and on the right paths -- a long toolchain to require of anyone who
 just wants a working companion.  The signed blob in `prebuilt/` is already
 built and signed:
 
-> **`cc3501e-v0.8.0.bin` is built from this tree's v0.8.0 release commit
-> (`prebuilt/BUILT_FROM`'s `built-from`), which `main` is now twenty commits
-> past.**  `cc3501e-v0.7.0.bin` and older are kept only for traceability, and
+> **`cc3501e-v0.9.0.bin` is built from this tree's v0.9.0 release commit
+> (`prebuilt/BUILT_FROM`'s `built-from`), which is current `main`.**
+> `cc3501e-v0.8.0.bin` and older are kept only for traceability, and
 > note they are not all the same KIND of artifact: 0.2.0, 0.3.0 and 0.5.0 are
-> raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1, 0.6.0, 0.7.0 and this
-> 0.8.0 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
+> raw `build_ti.ps1` output, while 0.4.0, 0.4.1, 0.5.1, 0.6.0, 0.7.0, 0.8.0 and
+> this 0.9.0 are wrapped TI `flash-images-builder` vendor images.  Only the wrapped
 > kind can be dropped straight into `primary_vendor_image.sign.bin` by the
 > recipe below (#96).  `prebuilt/BUILD_RECIPE.md` records which is which and CI
 > machine-checks it (#97).
@@ -135,12 +135,12 @@ built and signed:
 > `hal/` or `ti/` that is neither released nor attested `inert:` (does not
 > change the compiled image) in `prebuilt/BUILT_FROM`, so this is a checked
 > claim rather than an asserted one -- that gap is what let 0.4.1 go stale
-> under a green `prebuilt integrity` (#75).  **It is checked and currently
-> RED**: commits touching `src/`, `hal/` or `ti/` sit on `main` after
-> `built-from` with no `inert:` attestation and no new release cut, so the
-> shipped `v0.8.0` blob predates the Wi-Fi/socket fixes that have since
-> landed on `main`.  The claim above is "this is what v0.8.0 was built
-> from", not "this matches `main`".
+> under a green `prebuilt integrity` (#75).  It had been RED on every PR since
+> #130, with eleven commits touching `src/`, `hal/` or `ti/` sitting on `main`
+> after `built-from` with neither a release nor an `inert:` attestation; the
+> v0.9.0 cut is what cleared it.  The claim above is "this is what v0.9.0 was
+> built from", not "this matches `main`" -- they coincide today and will drift
+> again with the next merge.
 >
 > **Why 0.5.1 and not 0.6.0.**  This content shipped briefly as 0.6.0, which
 > burned a minor version for no reason: neither 0.5.0 nor 0.6.0 was ever tagged
@@ -169,8 +169,8 @@ built and signed:
 ```sh
 # 1. Verify what you are about to flash (never skip this).
 openssl dgst -sha256 -verify keys/alp_cc3501e_vendor_VALIDATION_public.pem \
-    -signature prebuilt/cc3501e-v0.8.0.bin.sig prebuilt/cc3501e-v0.8.0.bin
-sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.8.0.bin.sha256)  prebuilt/cc3501e-v0.8.0.bin"
+    -signature prebuilt/cc3501e-v0.9.0.bin.sig prebuilt/cc3501e-v0.9.0.bin
+sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.9.0.bin.sha256)  prebuilt/cc3501e-v0.9.0.bin"
 
 # 2. Use a flash-set whose signed programming_instructions was generated at
 #    THIS artifact's stamp -- see the warning below.  An existing flash-set
@@ -191,7 +191,7 @@ sha256sum -c <<<"$(cat prebuilt/cc3501e-v0.8.0.bin.sha256)  prebuilt/cc3501e-v0.
 #    table, not a signed container, and installing one here is a different file
 #    format, not a different build (#96).  prebuilt/BUILD_RECIPE.md records
 #    which release is which, and CI machine-checks it (#97).
-cp prebuilt/cc3501e-v0.8.0.bin <flashset>/primary_vendor_image.sign.bin
+cp prebuilt/cc3501e-v0.9.0.bin <flashset>/primary_vendor_image.sign.bin
 rm -f <flashset>/*.flashready.bin
 
 # 4. Program over XDS110/SWD (~18 s).
@@ -213,11 +213,11 @@ expensive trap on this part.  `programming_instructions` is built from
 
 Verify the flash took by asking the device, not by trusting the programmer:
 `GET_VERSION` must answer wire **`4.0`**, and `GET_DIAG_INFO` must report
-`fw_version=0x0800`.
+`fw_version=0x0900`.
 
 `GET_VERSION` answers a MAJOR.MINOR value (since v0.7.0, wire 3.1) rather than
 a flat counter. `fw_version` remains the reliable discriminator in general --
-`0x0800` for this release, `0x0700` / `0x0600` / `0x0501` / `0x0500` for older.
+`0x0900` for this release, `0x0800` / `0x0700` / `0x0600` / `0x0501` for older.
 
 **A wire-4.x image needs a wire-4.x host.** `cc3501e_reset()` reads
 `GET_VERSION` on every cold boot and returns `ALP_ERR_VERSION` on a **MAJOR**
@@ -227,7 +227,7 @@ and does not refuse -- that is the point of the scheme.
 
 Three distinct version numbers are in play here and they are **not**
 interchangeable -- app SemVer (`0.8.0`), wire protocol (`4.0`), and the GPE
-image stamp (`0.254.5.0`).  `prebuilt/CHANGELOG.md` has the table.
+image stamp (`0.254.15.0`).  `prebuilt/CHANGELOG.md` has the table.
 
 > **STOP -- do not reuse a stamp from an older doc, an older flash-set, or
 > memory. Get it wrong and the write still streams clean, exits 0, and the
@@ -363,7 +363,7 @@ release blob is version-pinned at `prebuilt/cc3501e-vX.Y.Z.bin`.
 validates that blob (relaying the image to the CC3501E over the
 inter-chip link) -- it is not a customer-facing utility, and lives
 in `alp-sdk-internal`, not this public tree.
-`prebuilt/` holds the signed release blob; `cc3501e-v0.8.0.bin` is the
+`prebuilt/` holds the signed release blob; `cc3501e-v0.9.0.bin` is the
 current one (wire protocol **4.0**).  Every older blob answers a DIFFERENT
 protocol and a host built from this tree refuses all of them:
 `cc3501e-v0.7.0.bin` answers **3.1**, `cc3501e-v0.6.0.bin` answers **8**,
@@ -384,5 +384,5 @@ accepts no clients (alp-sdk#1562).
 | TI backend: SDIO-slave (`hal/ti/transport_hw_ti_sdio.c`) | 🟡 frame glue complete; the SDIO-**device** register bring-up needs SWRU626 §21 (no public SDK SDIO-device driver). Off the critical path — SPI is the default. |
 | Async events: attention edge on READY | ❌ **NOT delivered by an edge on this board rev (#57, measured 2026-08-29).** Alif `P2_6` is an OPEN net at the host: with the Alif powered and only the CC35 held in nRESET, `P2_6` read HIGH in **48 of 48** samples across a 46 s window that spans the CC35's entire reset → `Board_init()` → first-arm sequence — the window in which `cc3501e_hw_init()` holds `cc3501e_bridge_busy()` (READY LOW) for *seconds*. The bridge answered `protocol v5` afterwards, so it really did reset and re-init in that window. A connected wire could not stay HIGH through it. This corroborates the independent "0 edges in 20000 samples" note in `src/worker.c` and `hal/ti/cc3501e_hw_ti_ble.c`, and **refutes** the previous row's claim of "135/135 firmware pushes delivered" *on the edge* — the host cannot observe edges on a net it does not see, so that delivery came from the timer poll, not the attention edge. The CC35-side pulse code is real and harmless; it is the HOST-side edge that does not exist here. Needs a board rev, or a dedicated HOST_IRQ pad. Build-time opt-in (`build_ti.ps1 -AttnPulse`, default OFF). |
 | `flash.py` real flashing | 🔮 moved to `alp-sdk-internal` (Alp-internal OTA-build tooling); blocked on TI's `cc3501e-flasher` CLI (not public yet); manual SWD/J-Link is the interim bench path |
-| `prebuilt/` populated | ✅ `cc3501e-v0.8.0.bin` signed (full bridge: META + Wi-Fi + BLE + OTA + the E1M SPI1 passthrough, **proto v4.0**), GPE `0.254.5.0`, sha256 `c67ad58a8bbf8be493f025571643740fe8f39921d25e932e2d8530c18d1ba2a7`. **`prebuilt freshness` is currently RED**, and has been on every PR since #130: commits touching `src/`, `hal/` or `ti/` have landed on `main` since `built-from` with no release or `inert:` attestation, so the shipped blob predates those fixes. Sockets now connect end-to-end (fixed 2026-08-31, #89 + alp-sdk#1872/#1873) -- closure evidence is from the earlier wire-7/v0.5.1-era build, not yet re-soaked on the shipping wire-4.0 bits; see `prebuilt/CHANGELOG.md`. |
+| `prebuilt/` populated | ✅ `cc3501e-v0.9.0.bin` signed (full bridge: META + Wi-Fi + BLE + OTA + the E1M SPI1 passthrough, **proto v4.0**), GPE `0.254.15.0`, sha256 `79c62f0de11a2582d60521c5f66d5dcc0fdd993cd4baa9f0ce317450701a7104`. Cut to clear a `prebuilt freshness` that had been RED on every PR since #130, with eleven `src/`/`hal/`/`ti/` commits landed after `built-from` and no release; the shipped blob now carries them. Sockets connect end-to-end (fixed 2026-08-31, #89 + alp-sdk#1872/#1873) -- closure evidence is from the earlier wire-7/v0.5.1-era build, not re-soaked on the shipping wire-4.0 bits; see `prebuilt/CHANGELOG.md`. |
 | Wi-Fi / BLE / GPIO-proxy groups | ✅ implemented and silicon-validated (alp-sdk v0.8.0 on E1M-AEN801): Wi-Fi scan with security decode, real BLE scan (ble_gap_disc), GPIO proxy warm-boot, OTA-over-bridge staged (see [`docs/cc3501e-bridge.md`](https://github.com/alplabai/alp-sdk/blob/main/docs/cc3501e-bridge.md)). |

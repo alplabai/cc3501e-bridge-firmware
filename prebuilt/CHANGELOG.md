@@ -7,9 +7,83 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## v0.9.0
 
-### Fixed
+GPE: `0.254.15.0`. Wire protocol: `4.0`. sha256
+`79c62f0de11a2582d60521c5f66d5dcc0fdd993cd4baa9f0ce317450701a7104`.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0 + Wi-Fi Toolbox 4.2.4) via
+`ti/build_ti.sh --wifi --ble`, then wrapped and signed per
+[`BUILD_RECIPE.md`](BUILD_RECIPE.md). Stage-1 raw sha256
+`2a6f85c6b260fb4aa2f2e5edef8e9ef5cb1ddecdc6ebb8d86afdb676d8db9bdb`.
+
+**Why this cut exists.** v0.8.0 shipped from `017e7cf` and `main` moved twenty
+commits past it, eleven of them touching `src/`, `hal/` or `ti/`, with no
+release and no `inert:` attestation. `prebuilt freshness` had been RED on every
+PR since #130, which is precisely the failure mode `BUILT_FROM`'s own header
+warns about: a permanently red gate is how a real staleness gets waved through.
+Everything below was merged but unreachable by anyone flashing the published
+blob.
+
+**GPE stamp.** `0.254.15.0`, which clears e1m-aen-evk-01's `0.254.14.0` by one.
+`gpe-floor` moves `0.254.5.0` -> `0.254.15.0` in this same commit; the floor and
+the wrapped stamp have to move together or `check_prebuilt_kind.py` goes red on
+the newest blob. Every earlier artifact -- v0.8.0 at `0.254.5.0` included -- is
+now a permanent rollback on that unit.
+
+### Fixed since v0.8.0
+
+- **The SPI re-init that wedged the link after fast operations (#106, #133).**
+  A control-path re-init ran after operations that completed quickly enough to
+  race it, leaving the slave armed but deaf.
+- **`SOCK_SEND` could answer with a stale cached result (#107, #134).** The
+  send path is now bounded and a reply is never served from a previous seq.
+- **Station power order, a `WIFI_STATUS` reason byte, and a per-event status-30
+  retry (#137).** An AUTH reject deny-lists the BSSID for 10 s; an ASSOC reject
+  carrying a comeback IE deny-lists for about 1 s and the driver resends three
+  times, so the two are no longer retried on the same schedule.
+- **`SOCK_RECV` replay safety (#138).** A CRC-rejected reply can no longer be
+  replayed as fresh data; worker reply sizes are bounded and the prefetch ring
+  stays owned.
+- **The connect-failure exit no longer re-inits SPI when the host proves the
+  slave live (#141).**
+- **The SPI self-heals now run in-line during the connect body, plus a
+  quiet-armed re-arm (#145).** Previously the heals were frozen for up to 70 s
+  during a connect, because `cc3501e_hw_tick()` only runs after
+  `worker_run_pending()`.
+- **The driver's stale `DEAUTH_LEAVING(3)` is no longer published as a connect
+  verdict (#146).** `pDrv->deauthReason` has no per-attempt reset and the
+  firmware's own `Wlan_Disconnect` sets it to 3, so a failed connect reported a
+  disconnect reason from an unrelated earlier event.
+- **The DHCP lease poll was widened to 30 s (#130)**, so a measured late lease
+  lands inside the connect call instead of after it. The host's own budget
+  should be 75 s against the resulting 70 s worst case (role-up 10 s +
+  association 30 s + DHCP 30 s).
+
+### Diagnostics and documentation
+
+- **`.TI.noinit` does NOT survive a warm nRESET (#148, #149).** The claim that
+  a wedge snapshot could be read back after the host's recovery reset was
+  disproven on the bench (run14 P6). The reset cause comes from a bootloader
+  RAM copy at `0x28000115` that folds pin reset and POR together. Every comment
+  and doc asserting otherwise is corrected, and a testable AON scratchpad
+  capture replaced it -- `CC3501E_WEDGE_PROBE` selectors 11 and 12, latched once
+  per boot. This changes no shipping build: both default and `--wifi --ble`
+  images are byte-identical with and without it.
+- **The docs frozen at `017e7cf` were refreshed (#150).** Most seriously, the
+  flashing recipes had hardcoded GPE stamps (`0.149.93.0`, `0.149.65.0`) that
+  were permanent bricks on the current bench unit, and two files stated the
+  monotonicity rule as `>=` rather than strictly greater. Stamps are now derived
+  at flash time from `BUILT_FROM`'s FLASHING LOG.
+
+### Known, unchanged
+
+The link-wedge cure is still unproven: run14 saw 0 wedges across 60 boots
+against run13's 1, which is not evidence of a fix. The host-side answer is the
+cause-agnostic failure ring, alp-sdk#2136.
+
+### Also fixed in this release
 
 **Correction to v0.8.0's "An unconfigured station now defaults to ACTIVE" claim
 below.** That fix (`cc3501e_hw_power_service()` applying the effective policy
