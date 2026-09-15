@@ -452,12 +452,16 @@ static struct {
 	 * hundreds of ticks have already overwritten whatever the reset left
 	 * behind, so a live read would show the magic regardless of what the
 	 * reset did.  g_retention_magic_pair_boot (declared with
-	 * g_retention_latched above bridge_transport_spi_probe_tick()) latches
-	 * this field's content on the FIRST tick, before this boot's own write
-	 * ever runs -- selector 12 returns THAT.  A single raw read of the latch
-	 * tells the three outcomes apart at a glance:
+	 * g_retention_magic_latched above bridge_transport_spi_probe_tick())
+	 * latches this field's content on the FIRST tick, before this boot's own
+	 * write ever runs -- selector 12 returns THAT (or
+	 * CC3501E_PROBE_SENTINEL_UNLATCHED if read before that first tick has
+	 * run, #148 review fix item 6).  A single raw read of the latch tells the
+	 * outcomes apart at a glance:
 	 *   0x5AA5A55A exactly => this word survived the reset (retained)
 	 *   0x00000000          => the bootloader/ROM zeroed .TI.noinit
+	 *   0xFFFFFFFF          => no probe tick has latched anything yet this
+	 *                          boot (the sentinel, not a reset outcome)
 	 *   anything else       => RAM came back randomised, not simply cleared
 	 * Companion to CC3501E_PROBE_AON_LINE2_ADDR's magic nibble below, but in
 	 * the OTHER retention domain (.TI.noinit/DRAM, not the AON scratchpad) --
@@ -1437,8 +1441,16 @@ void bridge_transport_spi_probe_xfer(void)
  * Fix: latch each domain's PRE-WRITE content exactly ONCE, on the first tick
  * this boot, into these plain-.bss copies (NOT .TI.noinit: they must start
  * zero/unlatched on every fresh boot and latch exactly once that boot).
- * Selectors 11 and 12 below return these latches, not a live re-read. */
-static bool     g_retention_latched;
+ * Selectors 11 and 12 below return these latches, not a live re-read.
+ *
+ * TWO separate flags, not one: the AON word does not sit behind g_persist's
+ * persist_writable() placement predicate (it is a fixed hardware register,
+ * not a .TI.noinit struct that might have landed in flash), so it latches on
+ * this firmware's very first tick regardless of whether g_persist is usable.
+ * The magic-pair latch legitimately stays gated on persist_writable() --
+ * reading g_persist when it is not writable is meaningless. */
+static bool     g_retention_aon_latched;
+static bool     g_retention_magic_latched;
 static uint32_t g_retention_aon_line2_boot;  /* raw LINE2 word as found on the first tick */
 static uint32_t g_retention_magic_pair_boot; /* raw probe_magic_pair as found on the first tick */
 
@@ -1448,25 +1460,30 @@ static uint32_t g_retention_magic_pair_boot; /* raw probe_magic_pair as found on
  * the single fact that separates the remaining hypotheses. */
 void bridge_transport_spi_probe_tick(void)
 {
-	if (!persist_writable()) {
-		return;
-	}
-	g_persist.probe_ticks++;
-	if (g_persist.probe_quiet < 0xFFFFu) {
-		g_persist.probe_quiet++;
-	}
-	g_persist.probe_resync  = g_resync_count;
-	g_persist.probe_armfail = g_arm_fail_count;
-	g_persist.probe_phase   = (uint8_t)phase;
-	/* Host-DMA channel state.  HOST_DMA_TGT_BASE is the ONLY DMA base in
+	/* #148 (review fix item 2): the AON scratchpad capture further down must
+	 * run regardless of whether g_persist is usable -- it is a fixed
+	 * hardware register, not a .TI.noinit struct that might have landed in
+	 * flash.  Everything that touches g_persist itself stays behind
+	 * persist_ok; the AON capture at the bottom of this function does not. */
+	const bool persist_ok = persist_writable();
+
+	if (persist_ok) {
+		g_persist.probe_ticks++;
+		if (g_persist.probe_quiet < 0xFFFFu) {
+			g_persist.probe_quiet++;
+		}
+		g_persist.probe_resync  = g_resync_count;
+		g_persist.probe_armfail = g_arm_fail_count;
+		g_persist.probe_phase   = (uint8_t)phase;
+		/* Host-DMA channel state.  HOST_DMA_TGT_BASE is the ONLY DMA base in
 	 * hw_memmap.h.  Read here and nowhere else: this whole block is
 	 * CC3501E_WEDGE_PROBE-only and never in a shipping image, which matters
 	 * because a base constant from this same header (PRCM_SCRATCHPAD_BASE)
 	 * turned out not to be the address the silicon answers on and broke
 	 * GET_DIAG_INFO when read from a handler.  Confining a possibly-wrong
 	 * base to a bench-only build is the mitigation. */
-	g_persist.probe_err_ris = HWREG(SOC_AON_BASE + SOC_AON_O_ERRSRIS);
-	/* Internal temperature channel (#18), sampled HERE because probe_tick() runs on
+		g_persist.probe_err_ris = HWREG(SOC_AON_BASE + SOC_AON_O_ERRSRIS);
+		/* Internal temperature channel (#18), sampled HERE because probe_tick() runs on
 	 * the task.  It must NOT be read from the diag selector: handlers on this part
 	 * dispatch from the SPI callback, and ADC_convert() is a blocking driver call.
 	 *
@@ -1474,58 +1491,60 @@ void bridge_transport_spi_probe_tick(void)
 	 * function, gain/offset trim or OTP location for channel 11, so this number has
 	 * no unit.  It is here to characterise the channel and to anchor the question to
 	 * TI, not to gate the radio. */
-	{
-		static ADC_Handle adc;
-		static bool       adc_tried;
-		static uint16_t   adc_ok_count; /* .bss -> starts at 0, unlike g_persist */
-		static uint16_t   adc_div;      /* sample every Nth tick, not every tick */
-		if (!adc_tried) {
-			ADC_Params ap;
-			/* ADC_init() FIRST.  ADC_open() is gated on a file-static `isInitialized`
+		{
+			static ADC_Handle adc;
+			static bool       adc_tried;
+			static uint16_t   adc_ok_count; /* .bss -> starts at 0, unlike g_persist */
+			static uint16_t   adc_div;      /* sample every Nth tick, not every tick */
+			if (!adc_tried) {
+				ADC_Params ap;
+				/* ADC_init() FIRST.  ADC_open() is gated on a file-static `isInitialized`
 			 * that ONLY ADC_init() sets (ti/drivers/ADC.c), and the generated
 			 * Board_init() does not call it -- it inits Power, GPIO and DMA only.  So
 			 * ADC_open() returned NULL immediately and nothing ever wrote the sample
 			 * field, which left the read-back showing uninitialised .TI.noinit RAM that
 			 * changed every boot and looked exactly like live data.  ADC_init() is
 			 * idempotent (guarded by that same flag), so calling it here is safe. */
-			ADC_init();
-			ADC_Params_init(&ap);
-			adc = ADC_open(CONFIG_ADC_TEMP, &ap);
-			g_adc_probe_stat |= 0x80000000u;
-			if (adc != NULL) {
-				g_adc_probe_stat |= 0x40000000u;
+				ADC_init();
+				ADC_Params_init(&ap);
+				adc = ADC_open(CONFIG_ADC_TEMP, &ap);
+				g_adc_probe_stat |= 0x80000000u;
+				if (adc != NULL) {
+					g_adc_probe_stat |= 0x40000000u;
+				}
+				adc_tried = true;
 			}
-			adc_tried = true;
-		}
-		/* Sample every 128th tick, NOT every tick.  ADC_convert() is a BLOCKING
+			/* Sample every 128th tick, NOT every tick.  ADC_convert() is a BLOCKING
 		 * driver call and probe_tick() runs on the housekeeping task: converting
 		 * on every tick stalled that task badly enough that the sample counter
 		 * appeared frozen across a 5 s window, which is indistinguishable from an
 		 * ADC that never converted.  Die temperature does not move on a 10 ms
 		 * scale, so a ~1.3 s cadence loses nothing and keeps the tick responsive. */
-		adc_div++;
-		if (adc != NULL && (adc_div & 0x7Fu) == 0u) {
-			uint16_t raw = 0u;
-			if (ADC_convert(adc, &raw) == ADC_STATUS_SUCCESS) {
-				/* Count in a .bss static, NOT in the .TI.noinit word: that section is
+			adc_div++;
+			if (adc != NULL && (adc_div & 0x7Fu) == 0u) {
+				uint16_t raw = 0u;
+				if (ADC_convert(adc, &raw) == ADC_STATUS_SUCCESS) {
+					/* Count in a .bss static, NOT in the .TI.noinit word: that section is
 				 * uninitialised by design, so seeding a counter from it reports garbage as
 				 * a sample count.  The first version did that AND incremented the low half
 				 * before masking to the high half, so the count moved only on carry -- it
 				 * read 44536 from cold boot and never advanced, which is indistinguishable
 				 * from an ADC that never converted. */
-				g_adc_probe_stat = (g_adc_probe_stat | 0x20000000u) + 1u;
-				adc_ok_count++;
-				g_persist.probe_adc_temp = ((uint32_t)adc_ok_count << 16) | (uint32_t)raw;
+					g_adc_probe_stat = (g_adc_probe_stat | 0x20000000u) + 1u;
+					adc_ok_count++;
+					g_persist.probe_adc_temp = ((uint32_t)adc_ok_count << 16) | (uint32_t)raw;
+				}
 			}
 		}
+		g_persist.probe_spi_ris =
+		    (spi != NULL) ? HWREG(((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr + SPI_O_RIS)
+		                  : 0u;
+		g_persist.probe_ch12sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12STA);
+		g_persist.probe_ch12tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12TSTA);
+		g_persist.probe_ch13sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13STA);
+		g_persist.probe_ch13tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13TSTA);
 	}
-	g_persist.probe_spi_ris =
-	    (spi != NULL) ? HWREG(((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr + SPI_O_RIS)
-	                  : 0u;
-	g_persist.probe_ch12sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12STA);
-	g_persist.probe_ch12tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH12TSTA);
-	g_persist.probe_ch13sta  = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13STA);
-	g_persist.probe_ch13tsta = HWREG(HOST_DMA_TGT_BASE + HOST_DMA_O_CH13TSTA);
+
 #ifndef CC3501E_READY_GPIO
 #define CC3501E_READY_GPIO 17u /* mirrors cc3501e_hw_ti_gpio.c -- CC35 GPIO17 -> Alif P2_6 */
 #endif
@@ -1551,42 +1570,78 @@ void bridge_transport_spi_probe_tick(void)
 	 * then blocks until timeout on every request.  From both ends that is
 	 * indistinguishable from the slave being dead, which is why the snapshot above
 	 * shows a perfectly healthy idle slave. */
-	g_persist.probe_flags =
-	    (uint8_t)((reply_armed ? 1u : 0u) | (bridge_transport_spi_is_dead() ? 2u : 0u) |
-	              (g_polled ? 4u : 0u) | (GPIO_read(CC3501E_READY_GPIO) ? 8u : 0u));
-
-	/* #148 (review fix): latch BOTH retention domains' PRE-WRITE content
-	 * exactly ONCE, on the first tick this boot, BEFORE either write below
-	 * touches them -- see g_retention_latched's declaration above for why a
-	 * live re-read at selector time cannot answer #148.  g_retention_latched
-	 * gates both captures together since both writes happen in this same
-	 * function; nothing before this point in the file ever writes either
-	 * word, so "first tick" here is also "before anything else can write
-	 * them". */
-	if (!g_retention_latched) {
-		g_retention_aon_line2_boot  = HWREG(CC3501E_PROBE_AON_LINE2_ADDR);
-		g_retention_magic_pair_boot = g_persist.probe_magic_pair;
-		g_retention_latched         = true;
+	if (persist_ok) {
+		g_persist.probe_flags =
+		    (uint8_t)((reply_armed ? 1u : 0u) | (bridge_transport_spi_is_dead() ? 2u : 0u) |
+		              (g_polled ? 4u : 0u) | (GPIO_read(CC3501E_READY_GPIO) ? 8u : 0u));
 	}
 
-	/* #148: refresh the .TI.noinit-domain raw retention pattern for the NEXT
-	 * reset to be tested against -- see g_persist.probe_magic_pair's
-	 * declaration for what the three read-back outcomes mean.  This is a
-	 * LIVE write, refreshed every tick like the rest of this snapshot;
-	 * selectors 11/12 read the LATCH above, not this word, for exactly the
-	 * reason g_retention_latched's declaration explains. */
-	g_persist.probe_magic_pair = 0x5AA5A55Au;
+	/* #148 (review fix item 2): latch the AON word's PRE-WRITE content exactly
+	 * ONCE, on this firmware's first tick, UNCONDITIONALLY -- it is a fixed
+	 * hardware register (PROVEN writable, see the comment above), not a
+	 * g_persist field, so it does not depend on persist_ok.  A previous
+	 * version gated this behind persist_writable() alongside the magic-pair
+	 * latch below; that made selector 11 (case 11u in bridge_transport_spi_
+	 * probe_read()) silently report 0 whenever g_persist happened to be
+	 * unusable, indistinguishable from the "bootloader clears this word too"
+	 * verdict below -- the exact "reports a fixed value regardless of
+	 * reality" defect this whole change exists to fix.
+	 *
+	 * Unlike probe_magic_pair below, this word is NOT provably untouched
+	 * before this latch runs: vendor psa_fwu_request_reboot() also writes
+	 * CC3501E_PROBE_AON_LINE2_ADDR (see that constant's comment) and is
+	 * reachable from cc3501e_hw_ti.c:396 and :422, both earlier in the same
+	 * cc3501e_hw_tick() body than this probe tick (:469).  In a
+	 * CC3501E_WEDGE_PROBE + CC3501E_OTA_SELFTEST build the first latch this
+	 * boot can therefore capture a hi16 this same boot already zeroed via
+	 * psa_fwu's write, not the reset's own leftover content. */
+	if (!g_retention_aon_latched) {
+		g_retention_aon_line2_boot = HWREG(CC3501E_PROBE_AON_LINE2_ADDR);
+		g_retention_aon_latched    = true;
+	}
+	/* The magic-pair latch legitimately stays behind persist_ok: it reads
+	 * g_persist.probe_magic_pair, and reading g_persist when it is not
+	 * writable is meaningless (see persist_writable()'s own comment).
+	 * Nothing before this point in the file ever writes probe_magic_pair, so
+	 * "first tick" here is also "before anything else can write it" -- true
+	 * for THIS word only; see the AON latch above for why the same claim does
+	 * not hold there. */
+	if (persist_ok && !g_retention_magic_latched) {
+		g_retention_magic_pair_boot = g_persist.probe_magic_pair;
+		g_retention_magic_latched   = true;
+	}
+
+	if (persist_ok) {
+		/* #148: refresh the .TI.noinit-domain raw retention pattern for the NEXT
+		 * reset to be tested against -- see g_persist.probe_magic_pair's
+		 * declaration for what the read-back outcomes mean.  This is a LIVE
+		 * write, refreshed every tick like the rest of this snapshot;
+		 * selector 12 reads the LATCH above, not this word, for exactly the
+		 * reason g_retention_magic_latched's declaration explains. */
+		g_persist.probe_magic_pair = 0x5AA5A55Au;
+	}
 
 	/* #148: reset-surviving capture in the AON scratchpad -- a SECOND,
 	 * INDEPENDENT retention domain from .TI.noinit/DRAM (see
 	 * CC3501E_PROBE_AON_LINE2_ADDR above for the address and its provenance).
-	 * This write refreshes the LIVE word for the NEXT reset to be tested
-	 * against; g_retention_aon_line2_boot (selector 11) is the answer for
-	 * THIS boot's reset, latched above before this write ever ran.  Read
-	 * selector 11's [31:28] nibble to tell the three outcomes apart:
+	 * UNCONDITIONAL, same as the latch above (#148 review fix item 2): this
+	 * domain does not depend on g_persist being writable.  This write
+	 * refreshes the LIVE word for the NEXT reset to be tested against;
+	 * g_retention_aon_line2_boot (selector 11) is the answer for THIS boot's
+	 * reset, latched above before this write ever ran.  Read selector 11's
+	 * [31:28] nibble to tell FOUR outcomes apart, not three -- see selector
+	 * 11's own comment in bridge_transport_spi_probe_read() for the sentinel
+	 * this probe returns before the first tick has latched anything:
 	 *   - magic (0xA) exactly    => a reset-surviving snapshot exists in
 	 *     AON, and the .TI.noinit non-retention (run14 P6) is DRAM-specific
-	 *   - reads 0                => the bootloader clears this word too
+	 *   - reads 0                => the bootloader clears this word too, on
+	 *     any reset whose PREVIOUS boot did not call psa_fwu_request_reboot()
+	 *     -- an OTA reboot's own write into this same word (psa_fwu.c
+	 *     assigns the scratchpad's uint16 into this volatile uint32 register,
+	 *     zeroing bits [31:16] as a side effect) can produce the identical
+	 *     reading with no bootloader clear involved; the #148 run14-P6 host-
+	 *     nRESET case qualifies for the "bootloader clears it" reading, an
+	 *     OTA reboot does not
 	 *   - reads random/garbage   => the warm nRESET is a POR to the AON bank
 	 *     as well, and no on-chip retention exists for either domain
 	 *
@@ -1601,21 +1656,39 @@ void bridge_transport_spi_probe_tick(void)
 	 *   [21]    CH12TSTA.STA
 	 *   [20:16] quiet count, saturating at 31 (ticks since last transfer) */
 	{
-		const uint32_t magic  = 0xAu;
-		const uint32_t quiet5 = (g_persist.probe_quiet > 31u) ? 31u : g_persist.probe_quiet;
+		const uint32_t magic = 0xAu;
+		/* quiet/CH12 bits fall back to 0 when g_persist is not writable: those
+		 * three fields live in g_persist and were not refreshed this tick (see
+		 * the persist_ok guard above), so a live re-read of them here would be
+		 * meaningless, not merely stale. */
+		const uint32_t quiet5 =
+		    persist_ok ? ((g_persist.probe_quiet > 31u) ? 31u : g_persist.probe_quiet) : 0u;
+		const bool ch12_run = persist_ok && (g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u;
+		const bool ch12_active =
+		    persist_ok && (g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u;
 		const uint32_t hi16 =
 		    (magic << 28) | (((uint32_t)phase & 0x3u) << 26) | ((reply_armed ? 1u : 0u) << 25) |
 		    ((bridge_transport_spi_is_dead() ? 1u : 0u) << 24) |
-		    ((GPIO_read(CC3501E_READY_GPIO) ? 1u : 0u) << 23) |
-		    (((g_persist.probe_ch12sta & HOST_DMA_CH12STA_RUN) != 0u ? 1u : 0u) << 22) |
-		    (((g_persist.probe_ch12tsta & HOST_DMA_CH12TSTA_STA) != 0u ? 1u : 0u) << 21) |
-		    (quiet5 << 16);
-		/* RACE NOTE: this read-modify-write is only safe because it and every
-		 * psa_fwu_request_reboot() call site run on the SAME task, this probe
-		 * tick always runs before request_reboot within a given tick, and a
-		 * successful request_reboot() never returns to let a second RMW race
-		 * it.  Moving either off that task (or making request_reboot return
-		 * on success) would silently corrupt a live OTA reboot request. */
+		    ((GPIO_read(CC3501E_READY_GPIO) ? 1u : 0u) << 23) | ((ch12_run ? 1u : 0u) << 22) |
+		    ((ch12_active ? 1u : 0u) << 21) | (quiet5 << 16);
+		/* RACE NOTE: this read-modify-write is safe for two reasons -- not the
+		 * simple "always runs before" ordering a prior version of this
+		 * comment claimed.  Two of the three psa_fwu_request_reboot() call
+		 * sites (cc3501e_hw_ti.c's OTA_SELFTEST install at :366, reached from
+		 * :396, and the trial-accept commit at :422) run EARLIER in the same
+		 * cc3501e_hw_tick() body than this probe tick (:469); only the
+		 * deferred OTA-reboot call at :483 runs after it.  What actually makes
+		 * this safe:
+		 *   (a) the read and the write here are a single-task,
+		 *       non-preemptible RMW -- all three psa_fwu_request_reboot()
+		 *       call sites run on the SAME bring-up task as this probe tick,
+		 *       so nothing can interleave inside it regardless of call order.
+		 *   (b) psa_fwu.c's !resetNeeded path returns PSA_ERROR_BAD_STATE
+		 *       BEFORE touching the scratchpad, so a refused reboot request
+		 *       never leaves live state in the word for this RMW to race.
+		 * Moving this probe tick off that task (or a request_reboot() success
+		 * path that returned instead of rebooting) would still silently
+		 * corrupt a live OTA reboot request. */
 		const uint32_t lo16_preserved       = HWREG(CC3501E_PROBE_AON_LINE2_ADDR) & 0x0000FFFFu;
 		HWREG(CC3501E_PROBE_AON_LINE2_ADDR) = hi16 | lo16_preserved;
 	}
@@ -1675,8 +1748,14 @@ void bridge_transport_spi_probe_tick(void)
  *                                     THE FIRST TICK AFTER BOOT (#148), the
  *                                     SECOND, INDEPENDENT retention capture
  *                                     -- a LATCH, not a live read (see
- *                                     g_retention_latched and
- *                                     CC3501E_PROBE_AON_LINE2_ADDR)
+ *                                     g_retention_aon_latched and
+ *                                     CC3501E_PROBE_AON_LINE2_ADDR).  Reads
+ *                                     CC3501E_PROBE_SENTINEL_UNLATCHED if read
+ *                                     before this boot's first probe tick has
+ *                                     run -- otherwise indistinguishable from
+ *                                     the legitimate "bootloader clears this
+ *                                     word too" reading of 0 (#148 review fix
+ *                                     item 6: a fourth outcome, not three).
  *   alp companion diag loglevel 12 -> g_persist.probe_magic_pair AS FOUND ON
  *                                     THE FIRST TICK AFTER BOOT (#148): a
  *                                     fixed 0x5AA5A55A test pattern -- also a
@@ -1685,15 +1764,34 @@ void bridge_transport_spi_probe_tick(void)
  *                                     apart from RANDOMISED .TI.noinit RAM
  *                                     (garbage, near-certainly not this exact
  *                                     word) -- next free selector,
- *                                     no wire change
+ *                                     no wire change.  Same
+ *                                     CC3501E_PROBE_SENTINEL_UNLATCHED
+ *                                     pre-latch reading as loglevel 11 above.
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
  * without a debugger.  Never compiled into a shipping image. */
 extern volatile uint8_t g_cc3501e_log_level;
 
+/* #148 (review fix item 6): a selector-11/12 read landing before this boot's
+ * first probe tick has run would otherwise return the .bss startup zero for
+ * g_retention_aon_line2_boot / g_retention_magic_pair_boot, indistinguishable
+ * from the legitimate "reads 0" bootloader-cleared verdict those selectors'
+ * own comments document.  Both raw values use their full 32 bits (register
+ * content / test pattern), so there is no spare bit to steal for a latched
+ * flag -- return this distinct out-of-band value instead. */
+#define CC3501E_PROBE_SENTINEL_UNLATCHED 0xFFFFFFFFu
+
 uint32_t bridge_transport_spi_probe_read(void)
 {
+	if (g_cc3501e_log_level == 11u) {
+		/* #148 (review fix item 2): case 11u does not depend on g_persist --
+		 * it reads the AON latch, not a g_persist field -- so it must not sit
+		 * behind persist_writable() either; see bridge_transport_spi_probe_
+		 * tick()'s AON latch for the matching write-side fix. */
+		return g_retention_aon_latched ? g_retention_aon_line2_boot
+		                               : CC3501E_PROBE_SENTINEL_UNLATCHED;
+	}
 	if (!persist_writable()) {
 		return 0u;
 	}
@@ -1745,28 +1843,20 @@ uint32_t bridge_transport_spi_probe_read(void)
 		 * quiet-armed detector actually fired a reinit.  Zero on a build/boot
 		 * that never took this path at all. */
 		return cc3501e_hw_link_quiet_rearm_count();
-	case 11u:
-		/* #148: raw AON scratchpad LINE2 word AS FOUND ON THE FIRST TICK
-		 * AFTER BOOT -- the pre-boot content, latched by
-		 * bridge_transport_spi_probe_tick() into g_retention_aon_line2_boot
-		 * BEFORE that function's own write ever ran (see its declaration and
-		 * CC3501E_PROBE_AON_LINE2_ADDR's comment for the address
-		 * provenance).  NOT a live read: a live HWREG() read here would
-		 * always show this firmware's own ~10ms-old write by the time a
-		 * bench reader can reach it over the wire (run14 P6: ~3.5s
-		 * post-reset) -- reading raw, not masked to [31:16], so bits [15:0]
-		 * (psa_fwu's own state) are visible too. */
-		return g_retention_aon_line2_boot;
+	/* case 11u handled above, before the persist_writable() guard -- it does
+	 * not touch g_persist at all (see that early return's own comment). */
 	case 12u:
 		/* #148: raw .TI.noinit retention pattern AS FOUND ON THE FIRST TICK
 		 * AFTER BOOT, latched into g_retention_magic_pair_boot before
 		 * bridge_transport_spi_probe_tick()'s own write ever ran -- see
-		 * g_persist.probe_magic_pair's declaration for what the three
-		 * read-back outcomes mean, and g_retention_latched's declaration for
-		 * why this must be a latch, not a live read.  Companion to case 11
-		 * above but in the OTHER retention domain (.TI.noinit/DRAM, not the
-		 * AON scratchpad). */
-		return g_retention_magic_pair_boot;
+		 * g_persist.probe_magic_pair's declaration for what the read-back
+		 * outcomes mean, and g_retention_magic_latched's declaration for why
+		 * this must be a latch, not a live read.  Companion to case 11 above
+		 * but in the OTHER retention domain (.TI.noinit/DRAM, not the AON
+		 * scratchpad).  #148 review fix item 6: sentinel, not 0, if read
+		 * before this boot's first probe tick has latched anything. */
+		return g_retention_magic_latched ? g_retention_magic_pair_boot
+		                                 : CC3501E_PROBE_SENTINEL_UNLATCHED;
 	default:
 		break;
 	}

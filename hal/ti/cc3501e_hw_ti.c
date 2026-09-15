@@ -719,8 +719,9 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
  * PowerWFF3_getResetReason() answers PowerWFF3_RESET_PIN_POR for a SYSRESETREQ on
  * this part, so the SDK accessor reports `power-on` after a CMD_RESET (bench-
  * measured on GPE 0.149.89.0 and again on 0.149.90.0).  The firmware does know it
- * asked for the reset, so it records that in RAM the reset does not clear and
- * cc3501e_hw_reset_cause() reads it back.
+ * asked for the reset, so it records that in a .TI.noinit struct the C startup
+ * does not clear, and cc3501e_hw_reset_cause() reads it back -- whether the
+ * SYSRESETREQ itself leaves that RAM intact is unmeasured; see the WARNING above.
  *
  * .TI.noinit is the section the transport's wedge-recovery state already uses --
  * placed into DRAM_NON_SECURE by ti/build_ti.ps1's linker patch, and never
@@ -733,10 +734,10 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
  * would BusFault -> hard fault -> boot loop.  A skipped marker only costs the
  * old, wrong `power-on` answer.
  *
- * The one misreport this can produce is a power cut in the microseconds between
- * arming and NVIC_SystemReset(), if that RAM then survives the outage: the next
- * cold boot would claim `soft`.  Consuming the marker on the first read keeps it
- * to that single boot. */
+ * A second misreport, besides the unmeasured-retention one above: a power cut
+ * in the microseconds between arming and NVIC_SystemReset(), if that RAM then
+ * survives the outage, would make the next cold boot claim `soft`.  Consuming
+ * the marker on the first read keeps it to that single boot. */
 #define CC3501E_SOFT_RESET_MAGIC 0x5253464Cu /* "LFSR" LE -- Left From Software Reset */
 
 static struct {
