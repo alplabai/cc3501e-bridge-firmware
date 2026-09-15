@@ -46,6 +46,7 @@
 #include "cc3501e_hw_ti_internal.h" /* reply_drained / ota_reboot_pending / ota_reboot_rc / cc3501e_hw_ota_pump */
 #include "transport.h" /* bridge_transport_spi_hw_reinit (Wlan_Start DMA-coexistence fix);
                         * cc3501e_bridge_busy -- READY driven LOW from init (#17) */
+#include "../../src/link_quiet_rearm.h" /* #142: the pure once-per-episode quiet-rearm decision */
 
 /* Bridge SPI desync counter (transport_hw_ti_spi.c): increments each time the
  * slave re-arms the header phase on a reserved-range/0xA5 header (a misframe).
@@ -436,61 +437,11 @@ void cc3501e_hw_tick(void)
 	}
 #endif
 
-	/* === Bridge SPI open-failure recovery (#1610) ===
-	 * The two self-heals below both key off counters (g_resync_count,
-	 * g_arm_fail_count) that can only move while the slave HAS a handle.  If every
-	 * SPI_open retry failed there is no handle at all: no transfers, no arm
-	 * attempts, both counters frozen, and the link is dead with nothing watching.
-	 *
-	 * That is what killed windowed OTA on silicon -- the shared DMA is briefly busy
-	 * after a psa_fwu flash burst, and re-arming after every window flush rolls that
-	 * dice ~67 times for a 1.09 MB image.  Losing once was permanent.  Retry here so
-	 * a busy-DMA open failure is a stall, not a death. */
-	if (bridge_transport_spi_is_dead()) {
-		bridge_transport_spi_hw_reinit();
-	}
-
-	/* === Bridge SPI FIFO-flush recovery (cold-framing self-heal) ===
-	 * The transport is hardware-SS0 framed (dwc-ssi drives SS0 per transfer), but a
-	 * cold first contact can still leave a 1-byte frame offset (RX FIFO residue from
-	 * the master over-clocking during a desync); it cannot self-correct by more
-	 * clocking -- it persists until the FIFO is flushed.  g_resync_count bursts
-	 * while the slave is stuck re-arming garbage (each misframed header reads the
-	 * 0xA5 idle, which is in the reserved cmd range -> re-arm++).  A burst within
-	 * one ~10 ms housekeeping tick = the link is stuck: do a full SPI re-open
-	 * (SPI_close/open) which FLUSHES the RX FIFO + DMA and re-arms a fresh header.
-	 * If this lands in the host's inter-PING gap the slave's fresh RX then aligns
-	 * with the host's next 4-byte transfer.  Healthy traffic uses valid (cmd<0x80)
-	 * headers and does not bump g_resync_count, so this never fires when aligned. */
-	static uint32_t last_resync;
-	const uint32_t  rc = g_resync_count;
-	if ((uint32_t)(rc - last_resync) >= 3u) {
-		bridge_transport_spi_hw_reinit(); /* flush FIFO+DMA, re-arm clean */
-		last_resync = 0u;                 /* reinit zeroes g_resync_count */
-	} else {
-		last_resync = rc;
-	}
-
-	/* === Bridge SPI arm-failure recovery (#1133) ===
-	 * Unlike a desync (which can self-clear once the host's byte-walk lands
-	 * on a boundary), a failed SPI_transfer() arm leaves NOTHING pending --
-	 * no callback will ever fire to retry it, so even ONE failure is a
-	 * permanent wedge.  Recover on the very next tick rather than waiting
-	 * for a burst. */
-	static uint32_t last_arm_fail;
-	const uint32_t  af = g_arm_fail_count;
-	if (af != last_arm_fail) {
-		bridge_transport_spi_hw_reinit(); /* fresh SPI_close/open, re-arm clean */
-		last_arm_fail = af;
-	}
-
-	/* === Bridge SPI reply-stall recovery ===
-	 * A transaction abandoned AFTER the slave armed its reply leaves that
-	 * transfer armed forever, and both self-heals above are blind to it (no
-	 * misframing, no failed arm).  Same reinit recovery. */
-	if (bridge_transport_spi_phase_stalled()) {
-		bridge_transport_spi_hw_reinit();
-	}
+	/* #142: the four SPI self-heals (dead handle, resync burst, arm failure,
+	 * reply stall) plus the quiet-armed detector now live in
+	 * cc3501e_hw_link_heal() below, called from here with in_connect_wait =
+	 * false -- see that function's own comment. */
+	cc3501e_hw_link_heal(false);
 
 	/* Deferred self-reset, gated on reply_drained so the CMD_RESET ack has
 	 * FULLY clocked to the host before the chip resets (audit
@@ -531,6 +482,221 @@ void cc3501e_hw_tick(void)
 		 * the host can distinguish "refused" from "never fired" via OTA_STATUS. */
 		ota_reboot_rc = (int8_t)psa_fwu_request_reboot();
 	}
+}
+
+/* #142: how long the slave may sit parked at PH_REQ_HEADER, quiet, before
+ * the quiet-armed detector treats it as an armed-but-deaf wedge rather than
+ * an ordinarily-idle host.  Long enough that the host's own worst-case
+ * WIFI_STATUS poll gap (50 ms) is nowhere close; short enough to recover
+ * well inside the ~70 s a WIFI_CONNECT body can otherwise hold the bring-up
+ * task. */
+#define CC3501E_LINK_QUIET_REARM_MS 3000u
+
+/* #142: count of quiet-rearm heals fired -- single writer
+ * (cc3501e_hw_link_heal(), always on the bring-up task, never an ISR or a
+ * second task), so a plain non-volatile counter is enough.  NOT wired onto
+ * the wire: no existing GET_DIAG_INFO/OTA_STATUS reserved field has spare
+ * room without a protocol MAJOR bump (see ALP_CC3501E_PROTOCOL_MAJOR's own
+ * guard in <alp/protocol/cc3501e.h>), out of scope for this fix -- exposed
+ * instead through the bench-only diag loglevel selector 10 (hal/ti/
+ * transport_hw_ti_spi.c's bridge_transport_spi_probe_read(),
+ * CC3501E_WEDGE_PROBE only). */
+static uint32_t g_quiet_rearm_heal_count;
+
+uint32_t cc3501e_hw_link_quiet_rearm_count(void)
+{
+	return g_quiet_rearm_heal_count;
+}
+
+#if !defined(CC3501E_CONTROL_TRANSPORT_SDIO)
+/* #142 item 2 (host review of dfd5280): per-CALL gating for the quiet-armed
+ * detector, on top of link_quiet_rearm.h's own per-EPISODE latch.
+ *
+ * quiet_arm_after_xfer_count: snapshotted by cc3501e_hw_link_heal_begin_
+ * connect(), called from cc3501e_hw_wifi_connect_sta() right after that
+ * body's own role-up reinit (or at the same point if no reinit ran).  The
+ * detector may not even be CONSULTED until bridge_transport_spi_xfer_
+ * count() has moved past this snapshot -- i.e. until at least one REAL host
+ * transfer has landed in THIS connect attempt.  Closes (does not fully
+ * close -- see the remaining-risk paragraph in link_quiet_rearm.h) the gap
+ * where 3 s of quiet_ms alone does not prove a deaf slave: the host can
+ * legitimately stop polling mid-body (examples/aen/aen-cc3501e-wedge-
+ * postmortem does exactly this on purpose, with a 2000 ms connect timeout
+ * then deliberate silence, to capture a wedge for forensics) -- requiring
+ * evidence the slave was ALREADY answering something in this very attempt
+ * makes that captured-wedge scenario much less likely to be mistaken for
+ * one this detector should "cure".
+ *
+ * quiet_fired_this_call: also reset by cc3501e_hw_link_heal_begin_connect().
+ * Caps the detector to AT MOST ONE fire per cc3501e_hw_wifi_connect_sta()
+ * call, independent of (and in addition to) the episode latch -- so even if
+ * a real transfer clears the episode latch mid-call and a second wedge
+ * follows in the SAME call, this detector still does not reinit twice in
+ * one connect attempt. */
+static uint32_t quiet_arm_after_xfer_count;
+static bool     quiet_fired_this_call;
+#endif
+
+void cc3501e_hw_link_heal_begin_connect(void)
+{
+#if !defined(CC3501E_CONTROL_TRANSPORT_SDIO)
+	quiet_arm_after_xfer_count = bridge_transport_spi_xfer_count();
+	quiet_fired_this_call      = false;
+#endif
+}
+
+/* #142 (host review of b3dc1e2): the SPI self-heal checks, factored into ONE
+ * function so it can be called from BOTH cc3501e_hw_tick() (the idle-tick
+ * path, @p in_connect_wait = false) AND from inside
+ * cc3501e_hw_wifi_connect_sta()'s own wait points (@p in_connect_wait =
+ * true) -- see that function's call sites (hal/ti/cc3501e_hw_ti_wifi.c) for
+ * exactly which windows and why each is safe to reinit in.
+ *
+ * REJECTED FIRST DESIGN (b3dc1e2): an independent 10 ms FreeRTOS task called
+ * this unconditionally.  That let a reinit fire inside windows the rest of
+ * this codebase guarantees are reinit-free -- mid BLE_SCAN, inside
+ * Wlan_Start's host-off bracket, right after an OTA erase's quiesce(false),
+ * or simply on an ordinarily-idle host/console session -- because nothing
+ * about "called from a background task" proves the MOMENT it runs is safe.
+ * See src/link_quiet_rearm.h's own top comment for the full writeup,
+ * including the SECOND bug (host review of dfd5280) that shipped in the
+ * fix for the first one.
+ *
+ * The four heals below are UNCONDITIONAL regardless of @p in_connect_wait --
+ * each is evidence-based (a counter moved, a handle died, a reply stalled),
+ * not a blind timer, and they ran exactly this way, from cc3501e_hw_tick(),
+ * before this whole fix -- no behaviour change for the idle-tick path.  The
+ * quiet-armed detector is the ONLY part gated on @p in_connect_wait: it is a
+ * blind timer (3 s of silence), and firing it from the unconditional idle
+ * tick is exactly what the rejected design got wrong.  NONE of these four
+ * calls bridge_transport_spi_hw_reinit() with a preceding cc3501e_bridge_
+ * busy() -- unlike the quiet-armed detector below, and unlike some (not
+ * all -- see that reinit's own comment) other reinit call sites in this
+ * file family. */
+void cc3501e_hw_link_heal(bool in_connect_wait)
+{
+	/* === Bridge SPI open-failure recovery (#1610) ===
+	 * The two self-heals below both key off counters (g_resync_count,
+	 * g_arm_fail_count) that can only move while the slave HAS a handle.  If every
+	 * SPI_open retry failed there is no handle at all: no transfers, no arm
+	 * attempts, both counters frozen, and the link is dead with nothing watching.
+	 *
+	 * That is what killed windowed OTA on silicon -- the shared DMA is briefly busy
+	 * after a psa_fwu flash burst, and re-arming after every window flush rolls that
+	 * dice ~67 times for a 1.09 MB image.  Losing once was permanent.  Retry here so
+	 * a busy-DMA open failure is a stall, not a death. */
+	if (bridge_transport_spi_is_dead()) {
+		bridge_transport_spi_hw_reinit();
+	}
+
+	/* === Bridge SPI FIFO-flush recovery (cold-framing self-heal) ===
+	 * The transport is hardware-SS0 framed (dwc-ssi drives SS0 per transfer), but a
+	 * cold first contact can still leave a 1-byte frame offset (RX FIFO residue from
+	 * the master over-clocking during a desync); it cannot self-correct by more
+	 * clocking -- it persists until the FIFO is flushed.  g_resync_count bursts
+	 * while the slave is stuck re-arming garbage (each misframed header reads the
+	 * 0xA5 idle, which is in the reserved cmd range -> re-arm++).  A burst within
+	 * one ~10 ms housekeeping tick (the idle-tick path) OR one connect-body wait
+	 * slice (the in_connect_wait path, <= 100 ms apart) = the link is stuck: do a
+	 * full SPI re-open (SPI_close/open) which FLUSHES the RX FIFO + DMA and
+	 * re-arms a fresh header.  If this lands in the host's inter-PING gap the
+	 * slave's fresh RX then aligns with the host's next 4-byte transfer.  Healthy
+	 * traffic uses valid (cmd<0x80) headers and does not bump g_resync_count, so
+	 * this never fires when aligned. */
+	static uint32_t last_resync;
+	const uint32_t  rc = g_resync_count;
+	if (rc < last_resync) {
+		/* #142 item 4 (host review of dfd5280), pre-existing but more exposed
+		 * now that this function runs far more often: g_resync_count can be
+		 * ZEROED by a DIFFERENT reinit (bridge_transport_spi_hw_reinit() ->
+		 * spi_open_and_arm() unconditionally resets it) between two calls of
+		 * this function -- the dead-handle recovery just above, on this SAME
+		 * call; the quiet-armed detector below; or the connect body's own
+		 * role-up reinit.  Without this guard, (uint32_t)(rc - last_resync)
+		 * with rc now SMALLER than the stale last_resync wraps to ~4e9,
+		 * reads as ">= 3u", and fires a SPURIOUS reinit -- with NO busy()
+		 * first, unlike a role-up/connect-success reinit -- while the host
+		 * may be mid-poll.  Resync last_resync to the new, lower rc instead
+		 * of comparing against a baseline that reinit already invalidated. */
+		last_resync = 0u;
+	}
+	if ((uint32_t)(rc - last_resync) >= 3u) {
+		bridge_transport_spi_hw_reinit(); /* flush FIFO+DMA, re-arm clean */
+		last_resync = 0u;                 /* reinit zeroes g_resync_count */
+	} else {
+		last_resync = rc;
+	}
+
+	/* === Bridge SPI arm-failure recovery (#1133) ===
+	 * Unlike a desync (which can self-clear once the host's byte-walk lands
+	 * on a boundary), a failed SPI_transfer() arm leaves NOTHING pending --
+	 * no callback will ever fire to retry it, so even ONE failure is a
+	 * permanent wedge.  Recover on the very next tick rather than waiting
+	 * for a burst. */
+	static uint32_t last_arm_fail;
+	const uint32_t  af = g_arm_fail_count;
+	if (af != last_arm_fail) {
+		bridge_transport_spi_hw_reinit(); /* fresh SPI_close/open, re-arm clean */
+		last_arm_fail = af;
+	}
+
+	/* === Bridge SPI reply-stall recovery ===
+	 * A transaction abandoned AFTER the slave armed its reply leaves that
+	 * transfer armed forever, and both self-heals above are blind to it (no
+	 * misframing, no failed arm).  Same reinit recovery. */
+	if (bridge_transport_spi_phase_stalled()) {
+		bridge_transport_spi_hw_reinit();
+	}
+
+#if !defined(CC3501E_CONTROL_TRANSPORT_SDIO)
+	/* === Quiet-armed recovery (#142) ===
+	 * SPI-transport-specific: #142 item 3 (host review of dfd5280).  An SDIO
+	 * build never opens the SPI slave at all, so bridge_transport_spi_
+	 * at_idle_header()/_quiet_ms() would report a permanently "quiet, idle"
+	 * slave that was never active in the first place -- reinitting a
+	 * transport that was never armed is meaningless at best.  Compiled OUT
+	 * entirely (not just runtime-gated) so an SDIO build carries none of
+	 * this state.
+	 *
+	 * See src/link_quiet_rearm.h's top comment for the full writeup.  ONLY
+	 * evaluated when called from cc3501e_hw_wifi_connect_sta()'s own wait
+	 * points -- never from the unconditional idle tick, so an ordinarily-
+	 * idle host/console session can never trip it -- AND ONLY after
+	 * cc3501e_hw_link_heal_begin_connect() has been called for this attempt
+	 * AND a real transfer has landed since (see quiet_arm_after_xfer_count's
+	 * own comment) AND no fire has already happened this call (quiet_fired_
+	 * this_call). */
+	if (!in_connect_wait) {
+		return;
+	}
+	if (quiet_fired_this_call) {
+		return;
+	}
+	if (bridge_transport_spi_xfer_count() == quiet_arm_after_xfer_count) {
+		return; /* not armed yet: no real transfer seen since this connect attempt began */
+	}
+
+	static link_quiet_rearm_state_t quiet_state;
+	const bool                      at_idle_header = bridge_transport_spi_at_idle_header();
+	const uint32_t                  xfer_count     = bridge_transport_spi_xfer_count();
+	const bool                      fire = link_quiet_rearm_tick(&quiet_state,
+	                                                             at_idle_header,
+	                                                             bridge_transport_spi_quiet_ms(),
+	                                                             CC3501E_LINK_QUIET_REARM_MS,
+	                                                             xfer_count);
+	if (fire) {
+		/* Unlike the four heals above (see this function's own top comment),
+		 * this DOES drop READY before the reinit -- a deliberate choice, not
+		 * a "matches every other site" claim (some do, some don't; see that
+		 * comment). */
+		cc3501e_bridge_busy();
+		bridge_transport_spi_hw_reinit();
+		g_quiet_rearm_heal_count++;
+		quiet_fired_this_call = true;
+	}
+#else
+	(void)in_connect_wait;
+#endif
 }
 
 /* Software-reset marker, retained across the warm reset (#111).

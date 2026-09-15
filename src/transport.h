@@ -159,6 +159,42 @@ uint8_t bridge_transport_spi_boot_mark(void);
 bool    bridge_transport_spi_poll_service(void);
 uint8_t bridge_transport_spi_phase(void);
 
+/* #142 item 9: named accessor for "is the phase machine parked at the idle
+ * request-header boundary (PH_REQ_HEADER)" -- the SAME contract
+ * bridge_transport_spi_phase()'s own 0-value already carries (that function
+ * is unchanged: still the raw enum value, reported over the wire via
+ * OTA_STATUS reserved[2]), but named here instead of leaving callers to
+ * compare against a bare 0 with a comment pointing at a "contract in
+ * transport.h" that was never actually written down as code.  The one
+ * caller is cc3501e_hw_link_heal()'s quiet-armed detector (hal/ti/
+ * cc3501e_hw_ti.c). */
+bool bridge_transport_spi_at_idle_header(void);
+
+/* #142: milliseconds since the slave last heard ANYTHING from the host, OR
+ * was itself last re-armed/torn down (spi_open_and_arm() and
+ * bridge_transport_spi_hw_release()/_hw_suspend() all stamp this too, not
+ * just the on_transfer() callback) -- see that stamp's own comment in
+ * hal/ti/transport_hw_ti_spi.c.  The sole reader is cc3501e_hw_link_heal()
+ * (hal/ti/cc3501e_hw_ti.c), and ONLY from cc3501e_hw_wifi_connect_sta()'s
+ * own wait points, never from the unconditional idle tick -- see that call
+ * path's own comments for the WHO/WHEN safety argument this relies on. */
+uint32_t bridge_transport_spi_quiet_ms(void);
+
+/* #142 item 1 (host review of dfd5280): count of REAL host-driven transfer
+ * completions -- bumped ONLY in on_transfer() (hal/ti/transport_hw_ti_spi.c),
+ * deliberately NOT in spi_open_and_arm()/_hw_release()/_hw_suspend() the way
+ * g_last_xfer_ms above is.  bridge_transport_spi_quiet_ms() resets on EITHER
+ * a real transfer OR the heal's own re-arm (by design, so a stale pre-flash
+ * stamp is never inherited) -- which means quiet_ms alone cannot tell
+ * "the host answered" from "we just re-armed ourselves", and using it to
+ * decide when the quiet-armed detector's own once-per-episode latch may
+ * clear let the detector's OWN reinit satisfy its OWN "did something change"
+ * check: 9 fires in 30 s against a genuinely deaf slave, measured.  This
+ * counter is the fix -- it only ever moves on host evidence, so the latch
+ * clears only when the host has actually answered something, never because
+ * the detector re-armed itself. */
+uint32_t bridge_transport_spi_xfer_count(void);
+
 /* Bridge READY/host-IRQ flow-control (the READY GPIO noted below).  Weak no-ops
  * in worker.c; the ti backend (cc3501e_hw_ti.c) drives a real GPIO -- CC35
  * GPIO17 / E1M IO16 -> Alif P2_6.  busy() = LOW (a radio op is running, the

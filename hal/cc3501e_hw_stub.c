@@ -28,6 +28,22 @@ void cc3501e_hw_tick(void)
 	/* no-op on the stub backend */
 }
 
+void cc3501e_hw_link_heal(bool in_connect_wait)
+{
+	/* no-op on the stub backend -- no real SPI slave to heal (#142) */
+	(void)in_connect_wait;
+}
+
+void cc3501e_hw_link_heal_begin_connect(void)
+{
+	/* no-op on the stub backend (#142 item 2) */
+}
+
+uint32_t cc3501e_hw_link_quiet_rearm_count(void)
+{
+	return 0u;
+}
+
 void cc3501e_hw_wifi_boot_start(void)
 {
 	/* No radio on the host stub -- nothing to bring up at boot. */

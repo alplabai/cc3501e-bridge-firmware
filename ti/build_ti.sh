@@ -191,6 +191,14 @@ cflags+=("-DCC3501E_BRIDGE_FW_VERSION_U16=$fw_u16")
 txdef=(-DCC3501E_WIRE_CRC=$WIRE_CRC)
 [ "$TRANSPORT" = sdio ] && txdef+=(-DCC3501E_CONTROL_TRANSPORT_SDIO=1)
 [ "$OTA_SELFTEST" = 1 ] && txdef+=(-DCC3501E_OTA_SELFTEST)
+# Bench wedge-probe instrumentation (#1691) -- OFF by default, opt in with the
+# env var, mirroring build_ti.ps1's `if ($env:CC3501E_WEDGE_PROBE)` (line
+# ~224).  This script had NO hook for it at all: run13 (#142 bench follow-up)
+# built with CC3501E_WEDGE_PROBE set in the environment expecting the .ps1's
+# behaviour, got a plain unguarded build instead, and the resulting map/`nm`
+# had 0 probe symbols.  `${VAR:-}` (not bare `$CC3501E_WEDGE_PROBE`) because
+# this script runs under `set -u`; an unset var must not abort the build.
+[ -n "${CC3501E_WEDGE_PROBE:-}" ] && txdef+=(-DCC3501E_WEDGE_PROBE=1)
 
 ntDir="$SDK_DIR/examples/rtos/LP_EM_CC35X1/demos/network_terminal"
 if [ "$WIFI_HOST_DRIVER" = 1 ]; then

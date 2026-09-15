@@ -687,6 +687,60 @@ bool bridge_transport_spi_phase_stalled(void)
 	return (uint32_t)(cc3501e_hw_uptime_ms() - reply_armed_ms) > CC3501E_REPLY_STALL_MS;
 }
 
+/* ---- Quiet-armed detector (#142, host review of b3dc1e2) -----------------
+ *
+ * The stall watchdog above only ever watches an ARMED reply/payload phase --
+ * PH_REQ_HEADER is deliberately excluded because it is the legitimate idle
+ * state, waiting for the host's next request, and can wait forever.  That is
+ * the blind spot cc3501e_hw_link_heal()'s quiet-armed detector closes (see
+ * hal/ti/cc3501e_hw_ti.c and src/link_quiet_rearm.h): a slave armed in
+ * PH_REQ_HEADER whose DMA never actually completes looks IDENTICAL to a
+ * healthy, quietly-idle link from every other self-heal.
+ *
+ * g_last_xfer_ms stamps every on_transfer() ENTRY (below) -- i.e. every time
+ * a phase transfer-complete callback fires, whether it advanced the phase
+ * machine, re-armed the header on a bad frame, or was a CANCELED/failed-arm
+ * bounce -- AND every spi_open_and_arm()/bridge_transport_spi_hw_release()/
+ * _hw_suspend() (a deliberate re-arm or teardown is itself evidence the
+ * quiet clock should restart, not carry forward a stamp from before it).
+ * That second half is load-bearing: the REJECTED first design (b3dc1e2) only
+ * stamped on_transfer(), so a reinit fired right after an OTA erase's
+ * quiesce(false) could inherit a last-xfer stamp tens of seconds stale from
+ * BEFORE the flash op and read as "already wedged" the instant it re-armed.
+ *
+ * bridge_transport_spi_quiet_ms() is therefore "how long since the slave
+ * last heard ANYTHING from the host, or was itself last touched" -- the one
+ * signal none of the other self-heals compute.  Its sole caller is
+ * cc3501e_hw_link_heal(), and ONLY from cc3501e_hw_wifi_connect_sta()'s own
+ * wait points -- never from the unconditional idle tick.  See that call
+ * path's own comments (hal/ti/cc3501e_hw_ti_wifi.c) for the WHO/WHEN safety
+ * argument; this file only stamps and reports the raw quiet duration.
+ *
+ * g_xfer_count is the SEPARATE counter #142's host review of dfd5280 added:
+ * bumped ONLY here, in on_transfer(), never in spi_open_and_arm()/
+ * _hw_release()/_hw_suspend() the way g_last_xfer_ms is.  quiet_ms resetting
+ * on the heal's OWN re-arm is correct for deciding WHEN to fire (so a stale
+ * pre-flash stamp is never inherited), but it is the WRONG signal for
+ * deciding when the once-per-episode latch may clear: a reinit that just
+ * re-armed the header satisfies "quiet_ms dropped" against ITSELF, which let
+ * the detector clear its own latch and fire again ~rearm_ms later with zero
+ * real evidence anything changed -- measured against a genuinely deaf slave:
+ * 9 fires in 30 s.  g_xfer_count only ever moves on a REAL host-driven
+ * transfer, so src/link_quiet_rearm.h's latch now clears on THIS counter
+ * moving, never on quiet_ms alone. */
+static volatile uint32_t g_last_xfer_ms;
+static volatile uint32_t g_xfer_count;
+
+uint32_t bridge_transport_spi_quiet_ms(void)
+{
+	return (uint32_t)(cc3501e_hw_uptime_ms() - g_last_xfer_ms);
+}
+
+uint32_t bridge_transport_spi_xfer_count(void)
+{
+	return g_xfer_count;
+}
+
 #ifdef CC3501E_WEDGE_PROBE
 void bridge_transport_spi_probe_xfer(void); /* defined below; used here */
 #endif
@@ -698,6 +752,15 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 #endif
 	(void)h;
 	reply_armed = false; /* a phase completed -> nothing outstanding */
+	/* #142: this callback firing AT ALL is evidence the slave heard the host,
+	 * regardless of which phase or whether it was a clean advance, a bad-frame
+	 * re-arm, or a CANCELED/failed-arm bounce -- see g_last_xfer_ms's own
+	 * comment above bridge_transport_spi_quiet_ms().  g_xfer_count moves HERE
+	 * ONLY -- see that counter's own comment just above -- so it is real host
+	 * evidence, never something the heal's own reinit can satisfy against
+	 * itself. */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
+	g_xfer_count++;
 	/* A phase's transfer just ended -> the slave is momentarily NOT armed for the host's
 	 * next clock.  Drop READY so the host holds off until arm_transfer() re-raises it. */
 	cc3501e_bridge_busy();
@@ -1142,6 +1205,13 @@ static bool spi_open_and_arm(void)
 	 * clock at any moment. */
 	protocol_crc16_table_init();
 
+	/* #142: a fresh open/re-arm is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms().  Stamped BEFORE arm_request_header()
+	 * so quiet_ms reads ~0 from the moment this function returns, not from
+	 * whatever traffic (or silence) preceded this open. */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
+
 	return arm_request_header();
 }
 
@@ -1172,6 +1242,10 @@ void bridge_transport_spi_hw_release(void)
 	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
 	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
 	reply_armed = false;
+	/* #142: a deliberate teardown is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms(). */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
 }
 
 /* Re-open + re-arm the bridge slave after a radio op (boot Wlan_Start or a
@@ -1190,6 +1264,17 @@ void bridge_transport_spi_hw_release(void)
 uint8_t bridge_transport_spi_phase(void)
 {
 	return (uint8_t)phase;
+}
+
+/* #142 item 9: named accessor for the PH_REQ_HEADER == 0 contract -- see
+ * transport.h's own doc comment on this function.  bridge_transport_spi_
+ * phase() itself is UNCHANGED (still the raw wire value); this is a second,
+ * self-documenting way to ask the one question cc3501e_hw_link_heal() (hal/
+ * ti/cc3501e_hw_ti.c) actually needs answered, without a bare `== 0u` at the
+ * call site. */
+bool bridge_transport_spi_at_idle_header(void)
+{
+	return phase == PH_REQ_HEADER;
 }
 
 bool bridge_transport_spi_hw_reinit(void)
@@ -1260,6 +1345,10 @@ void bridge_transport_spi_hw_suspend(void)
 	 * 10 ms, re-rolled spi_open_and_arm()'s 12-attempt open dice each time,
 	 * and blocked the bring-up task for up to 123 ms a go.  Issue #5. */
 	reply_armed = false;
+	/* #142: a deliberate teardown is itself evidence the quiet clock should
+	 * restart -- see g_last_xfer_ms's own comment above
+	 * bridge_transport_spi_quiet_ms(). */
+	g_last_xfer_ms = cc3501e_hw_uptime_ms();
 }
 
 void bridge_transport_spi_hw_init(void)
@@ -1408,16 +1497,19 @@ void bridge_transport_spi_probe_tick(void)
  * CH12/CH13 and SPI RIS registers do not fit.  Rather than widen
  * GET_DIAG_INFO's fixed payload, the recorded log level doubles as a selector:
  *
- *   alp companion diag log-level 0  -> the packed summary (default)
- *   alp companion diag log-level 1  -> raw SPI RIS
- *   alp companion diag log-level 2  -> raw CH12STA
- *   alp companion diag log-level 3  -> raw CH13STA
- *   alp companion diag log-level 4  -> raw SOC_AON ERRSRIS
- *   alp companion diag log-level 5  -> boots (retention witness)
- *   alp companion diag log-level 6  -> HOSTMCU_AON.CFGWDT   (watchdog config)
- *   alp companion diag log-level 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
- *   alp companion diag log-level 8  -> ADC internal temp: [15:0] raw, [31:16] count
- *   alp companion diag log-level 9  -> ADC probe status (open/convert bits)
+ *   alp companion diag loglevel 0  -> the packed summary (default)
+ *   alp companion diag loglevel 1  -> raw SPI RIS
+ *   alp companion diag loglevel 2  -> raw CH12STA
+ *   alp companion diag loglevel 3  -> raw CH13STA
+ *   alp companion diag loglevel 4  -> raw SOC_AON ERRSRIS
+ *   alp companion diag loglevel 5  -> boots (retention witness)
+ *   alp companion diag loglevel 6  -> HOSTMCU_AON.CFGWDT   (watchdog config)
+ *   alp companion diag loglevel 7  -> HOSTMCU_AON.ELPTMREN (LP timer enable)
+ *   alp companion diag loglevel 8  -> ADC internal temp: [15:0] raw, [31:16] count
+ *   alp companion diag loglevel 9  -> ADC probe status (open/convert bits)
+ *   alp companion diag loglevel 10 -> #142 quiet-rearm heal count (cc3501e_hw_
+ *                                     link_quiet_rearm_count()) -- next free
+ *                                     selector, no wire change
  *
  * 0x71 had no effect at all before (#52 made it merely RECORDED); giving it a
  * use in a bench-only build costs nothing and makes these registers readable
@@ -1471,6 +1563,12 @@ uint32_t bridge_transport_spi_probe_read(void)
 		/* ADC probe status: bit31 tried, bit30 open-ok, bit29 convert-ok,
 		 * low 16 = successful converts.  Zero-initialised (.bss). */
 		return g_adc_probe_stat;
+	case 10u:
+		/* #142: quiet-rearm heals fired since boot (cc3501e_hw_ti.c's
+		 * g_quiet_rearm_heal_count) -- how many times the connect-body's
+		 * quiet-armed detector actually fired a reinit.  Zero on a build/boot
+		 * that never took this path at all. */
+		return cc3501e_hw_link_quiet_rearm_count();
 	default:
 		break;
 	}
