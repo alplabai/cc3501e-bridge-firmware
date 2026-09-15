@@ -148,8 +148,11 @@ highest of:
 - the stamps in `prebuilt/CHANGELOG.md` if you ever flashed a published artifact.
 
 **If a unit has been used for OTA or flash iteration, assume its floor is high.**
-Bench units here sit around `0.149.x.x`. A part flashed at `0.254.0.0` has a
-floor of `0.254.0.0`, and every later image must be `>= 0.254.0.0`.
+e1m-aen-evk-01, for example, sits at `0.254.14.0` as of this writing
+(`prebuilt/BUILT_FROM`'s FLASHING LOG). A part flashed at `0.254.14.0` has a
+floor of `0.254.14.0`, and every later image must be `> 0.254.14.0` -- check
+the current log rather than reusing this number, it moves with every bench
+run.
 
 ---
 

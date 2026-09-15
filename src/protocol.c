@@ -29,13 +29,16 @@
  *     GET_DIAG_INFO / DIAG_GET_STATS handlers in protocol_diag.c read
  *     them via protocol_internal.h's extern declarations.
  *
- * Scope: protocol_dispatch() below routes 52 opcodes -- META, Wi-Fi,
+ * Scope: protocol_dispatch() below routes 55 opcodes -- META, Wi-Fi,
  * BLE, sockets, GPIO proxy, SPI1 host passthrough, camera enables, power
  * policy, diagnostics (including GET_PENDING_EVENTS) and OTA -- onto the
  * per-family handlers,
  * which reach TI's CC35xx Wi-Fi / NimBLE / lwIP / psa_fwu APIs through
  * the HAL backend.  Routed is not proven: BRINGUP_STATUS.md records what
- * is silicon-validated, and sockets do NOT connect (alp-sdk#1746).
+ * is silicon-validated.  Sockets now connect end-to-end (fixed
+ * 2026-08-31, #89 + alp-sdk#1872/#1873; alp-sdk#1746 closed) -- that
+ * closure evidence is from the earlier wire-7/v0.5.1-era build and has
+ * not yet been re-soaked on the shipping wire-4.0 bits.
  *
  * The rejection contract is unchanged and still load-bearing: an opcode
  * this firmware does not implement is answered with

@@ -6,7 +6,7 @@ Copyright 2026 Alp Lab AB
 # CC3501E bridge bring-up status
 
 Status of the Alif Ensemble E8 (M55-HE) <-> CC3501E (CC35X1E) SPI bridge on
-the E1M-AEN801 bench. Updated 2026-08-28.
+the E1M-AEN801 bench. Updated 2026-08-31.
 
 This is the consolidated on-silicon record for the **link / Wi-Fi / BLE**
 pillars. The authoritative topology is the hardware-framed SPI bridge described
@@ -22,7 +22,7 @@ only producers so far (see § 4).
 |---|---|---|
 | **Inter-chip link** (PING / GET_VERSION / GET_MAC / RESET) | PASS, cold + warm | Hardware SS0 + READY framing is bench-validated on E1M-AEN801; `ver` remains responsive after radio ops. |
 | **Wi-Fi GET_MAC / scan / RSSI** | PASS | Real scan records with security decode validated through the bridge. |
-| **Wi-Fi connect-STA** | PASS | Async connect survives the bridge; re-confirmed 2026-08-28 on fw 0.4.0 (`state: connected`, `rssi=-35 dBm`, DHCP lease). Association is INTERMITTENT in practice -- several attempts returned `wifi connect ... timed out` or `-5` and needed a cold cycle. |
+| **Wi-Fi connect-STA** | PASS, DHCP measured | Association survives the bridge. The v0.8.0 re-cut fixed the two mechanisms that were costing DHCP leases (station power-save across DHCP, lwIP retransmit backoff) -- measured on `e1m-aen-evk-01` at -80/-81 dBm, cold-cycled between attempts: address inside the connect call **12 of 16** (was ~1 in 4), address by any route **14 of 16**. **Residual, stated plainly:** 1 of 16 still failed at `REQUESTING`/`tries = 3`, and 1 further attempt hit the separate first-radio-op scan wedge (see `prebuilt/CHANGELOG.md`'s v0.8.0 entry). |
 | **Sockets** | **PASS - 10/10 end-to-end** (fixed 2026-08-31) | `sock tcp-get` now completes 10 of 10 consecutive trials against a bare `accept()` listener, zero `send failed`. Two defects, both closed: (1) no request identity on `SOCK_SEND`, so `poll_by_repeat()`'s byte-identical retry hit `WORKER_IDLE` and re-transmitted the payload -- fixed by a `seq` byte at offset 3 (the old `reserved`), wire protocol 5 -> 7, #89 + alp-sdk#1872, taking it to 6/10 with zero `-4` timeouts; (2) the host's blind 40 us `CC3501E_PHASE_SETTLE_US` raced this side's re-arm, so the request payload landed short and this firmware correctly rejected it with `RESP_ERR_INVALID` -- fixed HOST-side at 250 us (alp-sdk#1873), taking it to 10/10. Nothing in `src/protocol_sockets.c` needed changing for (2); the length check was right all along. **Still open:** socket RX stalls around 2 kB, and 250 us is an empirical upper bound paid per payload phase, so it is a throughput tax on anything that streams (alp-sdk#1677). |
 | **Soft-AP** | PASS (fixed 2026-08-28, fw 0.4.1) | A real second radio (Intel AX200) associates from a cold boot -- **t+13s** WPA2, **t+13s** open, **t+20s** on the hold run -- and stays associated: **0 of 9** samples dropped across a 270 s hold, `connected` at t+291s at 93-94%, well past the ~100 s this issue was named for. `wifievt` steps 3 -> 4, the station event the broken build could never emit. **One live limitation:** a second `wifi ap` on a device already in AP role does NOT take (measured: no association across ~340 s, `wifievt` stuck at 3) -- cold-cycle between AP experiments, and do NOT use `ap-stop` to reset, it wedges the bridge (alp-sdk#1564). Root cause was `RoleUpApCmd_t.sta_limit` left at **0** by a zero-init, i.e. an AP permitted zero clients; it beaconed perfectly, which is why one radio could never tell the difference (alp-sdk#1562). `ap start` still returns `-4 unconfirmed` -- there is no AP status latch (alp-sdk#1385), so AP state is still checked out of band. |
 | **BLE** (enable / advertise / scan / connect + GATT scaffolding) | PASS for enable + real scan (re-confirmed 2026-08-28: 9-15 real advertisers) | NimBLE enable and `ble_gap_disc` scan validated with real advertisers; full runtime GATT/event parity remains v1.0 work. |
@@ -95,11 +95,11 @@ wrong, and following it bricks the link on any unit whose history you do not kno
 
 ### Open, with measurements
 
-- **Sockets do not connect (alp-sdk#1746).** See the TL;DR row. This is the single
-  biggest gap: the socket surface is documented and shipped but non-functional. Note
-  that #1562 turned out to be a zero-init field reaching the NWP; the socket path is
-  worth re-reading with the same suspicion, since `sock_open` succeeding while connect
-  never completes has that shape.
+- **Sockets now connect (alp-sdk#1746, closed).** See the TL;DR row -- fixed
+  2026-08-31 by a `seq` byte on `SOCK_SEND` (#89 + alp-sdk#1872) and the
+  host-side 250 us phase-settle widening (alp-sdk#1873), 10 of 10 end-to-end.
+  That evidence is from the earlier wire-7/v0.5.1-era build; it has not been
+  re-run against the shipping wire-4.0 bits.
 - **One BLE scan costs exactly 100 frame errors (alp-sdk#1754).** `frames ok=15 err=0`
   -> one `ble scan` -> `err=100`, then frozen at 100 while `ok` keeps climbing. The
   counter is a plain `uint32_t` with no saturation, so 100 is a real count -- a bounded
@@ -213,12 +213,12 @@ deassert callback double-advances the READY state machine.
 - **STA connect** is asynchronous and validated across the bridge: association
   no longer wedges the link, and a `GET_VERSION`/`ver` check after connect still
   responds.
-- **Socket APIs** are present on the wire but **do not connect** -- see the TL;DR
-  row and alp-sdk#1746. `sock tcp-get` cannot open a TCP connection to any
-  destination on fw 0.4.0/0.4.1 (LAN `-1` `ALP_ERR_INVAL`, public `-4`
-  `ALP_ERR_TIMEOUT`) while the same targets fetch fine from the host on the same
-  LAN, so this is not a network-availability caveat. A credentialed socket soak
-  is blocked on the connect path working at all.
+- **Socket APIs now connect** -- see the TL;DR row. `sock tcp-get` completes
+  10 of 10 consecutive trials against a bare `accept()` listener (fixed
+  2026-08-31, alp-sdk#1746 closed by #89 + alp-sdk#1872/#1873). That evidence
+  is from the earlier wire-7/v0.5.1-era build and has not yet been re-soaked
+  on the shipping wire-4.0 bits -- a credentialed socket soak on the current
+  build is still open work.
 
 ## 3. BLE
 
@@ -509,10 +509,10 @@ rollback, which earlier bench runs misread as a dead secure element.
    EVK, which is why it defaults off).
 2. **Full runtime GATT/event parity** - finish the v1.0 portable BLE event
    surface; the attention transport it needs already exists.
-3. **Sockets do not connect at all (alp-sdk#1746)** - unchanged in 0.4.1, and
-   a prerequisite for any credentialed socket soak. Worth re-reading the
-   connect path for the same defect class #1562 turned out to be: a field left
-   at its zero value reaching the NWP.
+3. **Re-soak the socket connect path on the shipping v0.8.0 wire-4.0 bits
+   (alp-sdk#1746 is closed, but not on this build)** - the 10/10 evidence is
+   from the earlier wire-7/v0.5.1-era build; a credentialed socket soak on
+   the current build has not been run.
 4. **OTA cold swap-boot** - repeat final swap validation on a correctly
    activated cold-bootable CC3501E unit.
 5. **`flash.py` real flashing** - now Alp-internal tooling (moved to

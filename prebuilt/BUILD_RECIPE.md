@@ -49,10 +49,15 @@ Two stages. Stage 1 needs the license-gated TI toolchain; stage 2 needs the
 license-gated TI Wi-Fi Toolbox **and** two Alp Lab bench-only assets that are
 deliberately not in this repository.
 
-**Stage 1 — compile + link (`ti/build_ti.ps1`).**
+**Stage 1 — compile + link (`ti/build_ti.ps1` on Windows, `ti/build_ti.sh` on
+Linux — equivalent paths).**
 
 ```
 build_ti.ps1 -Ble -AlpSdkRoot <alp-sdk checkout>
+# or, on Linux (CHANGELOG.md's v0.2.0/v0.3.0 entries already record this as
+# the command used, and it reproduces built-from's raw-sha256 bit for bit --
+# see "Evidence" below):
+ti/build_ti.sh --wifi --ble
 ```
 
 - `ticlang` 5.1.1, SysConfig 1.28.0, SimpleLink Wi-Fi SDK 10.10.01.08 (the
@@ -106,9 +111,18 @@ simplelink-wifi-toolbox flash-images-builder sign vendor_image \
   (`keys/alp_cc3501e_vendor_VALIDATION_public.pem`). This is a bench/staging
   key, not the production HSM key `ti/package_cc3501e_prod.ps1` uses.
 
-Reproducing the exact signed bytes therefore needs bench access this
-recipe's stage 2 cannot be run without. What stage 1 + the unsigned half of
-stage 2 *can* prove — and does — is that this is the right mechanism.
+**The mechanics of this recipe are fully reproducible wherever the VALIDATION
+signing module is staged** — measured 2026-09-15: stage 1 at `built-from`
+(`017e7cf`), via `ti/build_ti.sh --wifi --ble`, rebuilt `build/ti/cc3501e-bridge.bin`
+to `raw-sha256` `0e0664d74e56770b3f79818151bf72e3c54cb19b0a951d8dd10a1f3a3ac4ed90`
+— bit-exactly the value `prebuilt/BUILT_FROM` records — and stage 2 then
+wrapped and signed that `.out` at GPE `0.254.5.0`, differing from the shipped
+`prebuilt/cc3501e-v0.8.0.bin` in exactly 64 bytes, all inside offsets
+`1105602..1105668` (the ECDSA signature TLV tail): same size (`1105668`),
+same GPE stamp bytes, everything before offset `1105602` byte-identical. **What cannot be reproduced is the signature tail, and
+only because ECDSA `k` is random — not because the recipe needs bench
+access.** Reproducing those 64 bytes needs the private key, which is not in
+this repository (`keys/README.md`) and never will be.
 
 ## Evidence (issue #94)
 

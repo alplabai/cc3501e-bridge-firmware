@@ -8,7 +8,7 @@ framing they share.
 
 ## Command scope
 
-`protocol_dispatch()` (`src/protocol.c`) routes **49 opcodes** -- every
+`protocol_dispatch()` (`src/protocol.c`) routes **55 opcodes** -- every
 command family in the wire header: META, Wi-Fi station/AP/scan/status,
 BLE (enable, advertise, scan, connect, GATT), sockets, the GPIO proxy,
 camera enables, power policy, diagnostics + `GET_PENDING_EVENTS`, and OTA
@@ -26,8 +26,10 @@ else is worth reading until these four answer:
 | `RESET` (0x02) | ack `RESP_OK`, then HAL reboots after the ack is drained |
 
 Routed is not the same as proven: `BRINGUP_STATUS.md` records what is
-silicon-validated per pillar, and **sockets do not connect**
-(alp-sdk#1746).
+silicon-validated per pillar. Sockets now connect end-to-end (fixed
+2026-08-31, #89 + alp-sdk#1872/#1873; alp-sdk#1746 closed) -- that closure
+evidence is from the earlier wire-7/v0.5.1-era build and has not yet been
+re-soaked on the shipping wire-4.0 bits.
 
 What survives unchanged from the bring-up contract is the rejection rule:
 an opcode this firmware does not implement returns
