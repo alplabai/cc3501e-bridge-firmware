@@ -632,6 +632,53 @@ static void radio_speedtest_udp(void)
 }
 #endif
 
+/* fd-count for the per-fd tables below and for sock_eof further down.
+ * Declared HERE rather than beside sock_eof because the #136 retire loop
+ * runs at the top of cc3501e_hw_sock_pump(), which is earlier in this
+ * file than sock_eof is. */
+#define CC3501E_SOCK_EOF_MAX_FD MEMP_NUM_NETCONN
+
+/* #136 -- RETIRE-ON-COLLECT for the worker-routed recv.
+ *
+ * The worker path used to CONSUME bytes off the socket and rely on the
+ * single-entry reply cache in protocol_sockets.c to hand them to the host on
+ * a retry.  That cache holds one (seq, handle) entry, so a second handle's
+ * recv landing before the first handle's retry evicted the first entry and
+ * its bytes were gone -- the cross-handle loss this issue is about, pinned by
+ * tests/unit/sock_recv_worker_cache's
+ * test_cross_handle_interleave_is_a_documented_residual.
+ *
+ * Fixed by not consuming until the host demonstrably has the data: the read
+ * below uses MSG_PEEK, so the bytes stay in lwIP's own buffers and ANY later
+ * read on that fd -- a retry or a genuinely new request, indistinguishable at
+ * this layer -- returns the same bytes.  No replay flag is needed and no
+ * per-handle reply buffer: MSG_PEEK is idempotent.
+ *
+ * STREAM ONLY.  A datagram MSG_PEEK does not mean "same bytes next time" the
+ * way a byte-stream one does (lwIP's udp path treats the flag separately),
+ * so DGRAM keeps consuming on the first read exactly as before.
+ *
+ * WHY TWO TABLES AND NOT ONE.  The moment we learn the host has the bytes is
+ * the moment protocol_sockets.c serves the cached reply -- and that runs in
+ * DISPATCH context, which must never call lwIP (hal/cc3501e_hw.h states that
+ * constraint for this path outright).  So the retire is split: dispatch calls
+ * cc3501e_hw_sock_recv_collected(), which only moves a count between two
+ * words, and cc3501e_hw_sock_pump() -- task context, already the one place
+ * that does lwIP reads -- performs the consuming read on its next tick.
+ *
+ * CONCURRENCY.  sock_peek_len is written by the WORKER (the recv below) and
+ * read/cleared by DISPATCH; sock_peek_retire is written by DISPATCH and
+ * read/cleared by the PUMP.  Each word has exactly one writer per context
+ * pair and is only ever handed off in one direction, so no ordering barrier
+ * is required beyond volatile -- deliberately unlike rx_ring, whose
+ * head/tail/uncommitted are shared in BOTH directions (see the CONCURRENCY
+ * comment above it, and the publish-order bug that comment records).
+ *
+ * FIFO makes the retire exact: consuming N bytes takes the OLDEST N, which
+ * are precisely the ones that were peeked, even if more have arrived since. */
+static volatile uint16_t sock_peek_len[CC3501E_SOCK_EOF_MAX_FD];
+static volatile uint32_t sock_peek_retire[CC3501E_SOCK_EOF_MAX_FD];
+
 /* Retire bytes the host has already collected (#136).
  *
  * Runs at the TOP of the pump, BEFORE the ring's own early returns: the
@@ -984,49 +1031,8 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
  * library ships built from this same config header.  A real fd this table
  * ever sees is therefore always < MEMP_NUM_NETCONN by construction, never
  * merely by luck. */
-#define CC3501E_SOCK_EOF_MAX_FD MEMP_NUM_NETCONN
 static bool sock_eof[CC3501E_SOCK_EOF_MAX_FD];
 
-/* #136 -- RETIRE-ON-COLLECT for the worker-routed recv.
- *
- * The worker path used to CONSUME bytes off the socket and rely on the
- * single-entry reply cache in protocol_sockets.c to hand them to the host on
- * a retry.  That cache holds one (seq, handle) entry, so a second handle's
- * recv landing before the first handle's retry evicted the first entry and
- * its bytes were gone -- the cross-handle loss this issue is about, pinned by
- * tests/unit/sock_recv_worker_cache's
- * test_cross_handle_interleave_is_a_documented_residual.
- *
- * Fixed by not consuming until the host demonstrably has the data: the read
- * below uses MSG_PEEK, so the bytes stay in lwIP's own buffers and ANY later
- * read on that fd -- a retry or a genuinely new request, indistinguishable at
- * this layer -- returns the same bytes.  No replay flag is needed and no
- * per-handle reply buffer: MSG_PEEK is idempotent.
- *
- * STREAM ONLY.  A datagram MSG_PEEK does not mean "same bytes next time" the
- * way a byte-stream one does (lwIP's udp path treats the flag separately),
- * so DGRAM keeps consuming on the first read exactly as before.
- *
- * WHY TWO TABLES AND NOT ONE.  The moment we learn the host has the bytes is
- * the moment protocol_sockets.c serves the cached reply -- and that runs in
- * DISPATCH context, which must never call lwIP (hal/cc3501e_hw.h states that
- * constraint for this path outright).  So the retire is split: dispatch calls
- * cc3501e_hw_sock_recv_collected(), which only moves a count between two
- * words, and cc3501e_hw_sock_pump() -- task context, already the one place
- * that does lwIP reads -- performs the consuming read on its next tick.
- *
- * CONCURRENCY.  sock_peek_len is written by the WORKER (the recv below) and
- * read/cleared by DISPATCH; sock_peek_retire is written by DISPATCH and
- * read/cleared by the PUMP.  Each word has exactly one writer per context
- * pair and is only ever handed off in one direction, so no ordering barrier
- * is required beyond volatile -- deliberately unlike rx_ring, whose
- * head/tail/uncommitted are shared in BOTH directions (see the CONCURRENCY
- * comment above it, and the publish-order bug that comment records).
- *
- * FIFO makes the retire exact: consuming N bytes takes the OLDEST N, which
- * are precisely the ones that were peeked, even if more have arrived since. */
-static volatile uint16_t sock_peek_len[CC3501E_SOCK_EOF_MAX_FD];
-static volatile uint32_t sock_peek_retire[CC3501E_SOCK_EOF_MAX_FD];
 
 int cc3501e_hw_sock_recv(uint16_t  handle,
                          uint16_t  max_len,
