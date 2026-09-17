@@ -983,6 +983,12 @@ alp_cc3501e_resp_t handle_sock_recv(const uint8_t *req,
 			if (reply_cap < (size_t)g_sock_recv_wk_reply_len) return ALP_CC3501E_RESP_ERR_NO_MEM;
 			memcpy(reply_data, (const void *)g_sock_recv_wk_reply, g_sock_recv_wk_reply_len);
 			*reply_data_len = g_sock_recv_wk_reply_len;
+			/* #136: the bytes are now in the host's reply buffer, so the
+			 * worker's MSG_PEEK on this handle can finally be retired.
+			 * AFTER the NO_MEM check above, deliberately -- a reply that
+			 * did not fit was not delivered, and retiring it would lose
+			 * exactly the data this path exists to protect. */
+			cc3501e_hw_sock_recv_collected(handle);
 		}
 		return g_sock_recv_wk_status;
 	}

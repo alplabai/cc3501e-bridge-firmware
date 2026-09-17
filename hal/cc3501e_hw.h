@@ -626,6 +626,25 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
                          uint8_t   from_addr[4],
                          uint16_t *from_port_out);
 
+/* Tell the HAL the host has actually received the bytes the last
+ * cc3501e_hw_sock_recv() on @p handle returned, so they can be retired from
+ * the socket (#136).
+ *
+ * The worker-routed recv reads with MSG_PEEK on STREAM sockets and does NOT
+ * consume, so that a reply the host never collected -- because it timed out,
+ * or because another handle's recv evicted it from the single-entry reply
+ * cache -- can still be re-read byte-for-byte later instead of being lost.
+ * This call is what finally releases them.
+ *
+ * DISPATCH-SAFE BY CONTRACT: implementations must do no more than move a
+ * count between two words.  It is called from the SPI callback, where lwIP
+ * must never be touched; the actual consuming read happens later on
+ * cc3501e_hw_sock_pump()'s task context.
+ *
+ * Harmless to call when nothing is outstanding, and for a DGRAM handle (that
+ * path never peeks).  A no-op in HALs without a real socket stack. */
+void cc3501e_hw_sock_recv_collected(uint16_t handle);
+
 /* Release the socket (STREAM: issue the TCP teardown).  The handle is invalid
  * afterwards and the firmware may reuse its value. */
 int cc3501e_hw_sock_close(uint16_t handle);

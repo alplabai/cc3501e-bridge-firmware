@@ -632,8 +632,36 @@ static void radio_speedtest_udp(void)
 }
 #endif
 
+/* Retire bytes the host has already collected (#136).
+ *
+ * Runs at the TOP of the pump, BEFORE the ring's own early returns: the
+ * worker-routed path this serves has no ring by definition, so gating it on
+ * rx_ring.fd_plus1 would mean it never ran for the very handles that need it.
+ *
+ * The count is only decremented by what was actually consumed, and any
+ * remainder is put back -- if a read comes up short the bytes stay owed and
+ * the next tick finishes the job.  Clearing optimistically would leave them
+ * un-retired and a later peek would serve them to the host a SECOND time,
+ * which is the duplicate-data bug this whole path exists to avoid. */
+static void sock_retire_collected(void)
+{
+	for (int fd = 0; fd < CC3501E_SOCK_EOF_MAX_FD; fd++) {
+		uint32_t owed = sock_peek_retire[fd];
+		if (owed == 0u) continue;
+		uint8_t sink[128];
+		while (owed > 0u) {
+			const size_t  chunk = (owed < sizeof(sink)) ? (size_t)owed : sizeof(sink);
+			const ssize_t r     = lwip_recv(fd, sink, chunk, MSG_DONTWAIT);
+			if (r <= 0) break; /* short read -- leave the rest owed */
+			owed -= (uint32_t)r;
+		}
+		sock_peek_retire[fd] = owed;
+	}
+}
+
 void cc3501e_hw_sock_pump(void)
 {
+	sock_retire_collected();
 #ifdef CC3501E_RADIO_SPEEDTEST
 	radio_speedtest_udp(); /* runs whether or not the host armed a TCP socket */
 #endif
@@ -959,6 +987,47 @@ int cc3501e_hw_sock_recv_ring(uint16_t  handle,
 #define CC3501E_SOCK_EOF_MAX_FD MEMP_NUM_NETCONN
 static bool sock_eof[CC3501E_SOCK_EOF_MAX_FD];
 
+/* #136 -- RETIRE-ON-COLLECT for the worker-routed recv.
+ *
+ * The worker path used to CONSUME bytes off the socket and rely on the
+ * single-entry reply cache in protocol_sockets.c to hand them to the host on
+ * a retry.  That cache holds one (seq, handle) entry, so a second handle's
+ * recv landing before the first handle's retry evicted the first entry and
+ * its bytes were gone -- the cross-handle loss this issue is about, pinned by
+ * tests/unit/sock_recv_worker_cache's
+ * test_cross_handle_interleave_is_a_documented_residual.
+ *
+ * Fixed by not consuming until the host demonstrably has the data: the read
+ * below uses MSG_PEEK, so the bytes stay in lwIP's own buffers and ANY later
+ * read on that fd -- a retry or a genuinely new request, indistinguishable at
+ * this layer -- returns the same bytes.  No replay flag is needed and no
+ * per-handle reply buffer: MSG_PEEK is idempotent.
+ *
+ * STREAM ONLY.  A datagram MSG_PEEK does not mean "same bytes next time" the
+ * way a byte-stream one does (lwIP's udp path treats the flag separately),
+ * so DGRAM keeps consuming on the first read exactly as before.
+ *
+ * WHY TWO TABLES AND NOT ONE.  The moment we learn the host has the bytes is
+ * the moment protocol_sockets.c serves the cached reply -- and that runs in
+ * DISPATCH context, which must never call lwIP (hal/cc3501e_hw.h states that
+ * constraint for this path outright).  So the retire is split: dispatch calls
+ * cc3501e_hw_sock_recv_collected(), which only moves a count between two
+ * words, and cc3501e_hw_sock_pump() -- task context, already the one place
+ * that does lwIP reads -- performs the consuming read on its next tick.
+ *
+ * CONCURRENCY.  sock_peek_len is written by the WORKER (the recv below) and
+ * read/cleared by DISPATCH; sock_peek_retire is written by DISPATCH and
+ * read/cleared by the PUMP.  Each word has exactly one writer per context
+ * pair and is only ever handed off in one direction, so no ordering barrier
+ * is required beyond volatile -- deliberately unlike rx_ring, whose
+ * head/tail/uncommitted are shared in BOTH directions (see the CONCURRENCY
+ * comment above it, and the publish-order bug that comment records).
+ *
+ * FIFO makes the retire exact: consuming N bytes takes the OLDEST N, which
+ * are precisely the ones that were peeked, even if more have arrived since. */
+static volatile uint16_t sock_peek_len[CC3501E_SOCK_EOF_MAX_FD];
+static volatile uint32_t sock_peek_retire[CC3501E_SOCK_EOF_MAX_FD];
+
 int cc3501e_hw_sock_recv(uint16_t  handle,
                          uint16_t  max_len,
                          uint8_t  *buf,
@@ -1009,7 +1078,11 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	 * worker, and worker_run_pending() holds READY LOW across the whole job, so
 	 * no bridge frame of ANY opcode is served while it waits.  That is why 4000
 	 * became 50 -- not why it should become zero. */
-	const ssize_t n = lwip_recvfrom(fd, buf, want, 0, (struct sockaddr *)&from, &fromlen);
+	const bool stream = sock_is_stream(fd);
+	/* MSG_PEEK on STREAM -- see the sock_peek_len block comment above for why
+	 * the bytes must not be consumed here, and why DGRAM is excluded. */
+	const ssize_t n =
+	    lwip_recvfrom(fd, buf, want, stream ? MSG_PEEK : 0, (struct sockaddr *)&from, &fromlen);
 	if (n < 0) {
 		/* SO_RCVTIMEO expiry (EAGAIN / EWOULDBLOCK) is NOT an error at the wire: it
 		 * means "no data yet" -- report OK with 0 bytes so the host re-polls.  Any
@@ -1035,8 +1108,14 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	 * its own header for the want == 0 BLOCKER this specific check closes,
 	 * and the block comment above sock_eof for the ENOTCONN bug it was
 	 * originally written to close. */
-	if (sock_worker_recv_eof_should_latch((int)n, want, sock_is_stream(fd))) {
+	if (sock_worker_recv_eof_should_latch((int)n, want, stream)) {
 		sock_worker_recv_eof_set(sock_eof, CC3501E_SOCK_EOF_MAX_FD, fd, true);
+	}
+	/* #136: remember what is owed on this fd so a later collect can retire
+	 * it.  Overwriting a previous, uncollected count is correct -- the peek
+	 * is idempotent, so the newer read covers the same bytes. */
+	if (stream && n > 0 && fd < CC3501E_SOCK_EOF_MAX_FD) {
+		sock_peek_len[fd] = (uint16_t)n;
 	}
 	if (recv_len_out != 0) *recv_len_out = (uint16_t)n;
 	if (from.sin_family == AF_INET) {
@@ -1044,6 +1123,21 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 		if (from_port_out != 0) *from_port_out = lwip_ntohs(from.sin_port);
 	}
 	return CC3501E_HW_OK;
+}
+
+/* DISPATCH CONTEXT -- word writes only, never lwIP (see the sock_peek_len
+ * block comment).  Hands this fd's outstanding peek to the pump to retire.
+ * ACCUMULATES rather than overwrites: a second collect can land before the
+ * pump has drained the first, and both sets of bytes are owed. */
+void cc3501e_hw_sock_recv_collected(uint16_t handle)
+{
+	if (handle == 0u) return;
+	const int fd = (int)handle - 1;
+	if (fd < 0 || fd >= CC3501E_SOCK_EOF_MAX_FD) return;
+	const uint16_t owed = sock_peek_len[fd];
+	if (owed == 0u) return;
+	sock_peek_len[fd] = 0u;
+	sock_peek_retire[fd] += (uint32_t)owed;
 }
 
 int cc3501e_hw_sock_close(uint16_t handle)
@@ -1153,6 +1247,11 @@ int cc3501e_hw_sock_listen(uint16_t handle, uint8_t backlog)
 
 void cc3501e_hw_sock_pump(void)
 {
+}
+
+void cc3501e_hw_sock_recv_collected(uint16_t handle)
+{
+	(void)handle;
 }
 
 void cc3501e_hw_sock_accept_pump(void)

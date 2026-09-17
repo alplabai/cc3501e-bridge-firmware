@@ -393,6 +393,13 @@ int cc3501e_hw_sock_recv(uint16_t  handle,
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
+void cc3501e_hw_sock_recv_collected(uint16_t handle)
+{
+	/* No socket stack here, so nothing was ever peeked and nothing is owed
+	 * -- see hal/cc3501e_hw.h for the contract. */
+	(void)handle;
+}
+
 int cc3501e_hw_sock_bind(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4])
 {
 	(void)handle;
