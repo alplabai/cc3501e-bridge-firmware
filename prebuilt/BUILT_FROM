@@ -87,7 +87,17 @@ raw-sha256:   2a6f85c6b260fb4aa2f2e5edef8e9ef5cb1ddecdc6ebb8d86afdb676d8db9bdb
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.15.0 (measured 2026-09-15).
+# FLASHING LOG -- module E1M-AEN803 2026W36-0009 IS NOW AT 0.254.27.0 (2026-09-29).
+#
+# Keyed on the module serial, not the place (the GPE floor is per die).  Warm
+# programs that day, all on XDS110 L50015YR, each streaming the full vendor
+# image with rc 0: 0.254.19.0 and 0.254.21.0/0.254.23.0 dispatch-timing probe
+# builds, 0.254.20.0 clean origin/main --wifi --ble, 0.254.24.0 clean
+# origin/main --wifi, then 0.254.25.0 and 0.254.27.0 perf/bridge-hot-path-ram
+# --wifi (ON THE PART NOW).  Its previous floor was 0.254.18.0 (2026-09-17).
+# Anything at or below 0.254.27.0 is a rollback on that die.
+#
+# EARLIER ENTRY -- e1m-aen-evk-01 WAS AT 0.254.15.0 (measured 2026-09-15).
 #
 # That unit (module 2026W36-0003) was warm-programmed THREE TIMES that evening,
 # 0.254.2.0 -> 0.254.3.0 -> 0.254.4.0, the last streaming 1105668 bytes in

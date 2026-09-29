@@ -146,6 +146,57 @@ static void assert_reply_header(const uint8_t *r, uint8_t cmd, uint16_t payload_
 	              "reply payload_len (padded to CC3501E_REPLY_PAD)");
 }
 
+/* spi_slave_rx_frame() is what the TI backend now calls instead of replaying
+ * the frame a byte at a time; it must stage the SAME reply as the per-byte
+ * seams for a valid frame (a large STREAM_WRITE, the throughput case) and for
+ * one longer than the RX staging buffer, which both paths truncate. */
+static size_t reply_via_bytes(const uint8_t *f, size_t len, uint8_t *out, size_t cap)
+{
+	transport_spi_init();
+	transaction_raw(f, len);
+	return drain(out, cap);
+}
+
+static size_t reply_via_frame(const uint8_t *f, size_t len, uint8_t *out, size_t cap)
+{
+	transport_spi_init();
+	spi_slave_rx_frame(f, len);
+	return drain(out, cap);
+}
+
+ZTEST(cc3501e_bridge_transport, test_rx_frame_matches_per_byte_path)
+{
+	static uint8_t frame[CC3501E_FRAME_MAX_BYTES + 16u];
+	static uint8_t a[64], b[64];
+	const size_t   payload = 4000u;
+	const uint16_t wire    = (uint16_t)(payload + (size_t)ALP_CC3501E_CRC_BYTES);
+
+	frame[0] = ALP_CC3501E_CMD_STREAM_WRITE;
+	frame[1] = 0x00u;
+	frame[2] = (uint8_t)(wire & 0xFFu);
+	frame[3] = (uint8_t)(wire >> 8);
+	for (size_t i = 0; i < payload; i++) {
+		frame[ALP_CC3501E_HEADER_BYTES + i] = (uint8_t)(i * 7u);
+	}
+	uint16_t crc = alp_crc16_ccitt_false(frame, ALP_CC3501E_HEADER_BYTES + payload);
+	frame[ALP_CC3501E_HEADER_BYTES + payload]      = (uint8_t)(crc & 0xFFu);
+	frame[ALP_CC3501E_HEADER_BYTES + payload + 1u] = (uint8_t)(crc >> 8);
+
+	const size_t len = (size_t)ALP_CC3501E_HEADER_BYTES + wire;
+	size_t       na  = reply_via_bytes(frame, len, a, sizeof a);
+	size_t       nb  = reply_via_frame(frame, len, b, sizeof b);
+	zassert_true(na > 0u, "per-byte path staged a reply");
+	zassert_equal(na, nb, "same reply length");
+	zassert_mem_equal(a, b, na, "same reply bytes");
+	zassert_equal(b[ALP_CC3501E_HEADER_BYTES], ALP_CC3501E_RESP_OK, "STREAM_WRITE acked");
+
+	/* Longer than the staging buffer: both paths drop the excess. */
+	na = reply_via_bytes(frame, sizeof frame, a, sizeof a);
+	nb = reply_via_frame(frame, sizeof frame, b, sizeof b);
+	zassert_equal(na, nb, "same reply length when truncated");
+	zassert_mem_equal(a, b, na, "same reply bytes when truncated");
+}
+
 ZTEST(cc3501e_bridge_transport, test_ping_ok)
 {
 	const uint8_t ping[] = { ALP_CC3501E_CMD_PING, 0x00u, 0x00u, 0x00u };

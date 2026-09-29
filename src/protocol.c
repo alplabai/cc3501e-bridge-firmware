@@ -98,6 +98,11 @@
  * runnable check that this firmware's table-driven output and the
  * canonical bitwise alp_crc16_ccitt_false() agree on the same reply. */
 static uint16_t crc16_table[256];
+/* Slicing-by-4 companions (#2052 bridge throughput): crc16_table4[k][i] is
+ * crc16_table[i] advanced by k more zero bytes, so the update loop folds four
+ * request bytes per step instead of one.  Derived from crc16_table at init,
+ * so there is still exactly one source algorithm. */
+static uint16_t crc16_table4[3][256];
 static bool     crc16_table_ready;
 
 static void crc16_table_init(void)
@@ -110,6 +115,13 @@ static void crc16_table_init(void)
 		 * below folds that starting-from-zero entry against the CALLER's
 		 * running register, which is what makes the two forms equivalent. */
 		crc16_table[i] = alp_crc16_ccitt_false_update(0u, &b, 1u);
+	}
+	for (unsigned i = 0; i < 256u; i++) {
+		uint16_t v = crc16_table[i];
+		for (unsigned k = 0; k < 3u; k++) {
+			v                     = (uint16_t)((uint16_t)(v << 8) ^ crc16_table[v >> 8]);
+			crc16_table4[k][i] = v;
+		}
 	}
 	crc16_table_ready = true;
 }
@@ -154,12 +166,18 @@ void protocol_crc16_table_init(void)
  * which call protocol_build_reply() directly and never run the firmware boot
  * path.  On real silicon protocol_crc16_table_init() has already run and
  * this branch is never taken -- do NOT rely on it there again. */
-static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
+CC3501E_RAMFUNC static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
 {
 	if (!crc16_table_ready) {
 		crc16_table_init();
 	}
-	for (size_t i = 0; i < len; i++) {
+	size_t i = 0;
+	for (; len - i >= 4u; i += 4u) {
+		const uint16_t x = (uint16_t)(crc ^ (uint16_t)(((uint16_t)buf[i] << 8) | buf[i + 1u]));
+		crc = (uint16_t)(crc16_table4[2][x >> 8] ^ crc16_table4[1][x & 0xFFu] ^
+		                 crc16_table4[0][buf[i + 2u]] ^ crc16_table[buf[i + 3u]]);
+	}
+	for (; i < len; i++) {
 		crc = (uint16_t)((crc << 8) ^ crc16_table[(uint8_t)((crc >> 8) ^ buf[i])]);
 	}
 	return crc;
@@ -670,7 +688,7 @@ typedef alp_cc3501e_resp_t (*cmd_handler_t)(const uint8_t *, size_t, uint8_t *, 
  * single-handler-table property.  A new feature group slots in here as
  * its HAL body lands.  Each case routes to the owning family's
  * protocol_<family>.c handler (declared in protocol_internal.h). */
-alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
+CC3501E_RAMFUNC alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
                                      uint8_t        flags,
                                      const uint8_t *req,
                                      size_t         req_len,
@@ -880,7 +898,7 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 
 /* CC3501E_WIRE_CRC=ON (default): the wire-MAJOR-4 shape.  See the #else arm
  * below for the byte-identical-to-3.1, CC3501E_WIRE_CRC=OFF shape. */
-size_t protocol_build_reply(const uint8_t *req_frame,
+CC3501E_RAMFUNC size_t protocol_build_reply(const uint8_t *req_frame,
                             size_t         req_len,
                             uint8_t       *reply_frame,
                             size_t         reply_cap)
@@ -1077,7 +1095,7 @@ size_t protocol_build_reply(const uint8_t *req_frame,
  * and this build must still answer it -- with the ordinary legacy-shaped
  * reply below -- rather than reject it and strand that host with no way to
  * rediscover the board's real major. */
-size_t protocol_build_reply(const uint8_t *req_frame,
+CC3501E_RAMFUNC size_t protocol_build_reply(const uint8_t *req_frame,
                             size_t         req_len,
                             uint8_t       *reply_frame,
                             size_t         reply_cap)

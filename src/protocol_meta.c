@@ -280,6 +280,11 @@ static uint32_t cc3501e_build_capabilities(void)
 	caps |= (uint32_t)ALP_CC3501E_CAP_SPI1_MASTER;
 #endif
 
+#if defined(__ti__)
+	/* The per-frame slave path is in code TCM (CC3501E_RAMFUNC), so the reply
+	 * header is armed in bounded time; lets the host shorten its gate. */
+	caps |= (uint32_t)ALP_CC3501E_CAP_FAST_REPLY;
+#endif
 #ifdef CC3501E_BLE
 	caps |= (uint32_t)ALP_CC3501E_CAP_BLE;
 #endif
@@ -312,7 +317,7 @@ alp_cc3501e_resp_t handle_get_capabilities(const uint8_t *req,
  * frame is acked the link never desyncs (unlike raw throwaway clocking).  The
  * running total is reported via GET_DIAG_INFO for throughput accounting.
  * Synchronous (no worker): a memory sink can't block. */
-alp_cc3501e_resp_t handle_stream_write(const uint8_t *req,
+CC3501E_RAMFUNC alp_cc3501e_resp_t handle_stream_write(const uint8_t *req,
                                        size_t         req_len,
                                        uint8_t       *reply_data,
                                        size_t         reply_cap,
