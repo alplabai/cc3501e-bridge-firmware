@@ -231,6 +231,11 @@ bool    spi_slave_tx_pending(void);   /* true while a staged reply has bytes lef
  * byte inside the host's reply-header gate, i.e. ~1.2 ms of a 2.9 ms SOCK_RECV
  * transaction carrying 1715 bytes.  Returns the number of bytes taken. */
 size_t spi_slave_tx_take(uint8_t *dst, size_t cap);
+/* Whole request frame in one call: the same result as cs_low + rx_byte per
+ * byte + cs_high, built straight from @p frame with no per-byte calls or
+ * staging copy.  A frame longer than the RX staging buffer is truncated to it,
+ * exactly as the per-byte path drops the excess. */
+void spi_slave_rx_frame(const uint8_t *frame, size_t len);
 
 /* ---- SDIO slave seams (defined in transport_sdio.c) ------------ */
 /* SDIO carries the same request/reply frames inside its data blocks.

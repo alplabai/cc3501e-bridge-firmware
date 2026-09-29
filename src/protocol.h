@@ -27,6 +27,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Code that runs for every bridge frame inside the SPI slave callback.  On the
+ * TI build it is copied to code TCM at boot (.TI.ramfunc, run=TCM_CRAM): from
+ * XIP flash its timing moved with the code layout -- an unrelated edit shifted
+ * a cache line and the host's blind reply gate started missing -- and the host
+ * cannot see READY on this board, so every microsecond here is host dead time.
+ * Host/unit builds leave it empty. */
+#if defined(__ti__)
+#define CC3501E_RAMFUNC __attribute__((section(".TI.ramfunc")))
+#else
+#define CC3501E_RAMFUNC
+#endif
+
 /* Canonical wire contract -- single source of truth, no mirror.
  * Resolved via the firmware CMake's include path onto
  * ${ALP_SDK_ROOT}/include (an alp-sdk checkout; the build FATAL_ERRORs

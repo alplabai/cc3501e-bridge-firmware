@@ -126,7 +126,7 @@ static size_t  spi_tx_cursor;
 /* Seams (testable; HW-side wiring lives in the ti backend)          */
 /* --------------------------------------------------------------- */
 
-void spi_slave_cs_low(void)
+CC3501E_RAMFUNC void spi_slave_cs_low(void)
 {
 	spi_rx_len = 0u;
 }
@@ -140,7 +140,7 @@ void spi_slave_rx_byte(uint8_t b)
      * count exceed the declared payload and replies RESP_ERR_PROTOCOL. */
 }
 
-void spi_slave_cs_high(void)
+CC3501E_RAMFUNC void spi_slave_cs_high(void)
 {
 	/* Empty transaction: the host toggled CS without sending a request
      * (e.g. a bare reply-read poll before the READY handshake).  Leave
@@ -167,7 +167,21 @@ bool spi_slave_tx_pending(void)
 	return spi_tx_cursor < spi_tx_len;
 }
 
-size_t spi_slave_tx_take(uint8_t *dst, size_t cap)
+CC3501E_RAMFUNC void spi_slave_rx_frame(const uint8_t *frame, size_t len)
+{
+	spi_rx_len = 0u;
+	if (frame == NULL || len == 0u) {
+		spi_tx_cursor = 0u; /* same as an empty CS-framed transaction */
+		return;
+	}
+	if (len > sizeof(spi_rx_buf)) {
+		len = sizeof(spi_rx_buf);
+	}
+	spi_tx_len    = protocol_build_reply(frame, len, spi_tx_buf, sizeof(spi_tx_buf));
+	spi_tx_cursor = 0u;
+}
+
+CC3501E_RAMFUNC size_t spi_slave_tx_take(uint8_t *dst, size_t cap)
 {
 	if (dst == NULL || cap == 0u) {
 		return 0u;

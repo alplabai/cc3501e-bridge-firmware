@@ -601,7 +601,7 @@ static bool        pend_valid;
  *     so the host clocked a full frame into a slave that never latches;
  *   - the reply-stall watchdog was stamped even when the arm bailed out, so a
  *     quiesced OTA flush left a guaranteed false stall pending. */
-static bool arm_transfer(void *rx, const void *tx, size_t count)
+CC3501E_RAMFUNC static bool arm_transfer(void *rx, const void *tx, size_t count)
 {
 	static SPI_Transaction t; /* retained for the transfer's duration */
 	if (g_quiesce) {
@@ -667,13 +667,12 @@ static bool arm_request_header(void)
 
 /* Replay the captured request frame through the silicon-free seams
  * (which build the staged reply), then drain that reply into reply_buf. */
-static void dispatch_frame(size_t frame_len)
+CC3501E_RAMFUNC static void dispatch_frame(size_t frame_len)
 {
-	spi_slave_cs_low();
-	for (size_t i = 0; i < frame_len; i++) {
-		spi_slave_rx_byte(frame_buf[i]);
-	}
-	spi_slave_cs_high();
+	/* One call for the whole frame (spi_slave_rx_frame): the per-byte
+	 * cs_low / rx_byte / cs_high replay was a cross-TU call per request byte,
+	 * inside the window the host waits out blind before reading the reply. */
+	spi_slave_rx_frame(frame_buf, frame_len);
 
 	/* ONE memcpy, not two cross-TU calls per byte.  The old loop drained the
 	 * staged reply a byte at a time through spi_slave_tx_pending() /
@@ -803,7 +802,7 @@ uint32_t bridge_transport_spi_xfer_count(void)
 void bridge_transport_spi_probe_xfer(void); /* defined below; used here */
 #endif
 
-static void on_transfer(SPI_Handle h, SPI_Transaction *t)
+CC3501E_RAMFUNC static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 {
 #ifdef CC3501E_WEDGE_PROBE
 	bridge_transport_spi_probe_xfer(); /* #1691: a transfer landed -- reset the quiet counter */

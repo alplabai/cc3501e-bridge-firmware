@@ -154,7 +154,7 @@ void protocol_crc16_table_init(void)
  * which call protocol_build_reply() directly and never run the firmware boot
  * path.  On real silicon protocol_crc16_table_init() has already run and
  * this branch is never taken -- do NOT rely on it there again. */
-static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
+CC3501E_RAMFUNC static uint16_t crc16_table_update(uint16_t crc, const uint8_t *buf, size_t len)
 {
 	if (!crc16_table_ready) {
 		crc16_table_init();
@@ -670,7 +670,7 @@ typedef alp_cc3501e_resp_t (*cmd_handler_t)(const uint8_t *, size_t, uint8_t *, 
  * single-handler-table property.  A new feature group slots in here as
  * its HAL body lands.  Each case routes to the owning family's
  * protocol_<family>.c handler (declared in protocol_internal.h). */
-alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
+CC3501E_RAMFUNC alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
                                      uint8_t        flags,
                                      const uint8_t *req,
                                      size_t         req_len,
@@ -880,7 +880,7 @@ alp_cc3501e_resp_t protocol_dispatch(uint8_t        cmd,
 
 /* CC3501E_WIRE_CRC=ON (default): the wire-MAJOR-4 shape.  See the #else arm
  * below for the byte-identical-to-3.1, CC3501E_WIRE_CRC=OFF shape. */
-size_t protocol_build_reply(const uint8_t *req_frame,
+CC3501E_RAMFUNC size_t protocol_build_reply(const uint8_t *req_frame,
                             size_t         req_len,
                             uint8_t       *reply_frame,
                             size_t         reply_cap)
@@ -1077,7 +1077,7 @@ size_t protocol_build_reply(const uint8_t *req_frame,
  * and this build must still answer it -- with the ordinary legacy-shaped
  * reply below -- rather than reject it and strand that host with no way to
  * rediscover the board's real major. */
-size_t protocol_build_reply(const uint8_t *req_frame,
+CC3501E_RAMFUNC size_t protocol_build_reply(const uint8_t *req_frame,
                             size_t         req_len,
                             uint8_t       *reply_frame,
                             size_t         reply_cap)

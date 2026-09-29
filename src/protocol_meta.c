@@ -312,7 +312,7 @@ alp_cc3501e_resp_t handle_get_capabilities(const uint8_t *req,
  * frame is acked the link never desyncs (unlike raw throwaway clocking).  The
  * running total is reported via GET_DIAG_INFO for throughput accounting.
  * Synchronous (no worker): a memory sink can't block. */
-alp_cc3501e_resp_t handle_stream_write(const uint8_t *req,
+CC3501E_RAMFUNC alp_cc3501e_resp_t handle_stream_write(const uint8_t *req,
                                        size_t         req_len,
                                        uint8_t       *reply_data,
                                        size_t         reply_cap,
