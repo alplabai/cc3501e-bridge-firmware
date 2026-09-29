@@ -280,6 +280,11 @@ static uint32_t cc3501e_build_capabilities(void)
 	caps |= (uint32_t)ALP_CC3501E_CAP_SPI1_MASTER;
 #endif
 
+#if defined(__ti__)
+	/* The per-frame slave path is in code TCM (CC3501E_RAMFUNC), so the reply
+	 * header is armed in bounded time; lets the host shorten its gate. */
+	caps |= (uint32_t)ALP_CC3501E_CAP_FAST_REPLY;
+#endif
 #ifdef CC3501E_BLE
 	caps |= (uint32_t)ALP_CC3501E_CAP_BLE;
 #endif
