@@ -365,6 +365,30 @@ t = io.open(p, encoding="utf-8", newline="").read()
 if ".bss.sock_ring" not in t and anchor in t:
     io.open(p, "w", encoding="utf-8", newline="").write(t.replace(anchor, block + anchor, 1))
 PYRING
+# 5. The TI SPI slave driver's per-transfer path -> code TCM (#2052).  The
+#    bridge's own per-frame code is already CC3501E_RAMFUNC; the driver it
+#    calls to re-arm each phase (SPIWFF3DMA_transfer and the HWI/SWI that
+#    complete it) still ran from XIP flash, inside the window the host waits
+#    out blind before reading the reply.  Pulled in by input-section name from
+#    the SDK archive -- no SDK source change.
+python3 - "$localCmd" <<'PYSPIRAM'
+import io, sys
+p = sys.argv[1]
+old = ".TI.ramfunc     : {} load=FLASH_NON_SECURE, run=TCM_CRAM_NON_SECURE, table(BINIT)"
+fns = ["SPIWFF3DMA_transfer", "SPIWFF3DMA_hwiFxn", "SPIWFF3DMA_swiFxn",
+       "configNextTransfer", "startDmaTransaction", "csnCallback", "dataGet",
+       "flushFifos", "enableSPI", "spiPostNotify"]
+secs = " ".join(".text." + f for f in fns)
+new = (".TI.ramfunc     : { *(.TI.ramfunc) *drivers_cc35xx.a<SPIWFF3DMA.c.obj>(" + secs +
+       ") } load=FLASH_NON_SECURE, run=TCM_CRAM_NON_SECURE, table(BINIT)")
+t = io.open(p, encoding="utf-8", newline="").read()
+if "SPIWFF3DMA.c.obj" not in t and old in t:
+    io.open(p, "w", encoding="utf-8", newline="").write(t.replace(old, new, 1))
+PYSPIRAM
+grep -q 'SPIWFF3DMA[.]c[.]obj' "$localCmd" || {
+    echo "build_ti.sh: SPI driver TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
+    exit 4
+}
 grep -q 'bss[.]sock_ring' "$localCmd" || {
     echo "build_ti.sh: sock-ring TCM placement did not apply to $localCmd -- the stock linker.cmd changed shape."
     echo "  The ring would fall back to the FULL DRAM bank and the link would overflow."
