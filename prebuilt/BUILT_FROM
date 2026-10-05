@@ -249,3 +249,4 @@ gpe-floor:    0.254.38.0
 # customer-selectable CC3501E_WIRE_CRC option, and the fix that moves the
 # wire-CRC table build out of the SPI ISR onto the boot path -- the last of
 # which is what made the 4.0 wire work on silicon at all.
+inert:        84a077f84d97e4d0c642322aa075bf9bf86cc536  # clang-format-22 whitespace only; rebuilt raw-sha256 a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c identical (2026-10-05)
