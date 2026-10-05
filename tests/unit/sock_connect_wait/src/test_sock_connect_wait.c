@@ -25,7 +25,10 @@ typedef struct {
 	int      heals, waits, set_calls, last_set;
 } fake_t;
 
-static int f_get(void *c) { return ((fake_t *)c)->get_rc < 0 ? -1 : ((fake_t *)c)->flags; }
+static int f_get(void *c)
+{
+	return ((fake_t *)c)->get_rc < 0 ? -1 : ((fake_t *)c)->flags;
+}
 static int f_set(void *c, int fl)
 {
 	fake_t *f = c;
@@ -36,9 +39,15 @@ static int f_set(void *c, int fl)
 	}
 	return f->set_rc_restore;
 }
-static int  f_conn(void *c) { return ((fake_t *)c)->connect_rc; }
-static bool f_inprog(void *c) { return ((fake_t *)c)->in_progress; }
-static int  f_wait(void *c, uint32_t ms)
+static int f_conn(void *c)
+{
+	return ((fake_t *)c)->connect_rc;
+}
+static bool f_inprog(void *c)
+{
+	return ((fake_t *)c)->in_progress;
+}
+static int f_wait(void *c, uint32_t ms)
 {
 	fake_t *f = c;
 	(void)ms;
@@ -51,21 +60,27 @@ static int f_soerr(void *c, int *e)
 	*e = ((fake_t *)c)->so_err;
 	return ((fake_t *)c)->so_rc;
 }
-static uint32_t f_now(void *c) { return ((fake_t *)c)->now; }
-static void     f_heal(void *c) { ((fake_t *)c)->heals++; }
+static uint32_t f_now(void *c)
+{
+	return ((fake_t *)c)->now;
+}
+static void f_heal(void *c)
+{
+	((fake_t *)c)->heals++;
+}
 
-static const sock_connect_ops_t ops = { f_get, f_set, f_conn, f_inprog, f_wait,
+static const sock_connect_ops_t ops = { f_get,   f_set, f_conn, f_inprog, f_wait,
 	                                    f_soerr, f_now, f_heal, NB };
 
 static fake_t base(void)
 {
 	fake_t f;
 	memset(&f, 0, sizeof f);
-	f.flags = 0x2;
-	f.connect_rc = -1;
+	f.flags       = 0x2;
+	f.connect_rc  = -1;
 	f.in_progress = true;
 	f.wait_result = 1;
-	f.now_step = 100u;
+	f.now_step    = 100u;
 	return f;
 }
 
@@ -73,7 +88,7 @@ ZTEST_SUITE(sock_connect_wait, NULL, NULL, NULL, NULL, NULL);
 
 ZTEST(sock_connect_wait, test_immediate_connect_restores_flags)
 {
-	fake_t f = base();
+	fake_t f     = base();
 	f.connect_rc = 0;
 	zassert_equal(sock_connect_run(&ops, &f), 0, "ok");
 	zassert_equal(f.waits, 0, "no wait");
@@ -82,7 +97,7 @@ ZTEST(sock_connect_wait, test_immediate_connect_restores_flags)
 
 ZTEST(sock_connect_wait, test_non_einprogress_error_fails_and_restores)
 {
-	fake_t f = base();
+	fake_t f      = base();
 	f.in_progress = false;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "fail");
 	zassert_equal(f.last_set, 0x2, "restored");
@@ -90,7 +105,7 @@ ZTEST(sock_connect_wait, test_non_einprogress_error_fails_and_restores)
 
 ZTEST(sock_connect_wait, test_heal_runs_between_timed_out_slices_then_connects)
 {
-	fake_t f = base();
+	fake_t f                = base();
 	f.timeouts_before_ready = 3;
 	zassert_equal(sock_connect_run(&ops, &f), 0, "ok");
 	zassert_equal(f.heals, 3, "one heal per timed-out slice");
@@ -108,14 +123,14 @@ ZTEST(sock_connect_wait, test_so_error_nonzero_fails)
 ZTEST(sock_connect_wait, test_so_error_getsockopt_failure_fails)
 {
 	fake_t f = base();
-	f.so_rc = -1;
+	f.so_rc  = -1;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "fail");
 	zassert_equal(f.last_set, 0x2, "restored");
 }
 
 ZTEST(sock_connect_wait, test_select_error_fails_and_restores)
 {
-	fake_t f = base();
+	fake_t f      = base();
 	f.wait_result = -1;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "fail");
 	zassert_equal(f.last_set, 0x2, "restored");
@@ -123,7 +138,7 @@ ZTEST(sock_connect_wait, test_select_error_fails_and_restores)
 
 ZTEST(sock_connect_wait, test_safety_cap_expires_and_restores)
 {
-	fake_t f = base();
+	fake_t f                = base();
 	f.timeouts_before_ready = 1 << 30; /* never ready */
 	zassert_equal(sock_connect_run(&ops, &f), -1, "gives up at the cap");
 	zassert_equal(f.waits, 600, "60 s / 100 ms slices");
@@ -133,16 +148,16 @@ ZTEST(sock_connect_wait, test_safety_cap_expires_and_restores)
 ZTEST(sock_connect_wait, test_waits_past_lwip_syn_limit)
 {
 	/* 25 s of timeouts (> lwIP's 12-21 s SYN give-up) must NOT be abandoned. */
-	fake_t f = base();
+	fake_t f                = base();
 	f.timeouts_before_ready = 250;
 	zassert_equal(sock_connect_run(&ops, &f), 0, "late SYN-ACK still accepted");
 }
 
 ZTEST(sock_connect_wait, test_set_nonblock_failure_returns_io_without_connecting)
 {
-	fake_t f = base();
+	fake_t f       = base();
 	f.set_rc_first = -1;
-	f.connect_rc = 0;
+	f.connect_rc   = 0;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "no blocking fallback");
 	zassert_equal(f.set_calls, 1, "nothing to restore");
 }
@@ -157,8 +172,8 @@ ZTEST(sock_connect_wait, test_get_flags_failure_returns_io)
 
 ZTEST(sock_connect_wait, test_restore_failure_is_io_even_when_connected)
 {
-	fake_t f = base();
-	f.connect_rc = 0;
+	fake_t f         = base();
+	f.connect_rc     = 0;
 	f.set_rc_restore = -1;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "non-blocking socket must not leak");
 }
@@ -174,8 +189,8 @@ ZTEST(sock_connect_wait, test_cap_survives_now_ms_wraparound)
 {
 	/* t0 just below UINT32_MAX: now - t0 is unsigned-modular, so the 60 s cap
 	 * must still land after 600 slices, not instantly or never. */
-	fake_t f = base();
-	f.now = UINT32_MAX - 150u;
+	fake_t f                = base();
+	f.now                   = UINT32_MAX - 150u;
 	f.timeouts_before_ready = 1 << 30;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "gives up at the cap");
 	zassert_equal(f.waits, 600, "60 s / 100 ms slices across the wrap");

@@ -185,8 +185,8 @@ static void cw_heal(void *c)
 	cc3501e_hw_link_heal(false);
 }
 static const sock_connect_ops_t sock_connect_lwip_ops = {
-	cw_get_flags, cw_set_flags, cw_connect, cw_in_progress,
-	cw_wait_writable, cw_so_error, cw_now, cw_heal, O_NONBLOCK,
+	cw_get_flags, cw_set_flags, cw_connect, cw_in_progress, cw_wait_writable,
+	cw_so_error,  cw_now,       cw_heal,    O_NONBLOCK,
 };
 
 int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, const uint8_t addr[4])

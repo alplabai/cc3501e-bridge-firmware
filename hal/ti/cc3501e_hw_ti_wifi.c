@@ -69,9 +69,9 @@ appControlBlock app_CB;
 
 #include "../cc3501e_hw.h"
 #include "cc3501e_hw_ti_internal.h" /* cc3501e_hw_wifi_lazy_start (shared with cc3501e_hw_ti_ble.c) */
-#include "transport.h"  /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
+#include "transport.h"     /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
 #include "ap_role_latch.h" /* wifi_ap_latch: AP role pending/up, published after the drain reinit */
-#include "wifi_retry.h" /* wifi_retry_delay_ms / wifi_retry_should_restore_first_pass -- the
+#include "wifi_retry.h"    /* wifi_retry_delay_ms / wifi_retry_should_restore_first_pass -- the
                           * silicon-free retry decisions the reason-30 retry site (further
                           * down) calls into.  #include'd unconditionally, like
                           * wifi_last_reason_tag just below: wifi_retry_event_t has no TI-SDK

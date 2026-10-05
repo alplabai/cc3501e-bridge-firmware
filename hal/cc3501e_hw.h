@@ -307,7 +307,7 @@ int cc3501e_hw_wifi_ap_stop(void);
  * the reinit runs before wifi_conn_set(CONNECTED).  No-op unless an ap_start
  * success is pending.  Worker-drain context only. */
 void cc3501e_hw_wifi_ap_role_publish(void);
-int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
+int  cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
 /* Report one interface's IPv4 address.  @p iface is an
  * alp_cc3501e_wifi_iface_t: STA = the DHCP lease from the joined AP, AP = the
  * module's own address on the soft-AP it runs.  The 4 octets are written in the
