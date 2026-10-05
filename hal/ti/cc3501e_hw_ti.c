@@ -645,6 +645,11 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	 * transfer armed forever, and both self-heals above are blind to it (no
 	 * misframing, no failed arm).  Same reinit recovery. */
 	if (bridge_transport_spi_phase_stalled()) {
+		/* Drop READY first, like the quiet-armed heal below: the reinit leaves the
+		 * slave armed at PH_REQ_HEADER with flushed FIFOs and clears the stall
+		 * latch (spi_open_and_arm), so the host is held off only for the window
+		 * between this fence and the arm's own READY raise. */
+		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}
 

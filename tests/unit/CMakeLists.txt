@@ -423,3 +423,40 @@ target_include_directories(test_wifi_connect_fail_skip PRIVATE
 target_compile_options(test_wifi_connect_fail_skip PRIVATE ${TEST_FLAGS})
 target_link_libraries(test_wifi_connect_fail_skip PRIVATE ztest_shim)
 add_test(NAME wifi_connect_fail_skip COMMAND test_wifi_connect_fail_skip)
+
+# worker_ap_publish: AP_START publishes the AP role only AFTER the drain's
+# post-body SPI reinit (v0.9.1 finding 3).  Same FW_SOURCES + stub HAL as
+# worker_seq, WITH CC3501E_WIFI so the drain really runs the body; --wrap on
+# the body, the reinit and the publish records their relative ORDER.
+add_executable(test_worker_ap_publish
+    worker_ap_publish/src/test_worker_ap_publish.c
+    ${FW_SOURCES}
+)
+target_include_directories(test_worker_ap_publish PRIVATE
+    ${FW}/src
+    ${FW}/hal
+    ${ALP_SDK_ROOT}/include
+)
+target_compile_definitions(test_worker_ap_publish PRIVATE
+    CC3501E_BRIDGE_FW_VERSION_U16=${CC3501E_BRIDGE_FW_VERSION_U16}
+    CC3501E_WIRE_CRC=1
+    CC3501E_WIFI=1)
+target_compile_options(test_worker_ap_publish PRIVATE ${TEST_FLAGS})
+target_link_options(test_worker_ap_publish PRIVATE
+    -Wl,--wrap=cc3501e_hw_wifi_ap_start
+    -Wl,--wrap=bridge_transport_spi_hw_reinit
+    -Wl,--wrap=cc3501e_hw_wifi_ap_role_publish)
+target_link_libraries(test_worker_ap_publish PRIVATE ztest_shim)
+add_test(NAME worker_ap_publish COMMAND test_worker_ap_publish)
+
+# sock_connect_slice: header-only slice arithmetic for the non-blocking
+# SOCK_CONNECT wait (v0.9.1 finding 4); the lwIP loop is TI-SDK-only.
+add_executable(test_sock_connect_slice
+    sock_connect_slice/src/test_sock_connect_slice.c
+)
+target_include_directories(test_sock_connect_slice PRIVATE
+    ${FW}/src
+)
+target_compile_options(test_sock_connect_slice PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_connect_slice PRIVATE ztest_shim)
+add_test(NAME sock_connect_slice COMMAND test_sock_connect_slice)

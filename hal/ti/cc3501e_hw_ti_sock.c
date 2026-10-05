@@ -42,6 +42,7 @@ extern size_t xPortGetFreeHeapSize(void);
 /* Pure, silicon-free tail/uncommitted arithmetic for the lazy-commit fix
  * below (cc3501e-bridge-firmware, host review) -- see its own header for
  * why this is split out rather than inlined here. */
+#include "sock_connect_slice.h"
 #include "sock_prefetch_arm.h"
 #include "sock_recv_commit.h"
 #include "sock_recv_ring_status.h"
@@ -85,6 +86,11 @@ extern size_t xPortGetFreeHeapSize(void);
  * returned 0 bytes for 81 s on a connection the server had already fed
  * 256 KiB (bench-measured, reverted). */
 #define CC3501E_SOCK_RCVTIMEO_MS 2
+/* SOCK_CONNECT wait: total budget (the old blocking connect gave up at lwIP's
+ * 12-21 s SYN-retry limit) and the slice between link heals.  100 ms matches the
+ * connect-body wait slice cc3501e_hw_link_heal() is documented against. */
+#define CC3501E_SOCK_CONNECT_BUDGET_MS 21000u
+#define CC3501E_SOCK_CONNECT_SLICE_MS  100u
 
 /* True iff fd is a SOCK_STREAM (TCP) socket.  Shared by sock_connect() below
  * (deciding whether to arm the prefetch ring) and, further down, the
@@ -151,7 +157,57 @@ int cc3501e_hw_sock_connect(uint16_t handle, uint8_t family, uint16_t port, cons
 	/* addr[0..3] are already big-endian (network order); s_addr is a network-order
 	 * u32, so a straight copy lands the octets in the right byte positions. */
 	memcpy(&sa.sin_addr.s_addr, addr, 4);
-	if (lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+	/* NON-BLOCKING connect + sliced wait with link heals in between (finding 4,
+	 * bench 2026-10-04 v0.9.0).  A blocking lwip_connect() holds this worker body
+	 * for 12-21 s, and the bring-up task loop (src/main.c) runs
+	 * worker_run_pending() and cc3501e_hw_tick() -> cc3501e_hw_link_heal() in
+	 * sequence, so every heal (stall watchdog, resync burst, dead handle) was
+	 * frozen for that whole time.  Same shape as #107's MSG_DONTWAIT send.  An
+	 * independent heal task stays rejected (b3dc1e2: it could reinit inside a
+	 * radio op); here the heal runs INLINE on the worker task and this body makes
+	 * NO Wlan_* call (src/worker.c socket_control note), so a reinit between
+	 * slices cannot land inside a radio op.  in_connect_wait = false: the
+	 * quiet-armed detector stays STA-connect-only. */
+	if (lwip_fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+		return CC3501E_HW_ERR_IO; /* never fall back to the unbounded blocking connect */
+	}
+	int rc = lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+	if (rc != 0 && errno == EINPROGRESS) {
+		const uint32_t t0 = cc3501e_hw_uptime_ms();
+		rc                = -1;
+		for (;;) {
+			const uint32_t slice =
+			    sock_connect_slice_ms(cc3501e_hw_uptime_ms() - t0,
+			                          CC3501E_SOCK_CONNECT_BUDGET_MS,
+			                          CC3501E_SOCK_CONNECT_SLICE_MS);
+			if (slice == 0u) {
+				break; /* budget spent: report failure, like the old lwIP SYN timeout */
+			}
+			fd_set wfds;
+			FD_ZERO(&wfds);
+			FD_SET(fd, &wfds);
+			struct timeval tv = { .tv_sec = 0, .tv_usec = (suseconds_t)slice * 1000 };
+			const int      n  = lwip_select(fd + 1, NULL, &wfds, NULL, &tv);
+			if (n > 0) {
+				int       so_err = 0;
+				socklen_t so_len = sizeof(so_err);
+				if (lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) == 0 &&
+				    so_err == 0) {
+					rc = 0;
+				}
+				break; /* writable: connected (rc = 0) or refused/reset (rc = -1) */
+			}
+			if (n < 0) {
+				break;
+			}
+			cc3501e_hw_link_heal(false); /* slice timed out: let the heals run */
+		}
+	}
+	/* Back to BLOCKING: the SOCK_RECV worker path relies on SO_RCVTIMEO bounding a
+	 * blocking recv, and MSG_DONTWAIT is wrong on this stack there (see
+	 * cc3501e_hw_sock_recv). */
+	(void)lwip_fcntl(fd, F_SETFL, 0);
+	if (rc != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
 	/* A connected STREAM socket is the bulk-receive case -- start prefetching so

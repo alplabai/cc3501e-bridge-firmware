@@ -297,6 +297,16 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
                              uint8_t        psk_len,
                              uint8_t        security);
 int cc3501e_hw_wifi_ap_stop(void);
+
+/* Publish the AP role (GET_DIAG_INFO role == WIFI_AP) once cc3501e_hw_wifi_ap_start()
+ * succeeded AND the worker drain's post-body SPI reinit has completed.  The host
+ * treats role == AP as "radio up, link usable" and fires its next request at once;
+ * publishing from inside ap_start put that request into the drain's reinit window
+ * (bench 2026-10-04, E1M-AEN803 v0.9.0: SOCK_OPEN rc=-4 in 3-5/20 at 0 ms after
+ * role==AP, 0/20 at 200+ ms).  Same ordering as the STA #106 SUCCESS path, where
+ * the reinit runs before wifi_conn_set(CONNECTED).  No-op unless an ap_start
+ * success is pending.  Worker-drain context only. */
+void cc3501e_hw_wifi_ap_role_publish(void);
 int cc3501e_hw_wifi_get_rssi(int8_t *rssi_dbm_out);
 /* Report one interface's IPv4 address.  @p iface is an
  * alp_cc3501e_wifi_iface_t: STA = the DHCP lease from the joined AP, AP = the

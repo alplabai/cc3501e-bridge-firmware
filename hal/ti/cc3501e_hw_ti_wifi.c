@@ -230,6 +230,10 @@ static bool wifi_sta_role_up;
  * underneath us without the firmware asking -- a different fault from the
  * firmware tearing it down, and the two are indistinguishable today. */
 static bool wifi_ap_role_up;
+/* ap_start succeeded, role NOT yet published: cc3501e_hw_wifi_ap_role_publish()
+ * flips wifi_ap_role_up after the worker drain's post-body SPI reinit.  Plain
+ * bool, same worker-thread-only reasoning as g_connect_reinit_pending. */
+static bool wifi_ap_role_pending;
 
 /* ---- Worker <-> Wi-Fi-event rendezvous (WIFI_BLE_INTEGRATION.md) ----------
  * Async Wlan_* ops (Scan / Connect) complete on the host-driver thread via the
@@ -2954,9 +2958,25 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	if (Wlan_RoleUp(WLAN_ROLE_AP, &ap, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
-	wifi_ap_role_up = true;
+	/* DO NOT set wifi_ap_role_up here.  GET_DIAG_INFO answers from the ISR, so the
+	 * host sees role == AP the instant this flips and fires its next request --
+	 * straight into the drain's post-body bridge_transport_spi_hw_reinit()
+	 * (src/worker.c; AP_START is not exempt from it).  Bench (E1M-AEN803, v0.9.0):
+	 * SOCK_OPEN 0 ms after role==AP failed 3-5/20 (rc=-4, request-header MISO
+	 * 00010000 then RAM-like words); with 200+ ms it was 0/20.  Mirrors the STA
+	 * #106 ordering (reinit first, then wifi_conn_set(CONNECTED)): the drain calls
+	 * cc3501e_hw_wifi_ap_role_publish() once the reinit has completed. */
 	network_set_up(network_get_ap_if());
+	wifi_ap_role_pending = true;
 	return CC3501E_HW_OK;
+}
+
+void cc3501e_hw_wifi_ap_role_publish(void)
+{
+	if (wifi_ap_role_pending) {
+		wifi_ap_role_pending = false;
+		wifi_ap_role_up      = true;
+	}
 }
 
 int cc3501e_hw_wifi_ap_stop(void)
@@ -2972,7 +2992,8 @@ int cc3501e_hw_wifi_ap_stop(void)
 	if (Wlan_RoleDown(WLAN_ROLE_AP, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
-	wifi_ap_role_up = false;
+	wifi_ap_role_up      = false;
+	wifi_ap_role_pending = false;
 	/* The AP role-up path forces device-wide pm to ALWAYS_ACTIVE, both inline
 	 * (cc3501e_hw_wifi_ap_start()'s own Wlan_Set() before RoleUp) and via
 	 * pp_apply_radio()'s AP-up override on every later apply.  Neither is

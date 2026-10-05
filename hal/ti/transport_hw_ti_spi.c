@@ -601,6 +601,8 @@ static bool        pend_valid;
  *     so the host clocked a full frame into a slave that never latches;
  *   - the reply-stall watchdog was stamped even when the arm bailed out, so a
  *     quiesced OTA flush left a guaranteed false stall pending. */
+static void spi_fifo_reset(void); /* defined below; used by arm_transfer() */
+
 static bool arm_transfer(void *rx, const void *tx, size_t count)
 {
 	static SPI_Transaction t; /* retained for the transfer's duration */
@@ -625,6 +627,24 @@ static bool arm_transfer(void *rx, const void *tx, size_t count)
 		 * because the phase WILL be driven; the polled path has no watchdog. */
 		return true;
 	}
+	/* Start EVERY callback/DMA phase from empty RX and TX FIFOs.  Bench 2026-10-04
+	 * (E1M-AEN803, v0.9.0): a host that clocks the 4 B reply header BEFORE the
+	 * slave armed it (DMA not primed) leaves the slave running its TX exactly one
+	 * host transfer late FOREVER -- RX stays correct (PINGs execute), but their
+	 * valid replies (status 0x5A, good CRC) come out one transfer late, a longer
+	 * host gate never catches up (fixed offset) and no firmware heal detected it.
+	 * The driver keeps the IP enabled after a completed transfer with nothing
+	 * queued (see spi_open_and_arm), so those pre-arm clocks sit in the FIFOs and
+	 * offset every later phase by 4 B.  Discarding them here is safe because the
+	 * host gates each phase on READY, which is only raised AFTER this arm, so
+	 * nothing legitimate can be in the FIFOs yet.
+	 *
+	 * Safe for the in-flight rule spi_fifo_reset() states: every caller arms from
+	 * a COMPLETED/failed transfer (on_transfer) or a fresh SPI_open, never over a
+	 * live one.  spi_fifo_reset() leaves the IP DISABLED and SPI_transfer's
+	 * primeTransfer re-enables it just before the DMA starts -- exactly the state
+	 * the "DO NOT touch CTL1.EN" note in spi_open_and_arm() requires. */
+	spi_fifo_reset();
 	t.count = count;
 	t.txBuf = (void *)tx;
 	t.rxBuf = rx;
@@ -1247,6 +1267,18 @@ static bool spi_open_and_arm(void)
 	 * again and stall the host's per-request READY gate (-3 BUSY).  Bench-proven. */
 
 	g_resync_count = 0u;
+
+	/* Clear the reply-stall latch: a reinit retires whatever transfer it referred
+	 * to.  hw_release()/hw_suspend() always did this; hw_reinit() (which every
+	 * heal uses) did NOT, so after the stall watchdog's own reinit reply_armed
+	 * stayed true with its stale stamp and bridge_transport_spi_phase_stalled()
+	 * fired again on the very next tick -- a 100 Hz SPI_close/SPI_open storm that
+	 * never let the fresh header arm survive (bench 2026-10-04: after a 4 B header
+	 * declaring len 16 then 300 ms of silence, request-header MISO read 00000000
+	 * forever, 0/20 PINGs, while a resync-burst reinit -- which never sets
+	 * reply_armed -- recovered 60/60).  Cleared BEFORE the arm below, so an arm
+	 * that records a fresh stamp is not wiped. */
+	reply_armed = false;
 
 	/* Build the wire-CRC table BEFORE the first frame can arrive.
 	 *
