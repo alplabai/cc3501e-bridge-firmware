@@ -195,6 +195,7 @@
 #include <ti/drivers/SPI.h>
 #include <ti/drivers/spi/SPIWFF3DMA.h> /* SPIWFF3DMA_CMD_RETURN_PARTIAL_ENABLE -- CS-framed re-sync */
 #include <ti/drivers/dpl/ClockP.h>     /* ClockP_usleep -- settle between SPI re-open retries */
+#include <ti/drivers/dma/DMAWFF3.h>   /* DMAWFF3_disableChannel/_clearInterrupt -- stall-reinit DMA teardown */
 
 /* Direct SPI register access, for the polled bridge's per-frame FIFO reset
  * (spi_fifo_reset() below).  The driver's own flushFifos() is static, and the
@@ -277,7 +278,10 @@ volatile uint32_t g_spi_reopen_count;
 volatile uint32_t g_arm_fail_count;
 
 /* Sticky SPI RX-overrun events observed at a polled frame boundary (#21).
- * Counted, never acted on -- see spi_fifo_reset() for why. */
+ * Counted, never acted on -- see spi_fifo_reset() for why.
+ * SCOPE (v0.9.1): spi_fifo_reset() now also runs at every callback-path TX-phase
+ * arm, so this counter is no longer polled-mode-only -- a RXOVF latched since the
+ * previous TX-phase arm is counted there too. */
 volatile uint32_t g_rx_overrun_count;
 
 /* ADC internal-temperature probe status (#18).  In .bss on purpose: the first
@@ -603,7 +607,7 @@ static bool        pend_valid;
  *     quiesced OTA flush left a guaranteed false stall pending. */
 static void spi_fifo_reset(void); /* defined below; used by arm_transfer() */
 
-static bool arm_transfer(void *rx, const void *tx, size_t count)
+static bool arm_transfer(void *rx, const void *tx, size_t count, bool flush_fifos)
 {
 	static SPI_Transaction t; /* retained for the transfer's duration */
 	if (g_quiesce) {
@@ -627,24 +631,31 @@ static bool arm_transfer(void *rx, const void *tx, size_t count)
 		 * because the phase WILL be driven; the polled path has no watchdog. */
 		return true;
 	}
-	/* Start EVERY callback/DMA phase from empty RX and TX FIFOs.  Bench 2026-10-04
-	 * (E1M-AEN803, v0.9.0): a host that clocks the 4 B reply header BEFORE the
-	 * slave armed it (DMA not primed) leaves the slave running its TX exactly one
-	 * host transfer late FOREVER -- RX stays correct (PINGs execute), but their
-	 * valid replies (status 0x5A, good CRC) come out one transfer late, a longer
-	 * host gate never catches up (fixed offset) and no firmware heal detected it.
-	 * The driver keeps the IP enabled after a completed transfer with nothing
-	 * queued (see spi_open_and_arm), so those pre-arm clocks sit in the FIFOs and
-	 * offset every later phase by 4 B.  Discarding them here is safe because the
-	 * host gates each phase on READY, which is only raised AFTER this arm, so
-	 * nothing legitimate can be in the FIFOs yet.
+	/* TX-PHASE arms only (reply header / reply payload; flush_fifos == true):
+	 * start from empty RX and TX FIFOs.  Bench 2026-10-04 (E1M-AEN803, v0.9.0): a
+	 * host that clocks the 4 B reply header BEFORE the slave armed it (DMA not
+	 * primed) leaves the slave running its TX exactly one host transfer late
+	 * FOREVER -- RX stays correct (PINGs execute), but their valid replies
+	 * (status 0x5A, good CRC) come out one transfer late, a longer host gate never
+	 * catches up (fixed offset) and no firmware heal detected it.  HYPOTHESIS
+	 * (not bench-proven): the pre-arm clocks leave stale bytes in the FIFOs, so
+	 * every later phase is offset by 4 B.  Bytes clocked before a TX phase is
+	 * armed are already lost to the host (it reads MISO garbage), so discarding
+	 * them costs nothing.
 	 *
-	 * Safe for the in-flight rule spi_fifo_reset() states: every caller arms from
-	 * a COMPLETED/failed transfer (on_transfer) or a fresh SPI_open, never over a
-	 * live one.  spi_fifo_reset() leaves the IP DISABLED and SPI_transfer's
-	 * primeTransfer re-enables it just before the DMA starts -- exactly the state
-	 * the "DO NOT touch CTL1.EN" note in spi_open_and_arm() requires. */
-	spi_fifo_reset();
+	 * NOT done for RX-phase arms (request header / payload): READY is not wired on
+	 * the bench unit, so the host uses a blind ~250 us settle, and a slow SWI arm
+	 * can see the host ALREADY clocking the request.  Those bytes are real; a flush
+	 * would drop them, and clearing CTL1.EN mid-SS0-frame bit-slips.
+	 *
+	 * Every caller arms from a COMPLETED/failed transfer (on_transfer) or a fresh
+	 * SPI_open, never over a live one.  spi_fifo_reset() leaves the IP DISABLED
+	 * and SPI_transfer's primeTransfer -> enableSPI() re-enables it (it reads the
+	 * register first, so no stale "already on") just before the DMA starts -- the
+	 * same enable point as an unflushed arm. */
+	if (flush_fifos) {
+		spi_fifo_reset();
+	}
 	t.count = count;
 	t.txBuf = (void *)tx;
 	t.rxBuf = rx;
@@ -682,7 +693,7 @@ static bool arm_transfer(void *rx, const void *tx, size_t count)
 static bool arm_request_header(void)
 {
 	phase = PH_REQ_HEADER;
-	return arm_transfer(frame_buf, sync_idle, ALP_CC3501E_HEADER_BYTES);
+	return arm_transfer(frame_buf, sync_idle, ALP_CC3501E_HEADER_BYTES, false);
 }
 
 /* Replay the captured request frame through the silicon-free seams
@@ -900,7 +911,7 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 			 * reads the payload in the NEXT.  (No single-transfer reply -- the SS0
 			 * deassert after the header would cut a single armed reply mid-frame.) */
 			phase = PH_REPLY_HEADER;
-			if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES)) {
+			if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES, true)) {
 				reply_armed_ms = cc3501e_hw_uptime_ms();
 				reply_armed    = true;
 			}
@@ -909,7 +920,7 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 			/* dummy_tx_zero (all-0x00) on MISO during payload (0xA5 marks the
 			 * header boundary only) -- see dummy_tx_zero's comment: SPIWFF3DMA
 			 * needs a real txBuf to arm, a literal NULL is not safe here. */
-			if (arm_transfer(&frame_buf[ALP_CC3501E_HEADER_BYTES], dummy_tx_zero, plen)) {
+			if (arm_transfer(&frame_buf[ALP_CC3501E_HEADER_BYTES], dummy_tx_zero, plen, false)) {
 				/* Watched: a host that abandons the transaction between header
 				 * and payload would otherwise leave this armed forever (#5). */
 				reply_armed_ms = cc3501e_hw_uptime_ms();
@@ -922,7 +933,7 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 		dispatch_frame((size_t)ALP_CC3501E_HEADER_BYTES + cur_payload_len);
 		/* Reply HEADER as its own SS0-framed transfer (see PH_REQ_HEADER). */
 		phase = PH_REPLY_HEADER;
-		if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES)) {
+		if (arm_transfer(NULL, reply_buf, ALP_CC3501E_HEADER_BYTES, true)) {
 			reply_armed_ms = cc3501e_hw_uptime_ms();
 			reply_armed    = true;
 		}
@@ -933,8 +944,10 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 		 * SS0-framed transfer, after the host clocked the reply header in the previous
 		 * transceive (so it knows the length to clock here). */
 		phase = PH_REPLY_PAYLOAD;
-		if (arm_transfer(
-		        NULL, &reply_buf[ALP_CC3501E_HEADER_BYTES], reply_len - ALP_CC3501E_HEADER_BYTES)) {
+		if (arm_transfer(NULL,
+		                 &reply_buf[ALP_CC3501E_HEADER_BYTES],
+		                 reply_len - ALP_CC3501E_HEADER_BYTES,
+		                 true)) {
 			reply_armed_ms = cc3501e_hw_uptime_ms();
 			reply_armed    = true;
 		}
@@ -953,8 +966,12 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
 	}
 }
 
-/* Reset the SPI RX **and** TX FIFOs.  POLLED MODE ONLY -- never call this with a
- * transfer in flight (see the caller).
+/* Reset the SPI RX **and** TX FIFOs.  Callers: the polled frame boundary
+ * (bridge_transport_spi_poll_service) and, since v0.9.1, TX-phase arms on the
+ * callback/DMA path (arm_transfer(..., flush_fifos == true)).  Never call this
+ * with a transfer in flight -- both callers guarantee that.  The "ROOT CAUSE"
+ * text below describes the polled-mode origin; the callback-path use is a
+ * bench-unproven hypothesis (see arm_transfer).
  *
  * THE ROOT CAUSE THIS EXISTS FOR (silicon 2026-08-21; do not re-derive):
  * spiPollingTransfer() calls enableSPI() and NEVER disables the IP again, and the
@@ -985,6 +1002,9 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
  * DISABLED for FIFORST to take.  SPI_transfer -> spiPollingTransfer -> enableSPI()
  * re-enables it (isSPIEnabled reads the register, SPIWFF3DMA.c:1586, so the driver
  * cannot cache a stale "already on"). */
+#define CC3501E_FIFORST_SPIN_MAX 10000u
+static volatile uint32_t g_fiforst_timeout_count; /* FIFORST never self-cleared; counted only */
+
 static void spi_fifo_reset(void)
 {
 	if (spi == NULL) {
@@ -993,7 +1013,16 @@ static void spi_fifo_reset(void)
 	const uint32_t base = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr;
 	HWREG(base + SPI_O_CTL1) &= ~SPI_CTL1_EN_ENABLE;
 	HWREG(base + SPI_O_CTL0) |= SPI_CTL0_FIFORST_RST_TRIG;
+	/* Bounded: this now runs in the SPI SWI on the callback path, where an
+	 * unbounded spin on a stuck FIFORST would hang the whole bridge.  The reset
+	 * completes in a few bus cycles; on timeout carry on (the transfer arms
+	 * anyway) and count it. */
+	uint32_t spin = 0u;
 	while ((HWREG(base + SPI_O_CTL0) & SPI_CTL0_FIFORST) == SPI_CTL0_FIFORST_RST_TRIG) {
+		if (++spin >= CC3501E_FIFORST_SPIN_MAX) {
+			g_fiforst_timeout_count++;
+			break;
+		}
 	}
 	/* READ the sticky RX-overrun latch BEFORE clearing it, and count it.
 	 *
@@ -1220,14 +1249,21 @@ static bool spi_open_and_arm(void)
 	 * Safe here specifically because this is worker/boot context with nothing in
 	 * flight -- do NOT move it into on_transfer()/arm_request_header(), which run
 	 * in the SPI ISR where the added latency would recreate the very overshoot
-	 * this is cleaning up after.
+	 * this is cleaning up after.  (v0.9.1: arm_transfer() DOES now flush, but only
+	 * for the reply-header/payload TX-phase arms -- a bounded few-cycle reset, not
+	 * this reinit-time flush, and never for the request arms this paragraph is
+	 * about.)
 	 *
 	 * spi_fifo_reset() leaves the IP DISABLED (FIFORST only takes while it is),
 	 * and its own comment establishes that SPI_transfer re-enables it only for
 	 * the POLLING path. Re-enable explicitly rather than assume the callback/DMA
 	 * path does the same -- isSPIEnabled reads the register, so the driver cannot
 	 * be holding a stale "already on". */
-	/* DO NOT flush the FIFOs or touch CTL1.EN here.  Both were tried on
+	/* (Scope: "here" = spi_open_and_arm()'s reinit-time path.  v0.9.1's TX-phase
+	 * flush in arm_transfer() is separate: it runs with the IP already disabled by
+	 * the reset and lets primeTransfer re-enable it, never pre-enabling it.)
+	 *
+	 * DO NOT flush the FIFOs or touch CTL1.EN here.  Both were tried on
 	 * 2026-09-10 and the enable was a REGRESSION; the premise behind them was
 	 * simply false.
 	 *
@@ -1267,18 +1303,6 @@ static bool spi_open_and_arm(void)
 	 * again and stall the host's per-request READY gate (-3 BUSY).  Bench-proven. */
 
 	g_resync_count = 0u;
-
-	/* Clear the reply-stall latch: a reinit retires whatever transfer it referred
-	 * to.  hw_release()/hw_suspend() always did this; hw_reinit() (which every
-	 * heal uses) did NOT, so after the stall watchdog's own reinit reply_armed
-	 * stayed true with its stale stamp and bridge_transport_spi_phase_stalled()
-	 * fired again on the very next tick -- a 100 Hz SPI_close/SPI_open storm that
-	 * never let the fresh header arm survive (bench 2026-10-04: after a 4 B header
-	 * declaring len 16 then 300 ms of silence, request-header MISO read 00000000
-	 * forever, 0/20 PINGs, while a resync-burst reinit -- which never sets
-	 * reply_armed -- recovered 60/60).  Cleared BEFORE the arm below, so an arm
-	 * that records a fresh stamp is not wiped. */
-	reply_armed = false;
 
 	/* Build the wire-CRC table BEFORE the first frame can arrive.
 	 *
@@ -1367,6 +1391,32 @@ bool bridge_transport_spi_at_idle_header(void)
 	return phase == PH_REQ_HEADER;
 }
 
+/* Stop the SPI IP's DMA hand-shake and host-DMA ch12/13 before SPI_close, using
+ * the same calls SPIWFF3DMA's own RX-overrun path makes (SPIWFF3DMA.c ~392-398)
+ * -- NOT SPI_transferCancel, which hung the bridge twice.
+ *
+ * HYPOTHESIS, to be bench-proven: SPIWFF3DMA_close() (SPIWFF3DMA.c ~183) disables
+ * the SPI IP and destroys the hwi/swi, but never clears DMACR.TXEN/RXEN nor
+ * disables DMA ch12/ch13.  After a RADIO op the radio's global DMA re-init has
+ * already torn that DMA down, so every reinit that follows one is clean.  The
+ * stall-watchdog heal is the only reinit that closes a handle whose DMA is still
+ * PRIMED (host went silent mid-phase), so the re-open then finds ch12/13 still
+ * owned by the dead transfer -> request-header MISO 00000000 forever (bench
+ * 2026-10-04: 0/20 PINGs after "len 16 header, then 300 ms silence"), while a
+ * resync-burst reinit (DMA retired by a completed transfer) recovers 60/60.
+ * If the bench still shows 00000000 after this, the hypothesis is wrong. */
+static void spi_dma_quiesce(void)
+{
+	const uint32_t base = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr;
+	const uint32_t rxch = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->rxDmaChannel;
+	const uint32_t txch = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->txDmaChannel;
+	HWREG(base + SPI_O_CTL1) &= ~SPI_CTL1_EN_ENABLE;
+	HWREG(base + SPI_O_DMACR) &= ~(SPI_DMACR_TXEN | SPI_DMACR_RXEN);
+	DMAWFF3_disableChannel(rxch);
+	DMAWFF3_disableChannel(txch);
+	DMAWFF3_clearInterrupt((1u << txch) | (1u << rxch));
+}
+
 bool bridge_transport_spi_hw_reinit(void)
 {
 	/* OTA update mode with a LIVE handle: nothing was ever torn down, so there is
@@ -1398,7 +1448,9 @@ bool bridge_transport_spi_hw_reinit(void)
 		 * the host held off; here the host may be mid-transaction, and cancelling
 		 * an armed CALLBACK transfer from this context does not return.  The
 		 * theoretical DMA leak is the lesser evil, and spi_open_and_arm's retry
-		 * budget already covers a momentarily-busy channel. */
+		 * budget already covers a momentarily-busy channel.  (v0.9.1: the DMA
+		 * is now stopped by register, not by cancel -- see spi_dma_quiesce.) */
+		spi_dma_quiesce();
 		SPI_close(spi);
 		spi = NULL;
 	}

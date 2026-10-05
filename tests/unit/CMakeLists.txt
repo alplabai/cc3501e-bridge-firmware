@@ -449,14 +449,17 @@ target_link_options(test_worker_ap_publish PRIVATE
 target_link_libraries(test_worker_ap_publish PRIVATE ztest_shim)
 add_test(NAME worker_ap_publish COMMAND test_worker_ap_publish)
 
-# sock_connect_slice: header-only slice arithmetic for the non-blocking
-# SOCK_CONNECT wait (v0.9.1 finding 4); the lwIP loop is TI-SDK-only.
-add_executable(test_sock_connect_slice
-    sock_connect_slice/src/test_sock_connect_slice.c
-)
-target_include_directories(test_sock_connect_slice PRIVATE
-    ${FW}/src
-)
-target_compile_options(test_sock_connect_slice PRIVATE ${TEST_FLAGS})
-target_link_libraries(test_sock_connect_slice PRIVATE ztest_shim)
-add_test(NAME sock_connect_slice COMMAND test_sock_connect_slice)
+# ap_role_latch: header-only AP pending/up latch (v0.9.1 finding 3).
+add_executable(test_ap_role_latch ap_role_latch/src/test_ap_role_latch.c)
+target_include_directories(test_ap_role_latch PRIVATE ${FW}/src)
+target_compile_options(test_ap_role_latch PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_ap_role_latch PRIVATE ztest_shim)
+add_test(NAME ap_role_latch COMMAND test_ap_role_latch)
+
+# sock_connect_wait: the non-blocking SOCK_CONNECT loop (v0.9.1 finding 4) behind
+# a fake lwIP ops table; the real lwip_* calls are bench-only.
+add_executable(test_sock_connect_wait sock_connect_wait/src/test_sock_connect_wait.c)
+target_include_directories(test_sock_connect_wait PRIVATE ${FW}/src)
+target_compile_options(test_sock_connect_wait PRIVATE ${TEST_FLAGS})
+target_link_libraries(test_sock_connect_wait PRIVATE ztest_shim)
+add_test(NAME sock_connect_wait COMMAND test_sock_connect_wait)

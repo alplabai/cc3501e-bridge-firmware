@@ -568,11 +568,12 @@ void cc3501e_hw_link_heal_begin_connect(void)
  * before this whole fix -- no behaviour change for the idle-tick path.  The
  * quiet-armed detector is the ONLY part gated on @p in_connect_wait: it is a
  * blind timer (3 s of silence), and firing it from the unconditional idle
- * tick is exactly what the rejected design got wrong.  NONE of these four
- * calls bridge_transport_spi_hw_reinit() with a preceding cc3501e_bridge_
- * busy() -- unlike the quiet-armed detector below, and unlike some (not
- * all -- see that reinit's own comment) other reinit call sites in this
- * file family. */
+ * tick is exactly what the rejected design got wrong.  Three of these four
+ * (dead handle, resync burst, arm failure) call bridge_transport_spi_hw_reinit()
+ * WITHOUT a preceding cc3501e_bridge_busy(); the reply-stall heal DOES fence
+ * (v0.9.1) -- see its own comment.  The quiet-armed detector below also fences;
+ * some (not all -- see that reinit's own comment) other reinit call sites in
+ * this file family do not. */
 void cc3501e_hw_link_heal(bool in_connect_wait)
 {
 	/* === Bridge SPI open-failure recovery (#1610) ===
@@ -645,10 +646,9 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	 * transfer armed forever, and both self-heals above are blind to it (no
 	 * misframing, no failed arm).  Same reinit recovery. */
 	if (bridge_transport_spi_phase_stalled()) {
-		/* Drop READY first, like the quiet-armed heal below: the reinit leaves the
-		 * slave armed at PH_REQ_HEADER with flushed FIFOs and clears the stall
-		 * latch (spi_open_and_arm), so the host is held off only for the window
-		 * between this fence and the arm's own READY raise. */
+		/* Drop READY first, like the quiet-armed heal below.  The reinit also stops
+		 * the still-primed DMA before SPI_close (spi_dma_quiesce -- a bench-unproven
+		 * hypothesis for the 00000000-forever state) and re-arms PH_REQ_HEADER. */
 		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}
