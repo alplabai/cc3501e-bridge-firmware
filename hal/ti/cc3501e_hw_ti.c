@@ -646,9 +646,10 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	 * transfer armed forever, and both self-heals above are blind to it (no
 	 * misframing, no failed arm).  Same reinit recovery. */
 	if (bridge_transport_spi_phase_stalled()) {
-		/* Drop READY first, like the quiet-armed heal below.  The reinit also stops
-		 * the still-primed DMA before SPI_close (spi_dma_quiesce -- a bench-unproven
-		 * hypothesis for the 00000000-forever state) and re-arms PH_REQ_HEADER. */
+		/* Drop READY first, like the quiet-armed heal below, then re-arm
+		 * PH_REQ_HEADER.  On v0.9.0 silicon this reinit can still leave the
+		 * slave TX dead (request-header MISO 00000000); the host's resync burst
+		 * (three 0xFF headers -> the resync heal below) revives it. */
 		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}

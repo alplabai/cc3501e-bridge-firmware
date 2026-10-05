@@ -195,7 +195,6 @@
 #include <ti/drivers/SPI.h>
 #include <ti/drivers/spi/SPIWFF3DMA.h> /* SPIWFF3DMA_CMD_RETURN_PARTIAL_ENABLE -- CS-framed re-sync */
 #include <ti/drivers/dpl/ClockP.h>     /* ClockP_usleep -- settle between SPI re-open retries */
-#include <ti/drivers/dma/DMAWFF3.h>   /* DMAWFF3_disableChannel/_clearInterrupt -- stall-reinit DMA teardown */
 
 /* Direct SPI register access, for the polled bridge's per-frame FIFO reset
  * (spi_fifo_reset() below).  The driver's own flushFifos() is static, and the
@@ -1391,32 +1390,6 @@ bool bridge_transport_spi_at_idle_header(void)
 	return phase == PH_REQ_HEADER;
 }
 
-/* Stop the SPI IP's DMA hand-shake and host-DMA ch12/13 before SPI_close, using
- * the same calls SPIWFF3DMA's own RX-overrun path makes (SPIWFF3DMA.c ~392-398)
- * -- NOT SPI_transferCancel, which hung the bridge twice.
- *
- * HYPOTHESIS, to be bench-proven: SPIWFF3DMA_close() (SPIWFF3DMA.c ~183) disables
- * the SPI IP and destroys the hwi/swi, but never clears DMACR.TXEN/RXEN nor
- * disables DMA ch12/ch13.  After a RADIO op the radio's global DMA re-init has
- * already torn that DMA down, so every reinit that follows one is clean.  The
- * stall-watchdog heal is the only reinit that closes a handle whose DMA is still
- * PRIMED (host went silent mid-phase), so the re-open then finds ch12/13 still
- * owned by the dead transfer -> request-header MISO 00000000 forever (bench
- * 2026-10-04: 0/20 PINGs after "len 16 header, then 300 ms silence"), while a
- * resync-burst reinit (DMA retired by a completed transfer) recovers 60/60.
- * If the bench still shows 00000000 after this, the hypothesis is wrong. */
-static void spi_dma_quiesce(void)
-{
-	const uint32_t base = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->baseAddr;
-	const uint32_t rxch = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->rxDmaChannel;
-	const uint32_t txch = ((const SPIWFF3DMA_HWAttrs *)spi->hwAttrs)->txDmaChannel;
-	HWREG(base + SPI_O_CTL1) &= ~SPI_CTL1_EN_ENABLE;
-	HWREG(base + SPI_O_DMACR) &= ~(SPI_DMACR_TXEN | SPI_DMACR_RXEN);
-	DMAWFF3_disableChannel(rxch);
-	DMAWFF3_disableChannel(txch);
-	DMAWFF3_clearInterrupt((1u << txch) | (1u << rxch));
-}
-
 bool bridge_transport_spi_hw_reinit(void)
 {
 	/* OTA update mode with a LIVE handle: nothing was ever torn down, so there is
@@ -1448,9 +1421,16 @@ bool bridge_transport_spi_hw_reinit(void)
 		 * the host held off; here the host may be mid-transaction, and cancelling
 		 * an armed CALLBACK transfer from this context does not return.  The
 		 * theoretical DMA leak is the lesser evil, and spi_open_and_arm's retry
-		 * budget already covers a momentarily-busy channel.  (v0.9.1: the DMA
-		 * is now stopped by register, not by cancel -- see spi_dma_quiesce.) */
-		spi_dma_quiesce();
+		 * budget already covers a momentarily-busy channel.
+		 *
+		 * Stopping the DMA by register here instead (DMACR.TXEN/RXEN cleared +
+		 * DMAWFF3_disableChannel on ch12/13 before SPI_close) was tried in
+		 * v0.9.1 and is WORSE: on silicon (E1M-AEN803 2026W36-0009,
+		 * 2026-10-05) EVERY reinit after it left request-header MISO at
+		 * 00000000 forever -- the post-AP_START drain reinit included, so the
+		 * soft-AP could not be confirmed at all, and the resync burst that
+		 * revives a stall-dead v0.9.0 link no longer did.  SPI_open does not
+		 * re-enable a channel left disabled this way. */
 		SPI_close(spi);
 		spi = NULL;
 	}
