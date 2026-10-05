@@ -56,7 +56,7 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   51acbfe605d3c7e43aac824189f0dd773aebaf46
+built-from:   3b435aeca4a9505026970434d86350e63ad398ca
 image-sha256: c2f09587134dfdf91ab40837d7abcd24b03218aaa4596036a327cc9b53ae0ddb
 raw-sha256:   a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c
 
@@ -249,4 +249,3 @@ gpe-floor:    0.254.38.0
 # customer-selectable CC3501E_WIRE_CRC option, and the fix that moves the
 # wire-CRC table build out of the SPI ISR onto the boot path -- the last of
 # which is what made the 4.0 wire work on silicon at all.
-inert:        84a077f84d97e4d0c642322aa075bf9bf86cc536  # clang-format-22 whitespace only; rebuilt raw-sha256 a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c identical (2026-10-05)
