@@ -279,6 +279,11 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	return CC3501E_HW_ERR_NOTIMPL;
 }
 
+void cc3501e_hw_wifi_ap_role_publish(void)
+{
+	/* The stub never brings an AP up, so there is never a role to publish. */
+}
+
 int cc3501e_hw_wifi_ap_stop(void)
 {
 	return CC3501E_HW_ERR_NOTIMPL;

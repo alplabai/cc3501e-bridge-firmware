@@ -568,11 +568,12 @@ void cc3501e_hw_link_heal_begin_connect(void)
  * before this whole fix -- no behaviour change for the idle-tick path.  The
  * quiet-armed detector is the ONLY part gated on @p in_connect_wait: it is a
  * blind timer (3 s of silence), and firing it from the unconditional idle
- * tick is exactly what the rejected design got wrong.  NONE of these four
- * calls bridge_transport_spi_hw_reinit() with a preceding cc3501e_bridge_
- * busy() -- unlike the quiet-armed detector below, and unlike some (not
- * all -- see that reinit's own comment) other reinit call sites in this
- * file family. */
+ * tick is exactly what the rejected design got wrong.  Three of these four
+ * (dead handle, resync burst, arm failure) call bridge_transport_spi_hw_reinit()
+ * WITHOUT a preceding cc3501e_bridge_busy(); the reply-stall heal DOES fence
+ * (v0.9.1) -- see its own comment.  The quiet-armed detector below also fences;
+ * some (not all -- see that reinit's own comment) other reinit call sites in
+ * this file family do not. */
 void cc3501e_hw_link_heal(bool in_connect_wait)
 {
 	/* === Bridge SPI open-failure recovery (#1610) ===
@@ -645,6 +646,14 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	 * transfer armed forever, and both self-heals above are blind to it (no
 	 * misframing, no failed arm).  Same reinit recovery. */
 	if (bridge_transport_spi_phase_stalled()) {
+		/* Drop READY first, like the quiet-armed heal below, then re-arm
+		 * PH_REQ_HEADER.  On firmware v0.9.0 this reinit could still leave the
+		 * slave TX dead (request-header MISO 00000000) until the host's resync
+		 * burst (three 0xFF headers -> the resync-burst heal above, which runs
+		 * on the next tick) revived it.  Bench, E1M-AEN803 2026W36-0009 with
+		 * v0.9.2: the stall-dead state self-recovers (42/60 PINGs, the first 6
+		 * fail, then healed). */
+		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}
 
@@ -685,8 +694,9 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	                                                             CC3501E_LINK_QUIET_REARM_MS,
 	                                                             xfer_count);
 	if (fire) {
-		/* Unlike the four heals above (see this function's own top comment),
-		 * this DOES drop READY before the reinit -- a deliberate choice, not
+		/* Unlike three of the four heals above (the stall heal also drops
+		 * READY; see this function's own top comment), this DOES drop READY
+		 * before the reinit -- a deliberate choice, not
 		 * a "matches every other site" claim (some do, some don't; see that
 		 * comment). */
 		cc3501e_bridge_busy();

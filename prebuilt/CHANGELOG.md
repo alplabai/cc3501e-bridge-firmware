@@ -7,6 +7,40 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.9.2
+
+GPE: `0.254.38.0`. Wire protocol: `4.0`. sha256
+`c2f09587134dfdf91ab40837d7abcd24b03218aaa4596036a327cc9b53ae0ddb`.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0 + Wi-Fi Toolbox 4.2.4) via
+`ti/build_ti.sh --wifi --ble`, then wrapped and signed per
+[`BUILD_RECIPE.md`](BUILD_RECIPE.md). Stage-1 raw sha256
+`a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c`.
+
+**GPE stamp.** `0.254.38.0` (file offset 36 reads `00 fe 26 00`), one above
+E1M-AEN803 2026W36-0009's floor of `0.254.37.0`. `gpe-floor` moves
+`0.254.15.0` -> `0.254.38.0` in this same commit. v0.9.0 (`0.254.15.0`) is now a
+permanent rollback on that unit.
+
+**v0.9.1 was never shipped.** Commit `e494061` (its reinit DMA quiesce) killed
+every SPI reinit on silicon, leaving the slave dead; it was dropped in
+`da4cf79` and never wrapped or released. v0.9.2 supersedes v0.9.0 directly.
+
+### Fixed since v0.9.0
+
+- **A one-transfer reply lag now self-heals.** The reply-stall heal drops READY
+  and re-arms `PH_REQ_HEADER`; the stall-dead state recovers without the host's
+  resync burst. Bench, E1M-AEN803 2026W36-0009: 42 of 60 PINGs succeed, the first
+  6 fail, then the link is healed. v0.9.0 stayed dead until the host's resync
+  burst.
+- **The AP role is published after the SPI re-open**, so the next request no
+  longer races the reinit.
+- **A non-blocking `SOCK_CONNECT` keeps the link heals running** between wait
+  slices instead of freezing them for the whole connect.
+- **The SPI FIFO reset wait is bounded to about 50 us** (was ~0.5 ms), so it no
+  longer exceeds the host's ~200 us reply-header gate inside the SPI SWI.
+
 ## v0.9.0
 
 GPE: `0.254.15.0`. Wire protocol: `4.0`. sha256

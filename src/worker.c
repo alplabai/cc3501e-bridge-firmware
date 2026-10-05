@@ -1288,6 +1288,16 @@ void worker_run_pending(void)
 			rearmed = bridge_transport_spi_hw_reinit();
 		}
 
+		/* AP_START: publish the AP role only NOW, after the reinit above (or after
+		 * the exempt skip) has left the slave armed.  See
+		 * cc3501e_hw_wifi_ap_role_publish() for the bench evidence.  Deliberately
+		 * NOT gated on `rearmed`: a failed arm is recovered by the
+		 * tick's g_arm_fail_count heal, and withholding the role forever would
+		 * hide a live AP from the host. */
+		if (cmd == ALP_CC3501E_CMD_WIFI_AP_START) {
+			cc3501e_hw_wifi_ap_role_publish();
+		}
+
 		/* CONNECT / AP_START are FIRE-AND-FORGET at the worker level: their outcome
 		 * is mirrored into the HAL connection-status latch (read NON-blocking by
 		 * CMD_WIFI_STATUS), so the host never collects their DONE/ERR through this

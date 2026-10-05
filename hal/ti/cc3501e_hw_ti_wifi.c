@@ -69,8 +69,9 @@ appControlBlock app_CB;
 
 #include "../cc3501e_hw.h"
 #include "cc3501e_hw_ti_internal.h" /* cc3501e_hw_wifi_lazy_start (shared with cc3501e_hw_ti_ble.c) */
-#include "transport.h"  /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
-#include "wifi_retry.h" /* wifi_retry_delay_ms / wifi_retry_should_restore_first_pass -- the
+#include "transport.h"     /* bridge_transport_spi_hw_reinit/suspend, cc3501e_bridge_busy/ready */
+#include "ap_role_latch.h" /* wifi_ap_latch: AP role pending/up, published after the drain reinit */
+#include "wifi_retry.h"    /* wifi_retry_delay_ms / wifi_retry_should_restore_first_pass -- the
                           * silicon-free retry decisions the reason-30 retry site (further
                           * down) calls into.  #include'd unconditionally, like
                           * wifi_last_reason_tag just below: wifi_retry_event_t has no TI-SDK
@@ -229,7 +230,11 @@ static bool wifi_sta_role_up;
  * role == WIFI_AP while a second radio sees no beacon, the NWP dropped the AP
  * underneath us without the firmware asking -- a different fault from the
  * firmware tearing it down, and the two are indistinguishable today. */
-static bool wifi_ap_role_up;
+/* Pending/up latch (src/ap_role_latch.h): ap_start only marks the role pending;
+ * cc3501e_hw_wifi_ap_role_publish() flips it up after the worker drain's
+ * post-body SPI reinit.  Plain struct, same worker-thread-only reasoning as
+ * g_connect_reinit_pending (the ISR only READS .up). */
+static ap_role_latch_t wifi_ap_latch;
 
 /* ---- Worker <-> Wi-Fi-event rendezvous (WIFI_BLE_INTEGRATION.md) ----------
  * Async Wlan_* ops (Scan / Connect) complete on the host-driver thread via the
@@ -749,7 +754,7 @@ void cc3501e_hw_wifi_dhcp_diag(uint8_t *state_out, uint8_t *flags_out)
  * configuration. The field's consumer (#1562) asks about the soft-AP. */
 uint8_t cc3501e_hw_radio_role(void)
 {
-	if (wifi_ap_role_up) return (uint8_t)ALP_CC3501E_ROLE_WIFI_AP;
+	if (wifi_ap_latch.up) return (uint8_t)ALP_CC3501E_ROLE_WIFI_AP;
 	if (wifi_sta_role_up) return (uint8_t)ALP_CC3501E_ROLE_WIFI_STA;
 	return (uint8_t)ALP_CC3501E_ROLE_OFF;
 }
@@ -2954,9 +2959,22 @@ int cc3501e_hw_wifi_ap_start(const uint8_t *ssid,
 	if (Wlan_RoleUp(WLAN_ROLE_AP, &ap, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
-	wifi_ap_role_up = true;
+	/* DO NOT publish the AP role (wifi_ap_latch.up) here.  GET_DIAG_INFO answers from the ISR, so the
+	 * host sees role == AP the instant this flips and fires its next request --
+	 * straight into the drain's post-body bridge_transport_spi_hw_reinit()
+	 * (src/worker.c; AP_START is not exempt from it).  Bench (E1M-AEN803, v0.9.0):
+	 * SOCK_OPEN 0 ms after role==AP failed 3-5/20 (rc=-4, request-header MISO
+	 * 00010000 then RAM-like words); with 200+ ms it was 0/20.  Mirrors the STA
+	 * #106 ordering (reinit first, then wifi_conn_set(CONNECTED)): the drain calls
+	 * cc3501e_hw_wifi_ap_role_publish() once the reinit has completed. */
 	network_set_up(network_get_ap_if());
+	ap_role_latch_started(&wifi_ap_latch, true);
 	return CC3501E_HW_OK;
+}
+
+void cc3501e_hw_wifi_ap_role_publish(void)
+{
+	ap_role_latch_publish(&wifi_ap_latch);
 }
 
 int cc3501e_hw_wifi_ap_stop(void)
@@ -2972,7 +2990,7 @@ int cc3501e_hw_wifi_ap_stop(void)
 	if (Wlan_RoleDown(WLAN_ROLE_AP, CC3501E_WIFI_ROLE_TIMEOUT_MS) != 0) {
 		return CC3501E_HW_ERR_IO;
 	}
-	wifi_ap_role_up = false;
+	ap_role_latch_stopped(&wifi_ap_latch);
 	/* The AP role-up path forces device-wide pm to ALWAYS_ACTIVE, both inline
 	 * (cc3501e_hw_wifi_ap_start()'s own Wlan_Set() before RoleUp) and via
 	 * pp_apply_radio()'s AP-up override on every later apply.  Neither is
@@ -3081,7 +3099,7 @@ int cc3501e_hw_wifi_get_ip(uint8_t iface, uint8_t ip_out[4])
 	 * asking before that is a host sequencing error, not a transient, so say
 	 * NOTIMPL (-> RESP_ERR_NOT_READY) rather than IO (-> RESP_ERR_RADIO, which
 	 * the host retries for its whole budget). */
-	if (iface == (uint8_t)ALP_CC3501E_WIFI_IFACE_AP && !wifi_ap_role_up) {
+	if (iface == (uint8_t)ALP_CC3501E_WIFI_IFACE_AP && !wifi_ap_latch.up) {
 		return CC3501E_HW_ERR_NOTIMPL;
 	}
 	const int role = (iface == (uint8_t)ALP_CC3501E_WIFI_IFACE_AP) ? WLAN_ROLE_AP : WLAN_ROLE_STA;
