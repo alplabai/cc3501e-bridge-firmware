@@ -1001,7 +1001,13 @@ static void on_transfer(SPI_Handle h, SPI_Transaction *t)
  * DISABLED for FIFORST to take.  SPI_transfer -> spiPollingTransfer -> enableSPI()
  * re-enables it (isSPIEnabled reads the register, SPIWFF3DMA.c:1586, so the driver
  * cannot cache a stale "already on"). */
-#define CC3501E_FIFORST_SPIN_MAX 10000u
+/* Time bound ~50 us, not an iteration count of convenience: this runs in the SPI
+ * SWI, and the host's reply-header gate is a blind ~200 us, so a spin that long
+ * (the old 10000 iterations was ~0.5 ms at 160 MHz) eats the whole gate.  The
+ * file has no cycle counter, so this is a calibrated loop: one iteration is a
+ * peripheral read + mask + compare + branch, ~6..12 core clocks at 160 MHz, so
+ * 800 iterations is ~30..60 us.  Re-measure if the loop body or core clock changes. */
+#define CC3501E_FIFORST_SPIN_MAX 800u
 static volatile uint32_t g_fiforst_timeout_count; /* FIFORST never self-cleared; counted only */
 
 static void spi_fifo_reset(void)

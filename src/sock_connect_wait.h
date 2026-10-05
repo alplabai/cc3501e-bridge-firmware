@@ -27,12 +27,12 @@
 #define CC3501E_SOCK_CONNECT_CAP_MS   60000u
 
 typedef struct {
-	int (*get_flags)(void *ctx);                       /* <0 on failure */
-	int (*set_flags)(void *ctx, int flags);            /* <0 on failure */
-	int (*start_connect)(void *ctx);                       /* 0 / -1 */
-	bool (*in_progress)(void *ctx);                    /* errno == EINPROGRESS after connect */
+	int (*get_flags)(void *ctx);                        /* <0 on failure */
+	int (*set_flags)(void *ctx, int flags);             /* <0 on failure */
+	int (*start_connect)(void *ctx);                    /* 0 / -1 */
+	bool (*in_progress)(void *ctx);                     /* errno == EINPROGRESS after connect */
 	int (*wait_writable)(void *ctx, uint32_t slice_ms); /* >0 ready, 0 timeout, <0 error */
-	int (*so_error)(void *ctx, int *err_out);          /* 0 if the getsockopt itself worked */
+	int (*so_error)(void *ctx, int *err_out);           /* 0 if the getsockopt itself worked */
 	uint32_t (*now_ms)(void *ctx);
 	void (*heal)(void *ctx); /* cc3501e_hw_link_heal(false) */
 	int nonblock_flag;       /* O_NONBLOCK */

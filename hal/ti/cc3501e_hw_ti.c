@@ -647,9 +647,12 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	 * misframing, no failed arm).  Same reinit recovery. */
 	if (bridge_transport_spi_phase_stalled()) {
 		/* Drop READY first, like the quiet-armed heal below, then re-arm
-		 * PH_REQ_HEADER.  On v0.9.0 silicon this reinit can still leave the
-		 * slave TX dead (request-header MISO 00000000); the host's resync burst
-		 * (three 0xFF headers -> the resync heal below) revives it. */
+		 * PH_REQ_HEADER.  On firmware v0.9.0 this reinit could still leave the
+		 * slave TX dead (request-header MISO 00000000) until the host's resync
+		 * burst (three 0xFF headers -> the resync-burst heal above, which runs
+		 * on the next tick) revived it.  Bench, E1M-AEN803 2026W36-0009 with
+		 * v0.9.2: the stall-dead state self-recovers (42/60 PINGs, the first 6
+		 * fail, then healed). */
 		cc3501e_bridge_busy();
 		bridge_transport_spi_hw_reinit();
 	}
@@ -691,8 +694,9 @@ void cc3501e_hw_link_heal(bool in_connect_wait)
 	                                                             CC3501E_LINK_QUIET_REARM_MS,
 	                                                             xfer_count);
 	if (fire) {
-		/* Unlike the four heals above (see this function's own top comment),
-		 * this DOES drop READY before the reinit -- a deliberate choice, not
+		/* Unlike three of the four heals above (the stall heal also drops
+		 * READY; see this function's own top comment), this DOES drop READY
+		 * before the reinit -- a deliberate choice, not
 		 * a "matches every other site" claim (some do, some don't; see that
 		 * comment). */
 		cc3501e_bridge_busy();

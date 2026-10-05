@@ -16,7 +16,7 @@
 #define NB 0x4
 
 typedef struct {
-	int      flags, get_rc, set_rc_first, set_rc_restore, connect_rc, wait_n_after_timeouts;
+	int      flags, get_rc, set_rc_first, set_rc_restore, connect_rc;
 	bool     in_progress;
 	int      timeouts_before_ready; /* wait_writable returns 0 this many times first */
 	int      wait_result;           /* then this */
@@ -110,6 +110,7 @@ ZTEST(sock_connect_wait, test_so_error_getsockopt_failure_fails)
 	fake_t f = base();
 	f.so_rc = -1;
 	zassert_equal(sock_connect_run(&ops, &f), -1, "fail");
+	zassert_equal(f.last_set, 0x2, "restored");
 }
 
 ZTEST(sock_connect_wait, test_select_error_fails_and_restores)
@@ -167,4 +168,16 @@ ZTEST(sock_connect_wait, test_slice_clamps_to_cap)
 	zassert_equal(sock_connect_slice_ms(0u), 100u, "full slice");
 	zassert_equal(sock_connect_slice_ms(59950u), 50u, "clamped");
 	zassert_equal(sock_connect_slice_ms(60000u), 0u, "spent");
+}
+
+ZTEST(sock_connect_wait, test_cap_survives_now_ms_wraparound)
+{
+	/* t0 just below UINT32_MAX: now - t0 is unsigned-modular, so the 60 s cap
+	 * must still land after 600 slices, not instantly or never. */
+	fake_t f = base();
+	f.now = UINT32_MAX - 150u;
+	f.timeouts_before_ready = 1 << 30;
+	zassert_equal(sock_connect_run(&ops, &f), -1, "gives up at the cap");
+	zassert_equal(f.waits, 600, "60 s / 100 ms slices across the wrap");
+	zassert_equal(f.last_set, 0x2, "restored");
 }
