@@ -56,9 +56,9 @@
 # commit" -- only record a SHA reachable from `main`; a branch-tip SHA is a
 # ticking failure the moment its PR merges.
 
-built-from:   3b435aeca4a9505026970434d86350e63ad398ca
-image-sha256: c2f09587134dfdf91ab40837d7abcd24b03218aaa4596036a327cc9b53ae0ddb
-raw-sha256:   a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c
+built-from:   3f1a501c086fdfd4271b2955adac5815ae87fc3e
+image-sha256: df2f3b1d2776a6562167457fe7542ce5bdc328c565f899c18c9760a183a6131a
+raw-sha256:   4e12b147167b6efee8aa9e8f4c6397d08c2bf8bf75ea97cd6f3eea056d9cb446
 
 # The GPE anti-rollback floor the NEWEST shipped artifact must clear.
 #
@@ -87,11 +87,13 @@ raw-sha256:   a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c
 # -- and the SBL would have taken the image and then refused to boot it, which
 # is permanent.
 #
-# FLASHING LOG -- bench unit E1M-AEN803 2026W36-0009 has been flashed up to
-# 0.254.37.0, so anything shipped must be STRICTLY ABOVE that; v0.9.2 is stamped
-# 0.254.38.0 (read back from file offset 36: 00 fe 26 00).  A stamp <= 0.254.37.0
-# bricks that unit permanently.  gpe-floor below is the stamp of the newest
-# shipped blob (v0.9.2), raised together with the re-wrap.
+# FLASHING LOG -- bench unit E1M-AEN803 2026W36-0009: this file recorded it at
+# 0.254.37.0 when v0.9.2 (0.254.38.0) was cut, but a later bench record has it
+# at 0.254.42.0 since 2026-10-06 (#158).  The unit was not on any labgrid place
+# on 2026-11-05, so the stamp could not be read back.  v0.9.3 is wrapped at
+# 0.254.43.0 (file offset 0x24..0x28: 00 fe 2b 00 00), strictly above both
+# records.  v0.9.2 (0.254.38.0) must never be flashed onto 0009.  gpe-floor
+# below is the stamp of the newest shipped blob (v0.9.3).
 #
 # FLASHING LOG -- e1m-aen-evk-01 IS NOW AT 0.254.15.0 (measured 2026-09-15).
 #
@@ -220,7 +222,7 @@ raw-sha256:   a8021689fedbadca394c6e91faae9221e7b3681ae619587c0392a68cdbd6703c
 # (cc3501e-release-0.254.0.0, built 2026-08-19).  It is not a release and does
 # not move this floor -- but if it was ever programmed to a unit, that unit's
 # real floor is 0.254.0.0.
-gpe-floor:    0.254.38.0
+gpe-floor:    0.254.43.0
 
 # Later src/hal/ti commits verified not to change the RAW image -- see "WHAT
 # AN `inert:` LINE CLAIMS" above.  Evidence beside each line rebuilds and

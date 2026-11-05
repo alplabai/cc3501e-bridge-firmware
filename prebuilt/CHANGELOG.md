@@ -7,6 +7,33 @@ dropped into this directory and named `cc3501e-vX.Y.Z.bin` (matching
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.9.3
+
+GPE: `0.254.43.0`. Wire protocol: `4.0`. sha256
+`df2f3b1d2776a6562167457fe7542ce5bdc328c565f899c18c9760a183a6131a`.
+
+Built with the `ti` backend (TI `ticlang` 5.1.1 + SimpleLink Wi-Fi SDK
+10.10.01.08 + SysConfig 1.28.0 + Wi-Fi Toolbox 4.2.4) via
+`ti/build_ti.sh --wifi --ble`, then wrapped and signed per
+[`BUILD_RECIPE.md`](BUILD_RECIPE.md). Stage-1 raw sha256
+`4e12b147167b6efee8aa9e8f4c6397d08c2bf8bf75ea97cd6f3eea056d9cb446`.
+
+**No firmware changes since v0.9.2.** The only source change is
+`firmware-version.txt` (`0.9.2` -> `0.9.3`), so `GET_VERSION` reports the new
+release. This release exists to ship an image above the GPE floor of every bench
+unit, for the Alp Platform 26.11 line.
+
+**GPE stamp.** `0.254.43.0` (file offset `0x24..0x28` reads `00 fe 2b 00 00`;
+`0x27` is padding). A bench record has E1M-AEN803 2026W36-0009 at `0.254.42.0`
+since 2026-10-06, four steps above the v0.9.2 stamp (#158). The unit was not on
+the bench when this was cut, so its stamp was not read back; `0.254.43.0` is
+strictly above every recorded value. `gpe-floor` moves `0.254.38.0` ->
+`0.254.43.0` in this same commit.
+
+**Hardware risk.** v0.9.2 (`0.254.38.0`) and every earlier blob are now
+permanent rollbacks on any unit flashed with v0.9.3. Flashing one streams clean
+and then never boots.
+
 ## v0.9.2
 
 GPE: `0.254.38.0`. Wire protocol: `4.0`. sha256
